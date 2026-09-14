@@ -39,12 +39,13 @@
     arm_joint_sign: [1.0, 1.0, 1.0, 1.0]
 
     # --- end-effector trajectory mode (arm GS "EE trajectory" tab) ------
-    ee_traj_circle_radius: 0.5      # [m]
-    ee_traj_fig8_a: 0.5             # figure-8 half-length along the heading [m]
-    ee_traj_fig8_b: 0.25            # half-width across it [m]
+    ee_traj_circle_radius: 1.0      # [m]
+    ee_traj_fig8_a: 1.0             # figure-8 half-length along the heading [m]
+    ee_traj_fig8_b: 0.5            # half-width across it [m]
     ee_traj_lap_time: 24.0          # one lap at time scale 1 [s]
     ee_traj_laps: 2
-    ee_traj_ccw: true               # circle turns left of the start heading
+    ee_traj_ccw: true               # circle turns counter-clockwise
+    ee_traj_center_origin: true     # circle centred on the world origin at the EE height
     ee_traj_ramp_time: 4.0          # min-snap ramp-in / ramp-out [s]
     # EE attitude about its heading = the fold q2+q3 at rest. 80 deg is the
     # flown home fold; 0 (a level EE) is this arm's wrist singularity -> refused.

@@ -68,6 +68,31 @@ void localShape(const EeShape & s, double tau, Vec3 * p, Vec3 * dp)
   }
 }
 
+// Where the run starts and which way it leaves: the local shape's tau = 0
+// point goes to f.p0 and its +x tangent to the ACTUAL azimuth f.theta.
+//   figure-8, or a circle with center_origin = false: the current EE point,
+//     tangent along the nose (the circle then bends left/right of it);
+//   circle with center_origin = true: the circle is centred on the WORLD
+//     origin at the current EE height, the start is the point of that circle
+//     on the current EE's bearing, the tangent is the ccw/cw tangent there.
+ShapeFrame anchorFrame(const EeShape & s, const VehicleModel & v, const RestSpec & hold)
+{
+  Vec3 r0e;
+  armKinematics(hold.q, v.params, nullptr, &r0e, nullptr);
+  const Vec3 p_e0 = hold.x_b + Rz(hold.phi) * r0e;
+  ShapeFrame f;
+  if (s.type == "circle" && s.center_origin) {
+    double th0 = std::atan2(p_e0(1), p_e0(0));
+    if (std::hypot(p_e0(0), p_e0(1)) < 1e-6) {th0 = hold.phi + 0.5 * M_PI - 0.5 * M_PI;}  // on the axis: bearing = nose
+    f.p0 = Vec3{s.radius * std::cos(th0), s.radius * std::sin(th0), p_e0(2)};
+    f.theta = th0 + (s.ccw ? 0.5 * M_PI : -0.5 * M_PI);
+  } else {
+    f.p0 = p_e0;
+    f.theta = hold.phi + 0.5 * M_PI;   // actual nose azimuth
+  }
+  return f;
+}
+
 // world EE position, tangent heading (ACTUAL azimuth) and R_e (MODEL frame)
 struct EeSample
 {
@@ -204,17 +229,15 @@ RestSpec EeTrajectoryPlanner::startRest(
   const VehicleModel & v, const RestSpec & hold, const EeShape & shape,
   const EeTrajectoryOptions & o)
 {
-  Vec3 r0e;
-  armKinematics(hold.q, v.params, nullptr, &r0e, nullptr);
-  const Vec3 p_e0 = hold.x_b + Rz(hold.phi) * r0e;
+  const ShapeFrame f = anchorFrame(shape, v, hold);
   const double beta_e = o.ee_fold_deg * M_PI / 180.0;
   const double q2 = q2At(o, shape, 0.0);
   RestSpec r;
-  r.phi = hold.phi;                       // tau = 0 tangent = the hold's nose
+  r.phi = f.theta - 0.5 * M_PI;           // nose along the tau = 0 tangent
   r.q << 0.0, q2, beta_e - q2, 0.0;
   Vec3 r0e0;
   armKinematics(r.q, v.params, nullptr, &r0e0, nullptr);
-  r.x_b = p_e0 - Rz(r.phi) * r0e0;      // same EE point, at the run's fold
+  r.x_b = f.p0 - Rz(r.phi) * r0e0;        // EE on the run's start point, at its fold
   return r;
 }
 
@@ -241,13 +264,7 @@ std::unique_ptr<Trajectory> EeTrajectoryPlanner::plan(
   d.laps = shape.laps;
   d.s = tp.s;
 
-  // anchor: EE at the hold's EE position, tau = 0 tangent along the nose
-  {
-    Vec3 r0e;
-    armKinematics(hold.q, P, nullptr, &r0e, nullptr);
-    traj->frame_.p0 = hold.x_b + Rz(hold.phi) * r0e;
-    traj->frame_.theta = hold.phi + 0.5 * M_PI;   // actual nose azimuth
-  }
+  traj->frame_ = anchorFrame(shape, v, hold);
   traj->rest0_ = startRest(v, hold, shape, o);
   const WbReference rest_ref = restReference(P, traj->rest0_);
 
@@ -279,11 +296,11 @@ std::unique_ptr<Trajectory> EeTrajectoryPlanner::plan(
   // r_k implies: the feasibility residual of feas_cost_redundant driven to 0.
   std::vector<Vec3> r(N, kE3);
   Eigen::MatrixXd Xc(N, 3), Psi(N, 1), Q(N, kNumJoints);
-  double psi_prev = hold.phi, gam_prev = 0.0;
+  double psi_prev = traj->rest0_.phi, gam_prev = 0.0;
   double step = 0.0;
   int it = 0;
   for (it = 0; it < o.maxit; ++it) {
-    psi_prev = hold.phi;
+    psi_prev = traj->rest0_.phi;
     gam_prev = 0.0;
     for (int k = 0; k < N; ++k) {
       // first the MATLAB decomposition (R2 = minimal tilt, zxz of R2^T R_e)

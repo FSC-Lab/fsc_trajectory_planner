@@ -8,7 +8,10 @@
 // Pipeline (the MATLAB task-space planner's main_redundant_zyxx, adapted):
 //   1. EE pose curve   p_e(tau), R_e(tau) = Rz(psi_tan(tau) - pi/2) Rx(beta_e)
 //                      in the MODEL frame: heading along the curve tangent,
-//                      fold angle beta_e about it (see ee_fold_deg).
+//                      fold angle beta_e about it (see ee_fold_deg). The
+//                      circle is centred on the world origin at the current
+//                      EE height (EeShape::center_origin); the figure-8 is
+//                      anchored on the current EE point.
 //   2. time scaling    tau(t): min-snap ramp-in, constant rate s, ramp-out;
 //                      the run starts and ends AT REST on the same pose and
 //                      covers `laps` whole periods.
@@ -48,7 +51,13 @@ struct EeShape
   double fig8_b{0.25};          // figure-8 half-width across it [m]
   double lap_time{24.0};        // period of one lap at time scale 1 [s]
   int laps{2};
-  bool ccw{true};               // circle turns left of the start heading
+  bool ccw{true};               // circle turns counter-clockwise (seen from above)
+  // circle only: centre on the WORLD origin (x = y = 0) at the current EE
+  // height; the run starts at the point of that circle on the current EE's
+  // bearing, nose along the tangent. false: the circle passes through the
+  // current EE point, bending left/right of the nose (the figure-8 always
+  // anchors that way).
+  bool center_origin{true};
 };
 
 struct EeTrajectoryOptions

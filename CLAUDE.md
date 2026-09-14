@@ -313,13 +313,14 @@ drag to orbit, wheel to zoom; status lines are overlaid on the view.
 | out | `path` (latched) | 400 × `[t, x, y, z, speed, qx, qy, qz, qw]`, world frame |
 | out | `start_error` (10 Hz) | `[pos_err_m, yaw_err_deg, joint_err_deg, ready]` |
 | out | `reference_pose` (20 Hz while streaming) | `PoseStamped`, the current EE reference |
+| out | `start_rest` (latched) | `PoseStamped`, the run's start BASE pose (actual yaw): what go_to_start flies to |
 | srv | `go_to_start`, `start` | `std_srvs/Trigger` |
 
 The run is a `Trajectory`, so the node's existing EXECUTING machinery streams
 it (100 Hz `WholeBodyReference` + the arm reference) and re-holds at its end.
-Selecting a shape anchors it on the CURRENT hold (EE at the held EE position,
-tangent along the drone's nose); a new hold re-anchors it, arriving at the
-run's own start rest does not. SAFETY drops everything.
+Selecting a shape anchors it on the CURRENT hold (the circle on the origin at
+the held EE height, the figure-8 at the held EE point); a new hold re-anchors
+it, arriving at the run's own start rest does not. SAFETY drops everything.
 
 ### The maths (`ee_trajectory_planner.{hpp,cpp}`, `bspline_fit.{hpp,cpp}`)
 
@@ -327,10 +328,15 @@ Following the MATLAB task-space planner (`~/Downloads/Task-space Planner`,
 `main_redundant_zyxx.m` + `recover_motion_redundant.m`), adapted to the
 z-x-x-z OM-X chain:
 
-1. **EE pose curve** p_e(τ) is the circle `R (sin ωτ, ±(1−cos ωτ))` or the
-   figure-8 `(A sin ωτ, B sin 2ωτ)` rotated so its τ=0 tangent lies along the
-   drone's nose and translated onto the held EE point; yaw = the curve's
-   tangent (ACTUAL azimuth), R_e = Rz(ψ_tan − π/2)·Rx(β_e) in the MODEL frame.
+1. **EE pose curve** p_e(τ): the circle is **centred on the world origin** at
+   the current EE height (`ee_traj_center_origin`, default true); the run
+   starts at the point of that circle on the current EE's bearing, tangent
+   ccw/cw there — so Go-to-start carries the vehicle onto the circle. The
+   figure-8 `(A sin ωτ, B sin 2ωτ)` (or the circle with `center_origin`
+   false) is rotated so its τ=0 tangent lies along the drone's nose and
+   translated onto the held EE point. Yaw = the curve's tangent (ACTUAL
+   azimuth), R_e = Rz(ψ_tan − π/2)·Rx(β_e) in the MODEL frame. The run's
+   start rest is published latched on `ee_trajectory/start_rest`.
    **β_e (`ee_traj_fold_deg`, default 80° = the flown home fold) is the EE's
    roll about its heading.** A literally level EE (β_e = 0) is this arm's
    wrist singularity — joints 1 and 4 share the vertical axis — and violates

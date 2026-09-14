@@ -69,12 +69,15 @@ class Rig(Node):
                                  lambda m: setattr(self, "start_err", list(m.data)), 10)
         self.create_subscription(PoseStamped, "whole_body_planner/ee_trajectory/reference_pose",
                                  lambda m: setattr(self, "ref_pose", m), 10)
+        self.create_subscription(PoseStamped, "whole_body_planner/ee_trajectory/start_rest",
+                                 lambda m: setattr(self, "start_rest", m), LATCHED)
         self.create_subscription(
             WholeBodyReference, "fsc_autopilot_ros2/whole_body_direct_actuation/reference",
             lambda m: self.refs.append((time.monotonic(), m)), 50)
         self.go_cli = self.create_client(Trigger, "whole_body_planner/ee_trajectory/go_to_start")
         self.start_cli = self.create_client(Trigger, "whole_body_planner/ee_trajectory/start")
         self.odom_xyz = np.array([0.0, 0.0, 1.2])
+        self.yaw = 0.0          # actual yaw the rig reports
         self.q = HOME.copy()
         self.create_timer(0.02, self.feed)
 
@@ -84,7 +87,8 @@ class Rig(Node):
         o.pose.pose.orientation.w = 1.0
         self.odom.publish(o)
         a = VehicleAttitude()
-        a.q = [0.7071067811865476, 0.0, 0.0, 0.7071067811865476]   # actual yaw 0
+        ned = 0.5 * math.pi - self.yaw          # ENU yaw = 90 deg - NED yaw
+        a.q = [math.cos(0.5 * ned), 0.0, 0.0, math.sin(0.5 * ned)]
         self.att.publish(a)
         j = JointState()
         j.name = ["joint1", "joint2", "joint3", "joint4"]
@@ -160,12 +164,16 @@ def main():
         wait(lambda: rig.status and rig.status.startswith("EXECUTING"), 30, "go-to-start EXECUTING")
         print(f"[5] go to start: {rig.status}")
         wait(lambda: rig.status == "HOLD", 60, "arrived (HOLD)")
-        # the rig teleports its odometry onto the start rest the planner reached
+        # the rig teleports its odometry onto the start rest the planner published
         m = rig.refs[-1][1]
         xcd = np.array([m.x_cd.x, m.x_cd.y, m.x_cd.z])
-        # start rest = home q at the hold's EE; base x_b is the hold's -> odometry back to it
-        rig.odom_xyz = np.array([0.0, 0.0, 1.2])
+        wait(lambda: rig.start_rest is not None, 5, "start_rest")
+        sr = rig.start_rest.pose
+        rig.odom_xyz = np.array([sr.position.x, sr.position.y, sr.position.z])
+        rig.yaw = 2.0 * math.atan2(sr.orientation.z, sr.orientation.w)
         rig.q = np.array(m.q_d)
+        print(f"    start rest: base {np.round(rig.odom_xyz, 3).tolist()} yaw {math.degrees(rig.yaw):.1f} deg "
+              f"(circle centred on the origin: EE at r = 0.5 m)")
         wait(lambda: rig.start_err is not None and rig.start_err[3] == 1.0, 10, "at start")
         print(f"[6] at start: errors {np.round(rig.start_err[:3], 4).tolist()}")
         assert rig.ee_status.startswith("READY"), rig.ee_status
@@ -185,7 +193,13 @@ def main():
         print(f"[8] run streamed {len(ms)} samples, max EE step {steps.max()*1e3:.2f} mm, "
               f"EE excursion {np.ptp(ee, axis=0).round(3).tolist()} m")
         assert steps.max() < 0.01
-        assert np.ptp(ee[:, 0]) > 0.8 or np.ptp(ee[:, 1]) > 0.8, "the EE did not go round the circle"
+        # centred on the origin: every streamed EE sample sits at the radius the
+        # planner's own path reports (the configured ee_traj_circle_radius)
+        path = rig.path.reshape(-1, 9)
+        radius = float(np.hypot(path[0, 1], path[0, 2]))
+        assert np.ptp(ee[:, 0]) > 1.6 * radius and np.ptp(ee[:, 1]) > 1.6 * radius, "the EE did not go round the circle"
+        assert np.allclose(np.hypot(ee[:, 0], ee[:, 1]), radius, atol=3e-3), "circle not centred on the origin"
+        print(f"    circle radius {radius:.3f} m about the origin, all samples within 3 mm")
         # ends where it started
         assert np.linalg.norm(ee[-1] - ee[0]) < 5e-3, np.linalg.norm(ee[-1] - ee[0])
         assert np.linalg.norm(xcd - np.array([ms[-1].x_cd.x, ms[-1].x_cd.y, ms[-1].x_cd.z])) < 5e-3

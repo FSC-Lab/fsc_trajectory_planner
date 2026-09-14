@@ -203,6 +203,9 @@ public:
     declare_parameter<double>("ee_traj_lap_time", 24.0);
     declare_parameter<int>("ee_traj_laps", 2);
     declare_parameter<bool>("ee_traj_ccw", true);
+    // circle centred on the world origin at the current EE height (true) or
+    // through the current EE point (false)
+    declare_parameter<bool>("ee_traj_center_origin", true);
     declare_parameter<double>("ee_traj_ramp_time", 4.0);
     // EE attitude about its heading (= the fold q2+q3 at rest). 80 deg is the
     // flown home fold; 0 (a level EE) is this arm's wrist singularity and is
@@ -271,6 +274,9 @@ public:
     ee_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/path", latched);
     ee_start_err_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/start_error", 10);
     ee_ref_pose_pub_ = create_publisher<PoseStamped>(prefix + "/ee_trajectory/reference_pose", 10);
+    // the run's start rest as a BASE pose (actual yaw), latched: what
+    // go_to_start flies to and what the Start gate measures against
+    ee_start_rest_pub_ = create_publisher<PoseStamped>(prefix + "/ee_trajectory/start_rest", latched);
     ee_select_sub_ = create_subscription<String>(
       prefix + "/ee_trajectory/select", 10, [this](const String & m) {onEeSelect(m);});
     ee_scale_sub_ = create_subscription<Float64>(
@@ -1081,6 +1087,7 @@ private:
     sh.lap_time = get_parameter("ee_traj_lap_time").as_double();
     sh.laps = static_cast<int>(get_parameter("ee_traj_laps").as_int());
     sh.ccw = get_parameter("ee_traj_ccw").as_bool();
+    sh.center_origin = get_parameter("ee_traj_center_origin").as_bool();
     return sh;
   }
 
@@ -1236,6 +1243,7 @@ private:
         publishEeStatus(m.str());
         publishEeInfo(s_max, o.time_scale, diag);
         publishEePath(traj.get());
+        publishEeStartRest(traj->goalRest());
       });
   }
 
@@ -1359,6 +1367,20 @@ private:
       m.data = {pos, yaw * 180.0 / M_PI, joint * 180.0 / M_PI, ready ? 1.0 : 0.0};
     }
     ee_start_err_pub_->publish(m);
+  }
+
+  void publishEeStartRest(const RestSpec & r)
+  {
+    PoseStamped m;
+    m.header.stamp = now();
+    m.header.frame_id = "world";
+    m.pose.position.x = r.x_b(0);
+    m.pose.position.y = r.x_b(1);
+    m.pose.position.z = r.x_b(2);
+    const double yaw = r.phi + 0.5 * M_PI;   // model heading -> actual yaw
+    m.pose.orientation.z = std::sin(0.5 * yaw);
+    m.pose.orientation.w = std::cos(0.5 * yaw);
+    ee_start_rest_pub_->publish(m);
   }
 
   void publishEeStatus(const std::string & s)
@@ -1573,7 +1595,7 @@ private:
   rclcpp::TimerBase::SharedPtr stream_timer_, ee_timer_;
   rclcpp::Publisher<String>::SharedPtr ee_status_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr ee_info_pub_, ee_path_pub_, ee_start_err_pub_;
-  rclcpp::Publisher<PoseStamped>::SharedPtr ee_ref_pose_pub_;
+  rclcpp::Publisher<PoseStamped>::SharedPtr ee_ref_pose_pub_, ee_start_rest_pub_;
   rclcpp::Subscription<String>::SharedPtr ee_select_sub_;
   rclcpp::Subscription<Float64>::SharedPtr ee_scale_sub_;
   rclcpp::Service<Trigger>::SharedPtr ee_go_srv_, ee_start_srv_;

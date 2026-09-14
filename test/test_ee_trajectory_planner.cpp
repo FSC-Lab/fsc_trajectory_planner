@@ -59,8 +59,15 @@ TEST_P(EeTrajectoryTest, RunIsCompatibleAndBounded)
   EXPECT_LT((traj->goalRest().x_b - r0.x_b).norm(), 1e-12);
   // q1 is the fixed joint, q2 the assigned sinusoid
   EXPECT_LT(std::abs(a.q_d(0)), 1e-9);
-  // the EE heading follows the tangent: at t = 0 the model heading is the hold's
-  EXPECT_NEAR(std::atan2(a.b1_de(1), a.b1_de(0)), homeHold(*v).phi, 1e-3);
+  // the EE heading follows the tangent: at t = 0 it is the start rest's heading
+  EXPECT_NEAR(std::atan2(a.b1_de(1), a.b1_de(0)), r0.phi, 1e-3);
+  if (shape.type == "circle") {
+    // centred on the world origin: the EE stays at the radius all run long
+    for (double t = 0.0; t <= traj->duration(); t += 0.5) {
+      const WbReference c = traj->eval(t);
+      EXPECT_NEAR(std::hypot(c.r_ed(0), c.r_ed(1)), shape.radius, 2e-3);
+    }
+  }
   // smooth: no gap in the streamed reference at 100 Hz
   double worst = 0.0;
   WbReference prev = traj->eval(0.0);
