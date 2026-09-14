@@ -16,31 +16,19 @@
 
 #include <string>
 
-#include "fsc_trajectory_planner/wb_model.hpp"
-#include "fsc_trajectory_planner/wb_types.hpp"
+#include "fsc_trajectory_planner/wb_law.hpp"
 
 namespace fsc_trajectory_planner
 {
 
-// The validated OM-X working range [rad] — the same numbers every arm config
-// carries (min/max_position), transition_planner.Q_MIN/Q_MAX and the C++
-// WbReferenceBuilder::kQMin/kQMax. q4 = +-120 deg since 2026-08-23.
-inline constexpr double kArmQMin[kNumJoints] = {-0.610865, -1.396263, -0.698132,
-  -2.0943951};
-inline constexpr double kArmQMax[kNumJoints] = {0.610865, 0.872665, 0.872665,
-  2.0943951};
+// Joint limits: kArmQMin/kArmQMax (wb_law.hpp) -- the flight node's own.
 
 // Non-dimensional singularity margin of the certified-safe set
 // (transition_planner.SIGMA_ND_MARGIN).
 inline constexpr double kSigmaNdMargin = 0.10;
 
-// A static hold: base position (world), MODEL heading, joint vector.
-struct RestSpec
-{
-  Vec3 x_b{Vec3::Zero()};
-  double phi{0.0};
-  VecN q{VecN::Zero()};
-};
+// RestSpec (a static hold: base position, MODEL heading, joints) is the
+// flight node's, via wb_law.hpp.
 
 // ---- elementary rotations ------------------------------------------------
 Mat3 Rz(double a);

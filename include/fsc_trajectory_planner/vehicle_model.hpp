@@ -15,9 +15,8 @@
 #include <string>
 #include <vector>
 
-#include "fsc_trajectory_planner/flat_planner.hpp"
 #include "fsc_trajectory_planner/kinematics.hpp"
-#include "fsc_trajectory_planner/wb_model.hpp"
+#include "fsc_trajectory_planner/wb_law.hpp"
 
 namespace fsc_trajectory_planner
 {

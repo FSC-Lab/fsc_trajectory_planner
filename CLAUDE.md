@@ -17,15 +17,25 @@ It replaces the Python `whole_body_planner.py` that lived in
 and imported its maths from `fsc_PegasusSimulator`'s
 `extensions/fsc_aerial_manipulation/.../robotic_arm/utils_planner`. That
 coupling — a flight-stack node importing a simulator extension by filesystem
-path — is gone: **nothing here depends on Pegasus or on `fsc_autopilot_ros2`.**
-The only workspace dependency is `fsc_autopilot_ros2_msgs` (the
-`WholeBodyReference` and `PositionControllerReference` messages) plus
-`px4_msgs`. The Python planner directory was DELETED from the autopilot repo
-the same day (nothing launched it any more); its four rig tests were ported
-here (`test/test_planner_loopback.py`, `test_go_home.py`,
-`test_replan_stream.py`, `test_traj_viz.py`) and pass against this node. The
-Python *maths* still exists in Pegasus (`utils_planner`, imported by its demos
-and truth generators) and is what `scripts/dump_python_fixtures.py` reads.
+path — is gone. **Nothing here depends on Pegasus.** The whole-body model and
+the flat B-spline planner are NOT copied either (they were, for one day):
+since 2026-09-14 (evening) the package links the flight stack's exported
+library **`fsc_autopilot_ros2::wb_law`** — the very `wb_model.cpp` /
+`flat_planner.cpp` the whole-body node flies and its parity tests lock — so a
+model fix in the autopilot is a fix here on the next build, and there is no
+second copy to drift. `include/fsc_trajectory_planner/wb_law.hpp` is the one
+place that dependency is named; it imports the types into this namespace.
+The other workspace dependencies are `fsc_autopilot_ros2_msgs` (the
+`WholeBodyReference` and `PositionControllerReference` messages) and
+`px4_msgs`. Build order: `fsc_autopilot_ros2_msgs` → `fsc_autopilot_ros2` →
+this package (package.xml declares it, colcon orders it).
+
+The Python planner directory was DELETED from the autopilot repo the same day
+(nothing launched it any more); its four rig tests were ported here
+(`test/test_planner_loopback.py`, `test_go_home.py`, `test_replan_stream.py`,
+`test_traj_viz.py`) and pass against this node. The Python *maths* still
+exists in Pegasus (`utils_planner`, imported by its demos and truth
+generators) and is what `scripts/dump_python_fixtures.py` reads.
 
 Why C++: a plan is **~3-4 ms** here (straight-line Picard 4.1 ms, flat
 B-spline 2.9 ms, Release build) against 45-260 ms in Python. The whole-body
@@ -35,34 +45,37 @@ model alone was 6 µs vs 1 ms per `dynamics()` call.
 
 ```
 include/fsc_trajectory_planner/
-  wb_types.hpp            fixed-size Eigen types, WbReference (the law's 16-field reference)
-  wb_model.hpp            WholeBodyParams (+ t650Defaults), FK, computeDynamics  [copied from the flight node]
-  kinematics.hpp          RestSpec, Rz/Rx, minsnap3, buildR0, zxzAngles, armKinematics,
-                          armTaskJacobian, sigmaNd, restReference, ikPositionAzimuth, ikWorld,
-                          kArmQMin/kArmQMax, kSigmaNdMargin
+  wb_law.hpp              THE dependency: includes fsc_autopilot_ros2's wb_types/wb_model/
+                          flat_planner/wb_reference_builder headers and imports the types
+                          (Vec3.., WbReference, WholeBodyParams, RestSpec, RotorModel, FlatPlan*,
+                          kArmQMin/kArmQMax = WbReferenceBuilder::kQMin/kQMax) into this namespace
+  kinematics.hpp          Rz/Rx, minsnap3, buildR0, zxzAngles, armKinematics, armTaskJacobian,
+                          sigmaNd, restReference, ikPositionAzimuth, ikWorld, kSigmaNdMargin
   vehicle_model.hpp       VehicleModel + VehicleOptions + the VEHICLE REGISTRY (name -> factory)
   trajectory.hpp          Trajectory / HoldTrajectory / PlanOptions / PlanRequest /
                           TrajectoryPlanner + the PLANNER REGISTRY (name -> factory)
-  transition_planner.hpp  StraightLineTransitionPlanner, FlatBSplineTransitionPlanner
-  flat_planner.hpp        the flat B-spline planner (ClampedBSpline, planFlatTransition) [copied]
+  transition_planner.hpp  StraightLineTransitionPlanner, FlatBSplineTransitionPlanner (adapter
+                          over wb_law's planFlatTransition)
 src/
-  wb_model.cpp, flat_planner.cpp           copied from fsc_autopilot_ros2's client_lib (see "Provenance")
   kinematics.cpp                           port of transition_planner.py / compatible_trajectory.py helpers
   transition_planner.cpp                   port of plan_transition() (Picard) + the bspline adapter
-  vehicle_model.cpp                        the registry: "t650_aerial_manipulator"
+  vehicle_model.cpp                        the registry: "t650_aerial_manipulator" (WholeBodyParams::t650Defaults + RotorModel::t650 from wb_law)
   trajectory.cpp                           HoldTrajectory + the registry: "straight_line", "bspline"
   whole_body_trajectory_planner_node.cpp   the rclcpp node (port of whole_body_planner.py's state machine)
 launch/whole_body_trajectory_planner_launch.py     uav_prefix -> namespace, params_file, overrides
 config/whole_body_trajectory_planner_t650_aerial_manipulator.yaml   the standalone default config
-test/  test_kinematics.cpp, test_transition_planner.cpp, test_flat_planner.cpp (gtest, parity vs Python)
+test/  test_kinematics.cpp, test_transition_planner.cpp (gtest, parity vs Python, fixtures under data/)
+       test_flat_planner.cpp (gtest, parity vs Python through the registry, reading the AUTOPILOT's
+         installed fixture share/fsc_autopilot_ros2/test_data/flat_plan_t650.txt -- path compiled in)
        test_planner_loopback.py, test_go_home.py, test_replan_stream.py, test_traj_viz.py
          (rclpy rigs driving the built node end to end, no sim -- ported from the Python planner)
-       data/python_kinematics_t650.txt, python_transition_t650.txt, flat_plan_t650.txt (fixtures)
+       data/python_kinematics_t650.txt, python_transition_t650.txt (fixtures)
 scripts/dump_python_fixtures.py   DEV-ONLY: regenerates the python_* fixtures from Pegasus
 ```
 
 Library target: `fsc_trajectory_planner::planner_lib` (static, PIC, exported)
-— pure Eigen, no ROS. Executable: `whole_body_trajectory_planner`.
+— pure Eigen on top of `fsc_autopilot_ros2::wb_law`, no ROS. Executable:
+`whole_body_trajectory_planner`.
 
 ## Build / test
 
@@ -181,10 +194,10 @@ also need a trigger (a service taking name + parameters) in the node.
 - Min-snap (septic) phase is REQUIRED for the straight-line task, not a nicety:
   the solved CoM velocity depends on the prescribed jerk, so min-jerk endpoints
   step the CoM velocity at the hold joins.
-- `kArmQMin/kArmQMax`, `GRIPPER_OFF_WRIST` (0.108 m, inside `t650Defaults`),
-  `home_pose` and `tau_joint_max` each exist in several places (this package,
-  the flight node's `WbReferenceBuilder`, the arm controller, the Isaac plant,
-  the arm GS). Change one, change all.
+- `GRIPPER_OFF_WRIST` (0.108 m, inside `t650Defaults`), the joint box, `home_pose`
+  and `tau_joint_max` each exist in several places (the flight node — which this
+  package now shares by linking — the arm controller, the Isaac plant, the arm
+  GS). Change one, change all.
 - `base_com` MUST equal the flight node's `wb_base_com_*` (the hardware
   launcher cross-checks and refuses); the node builds `x_cd` from this model
   while the law computes `x_c` from its own.
@@ -194,17 +207,18 @@ also need a trigger (a service taking name + parameters) in the node.
 
 ## Provenance and parity
 
-`wb_types.hpp`, `wb_model.{hpp,cpp}` and `flat_planner.{hpp,cpp}` are copies of
-the flight node's `client_lib` (namespace `nodelib::wb` → `fsc_trajectory_planner`,
-`WbReferenceBuilder::kQMin/kQMax` → `kArmQMin/kArmQMax`, `RestSpec` moved to
-`kinematics.hpp`, two anonymous helpers renamed to avoid clashes). They were
-copied rather than linked so this package builds without `fsc_autopilot_ros2`;
-the trade is that a model fix in one must be mirrored in the other — the
-parity fixtures (`flat_plan_t650.txt` is byte-identical to the flight node's)
-are what catch a drift. `kinematics.cpp` and `transition_planner.cpp` are
-fresh ports of the Python; `scripts/dump_python_fixtures.py` regenerates
-their fixtures from a Pegasus checkout (`FSC_PEGASUS_ROOT`, default
-`~/Source/fsc_PegasusSimulator`, run with `PYTHONNOUSERSITE=1 /usr/bin/python3`).
+The whole-body model, the flat B-spline planner, `RestSpec`, `RotorModel` and
+the joint box are **the flight node's, linked** (`fsc_autopilot_ros2::wb_law`,
+exported by `fsc_autopilot_ros2/CMakeLists.txt`; headers under
+`include/single_aerial_manipulator_whole_body_direct_actuation/`). Do not
+copy any of them back into this package: the day they were copied
+(2026-09-14, morning) is exactly the drift risk the user asked to remove.
+`kinematics.cpp` and `transition_planner.cpp` are fresh ports of the Python;
+`scripts/dump_python_fixtures.py` regenerates their fixtures from a Pegasus
+checkout (`FSC_PEGASUS_ROOT`, default `~/Source/fsc_PegasusSimulator`, run
+with `PYTHONNOUSERSITE=1 /usr/bin/python3`). The flat-planner parity test
+reads the autopilot's installed fixture, so the two packages can never hold
+two different truths for the same code.
 
 ## Where it is wired in
 
@@ -246,6 +260,14 @@ Record: `fsc_PegasusSimulator/docs/docs_aerial_manipulator/trajectory_planner_cp
 compared like-for-like against the Python planner in flight (the plant config
 has moved since the 2026-09-06 run E table); the reference streams are
 identical to 1e-9 by the parity tests, which is the claim that matters.
+
+**Second flight, same evening, after re-basing the package on the linked
+`fsc_autopilot_ros2::wb_law`** (tag `cpp_planner_wblaw`): 10/10 legs, no
+refusal, no abort, stream fresh 100 %, u1 47.60 N. Per-leg peak / settled
+CoM error: x 318-356 / 79-84 mm, y 328-389 / 79-89 mm, yaw 77-167 / 46-53 mm,
+compatible EE trajectory 46 / 21 mm (back 35 / 15 mm), whole-system move
+209-220 / 71-76 mm — same profile as the first flight within the rig's
+run-to-run scatter. Score in the same record directory.
 
 Not yet done: a hardware flight with this node (the hardware launcher is
 wired and passes `base_com` / `arm_joint_sign`, unflown), and the figure-8 /

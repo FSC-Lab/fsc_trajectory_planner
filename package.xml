@@ -23,6 +23,8 @@
   <depend>trajectory_msgs</depend>
   <depend>px4_msgs</depend>
   <depend>fsc_autopilot_ros2_msgs</depend>
+  <!-- the whole-body model + flat B-spline planner: the exported wb_law target -->
+  <depend>fsc_autopilot_ros2</depend>
   <depend>eigen</depend>
 
   <exec_depend>ros2launch</exec_depend>

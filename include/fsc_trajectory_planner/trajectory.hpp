@@ -29,7 +29,7 @@
 
 #include "fsc_trajectory_planner/kinematics.hpp"
 #include "fsc_trajectory_planner/vehicle_model.hpp"
-#include "fsc_trajectory_planner/wb_types.hpp"
+#include "fsc_trajectory_planner/wb_law.hpp"
 
 namespace fsc_trajectory_planner
 {

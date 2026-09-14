@@ -1,6 +1,7 @@
 // Parity of the flat B-spline backend against the Python
-// flat_bspline_planner.py (fixture test/data/flat_plan_t650.txt, from
-// fsc_PegasusSimulator's dump_flat_reference.py), through the registry.
+// flat_bspline_planner.py, through the registry. The fixture is the flight
+// stack's own (share/fsc_autopilot_ros2/test_data/flat_plan_t650.txt, from
+// fsc_PegasusSimulator's dump_flat_reference.py); its path is compiled in.
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -26,8 +27,8 @@ std::vector<double> readRow(std::istream & in, int n)
 
 TEST(FlatBSpline, ParityWithPython)
 {
-  std::ifstream in("data/flat_plan_t650.txt");
-  ASSERT_TRUE(in.good()) << "run from the test/ directory";
+  std::ifstream in(WB_FLAT_FIXTURE);
+  ASSERT_TRUE(in.good()) << "fixture not found: " << WB_FLAT_FIXTURE;
   const auto vehicle = makeVehicleModel("t650_aerial_manipulator");
   const auto planner = makePlanner("bspline");
   PlanRequest req;

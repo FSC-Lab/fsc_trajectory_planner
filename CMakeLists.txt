@@ -24,16 +24,17 @@ find_package(trajectory_msgs REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(fsc_autopilot_ros2_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+# The whole-body model and the flat B-spline planner are the flight stack's
+# exported wb_law library (fsc_autopilot_ros2::wb_law) -- linked, never copied.
+find_package(fsc_autopilot_ros2 REQUIRED)
 
 # ---------------------------------------------------------------------------
-# The planning library: pure Eigen, no ROS. Exported so another package can
-# plan with exactly this code.
+# The planning library: pure Eigen, no ROS, on top of wb_law. Exported so
+# another package can plan with exactly this code.
 # ---------------------------------------------------------------------------
 add_library(planner_lib STATIC
-  src/wb_model.cpp
   src/kinematics.cpp
   src/vehicle_model.cpp
-  src/flat_planner.cpp
   src/transition_planner.cpp
   src/trajectory.cpp)
 set_target_properties(planner_lib PROPERTIES
@@ -42,7 +43,7 @@ set_target_properties(planner_lib PROPERTIES
 target_include_directories(planner_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(planner_lib PUBLIC Eigen3::Eigen)
+target_link_libraries(planner_lib PUBLIC fsc_autopilot_ros2::wb_law Eigen3::Eigen)
 
 # ---------------------------------------------------------------------------
 # The ROS 2 node.
@@ -72,11 +73,11 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(export_planner_lib HAS_LIBRARY_TARGET)
-ament_export_dependencies(Eigen3)
+ament_export_dependencies(fsc_autopilot_ros2 Eigen3)
 
 # ---------------------------------------------------------------------------
-# Tests: parity against the Python planners (committed fixtures) and the
-# planner self-checks.
+# Tests: parity against the Python planners (committed fixtures for the ported
+# code, the flight stack's fixture for wb_law) and the planner self-checks.
 # ---------------------------------------------------------------------------
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -89,6 +90,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_flat_planner test/test_flat_planner.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_flat_planner planner_lib)
+  # The parity fixture is the flight stack's own (installed beside its
+  # flat_planner_selftest), so the two tests can never disagree on the truth.
+  get_filename_component(_wb_share "${fsc_autopilot_ros2_DIR}/.." ABSOLUTE)
+  target_compile_definitions(test_flat_planner PRIVATE
+    WB_FLAT_FIXTURE="${_wb_share}/test_data/flat_plan_t650.txt")
 endif()
 
 ament_package()
