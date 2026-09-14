@@ -50,8 +50,8 @@
     # EE attitude about its heading = the fold q2+q3 at rest. 80 deg is the
     # flown home fold; 0 (a level EE) is this arm's wrist singularity -> refused.
     ee_traj_fold_deg: 80.0
-    ee_traj_q2_center_deg: 30.0     # the assigned redundancy DoF: q2 sinusoid
-    ee_traj_q2_amp_deg: 12.0
+    ee_traj_q2_center_deg: 40.0     # the assigned redundancy DoF: q2 sinusoid
+    ee_traj_q2_amp_deg: 8.0
     ee_traj_q2_period_s: 0.0        # 0 -> one lap
     ee_traj_qdot_max: 0.5           # [rad/s]
     ee_traj_time_scale: 1.0         # the default request; the GS slider overrides
