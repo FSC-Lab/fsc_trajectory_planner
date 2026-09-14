@@ -314,6 +314,10 @@ drag to orbit, wheel to zoom; status lines are overlaid on the view.
 | out | `start_error` (10 Hz) | `[pos_err_m, yaw_err_deg, joint_err_deg, ready]` |
 | out | `reference_pose` (20 Hz while streaming) | `PoseStamped`, the current EE reference |
 | out | `start_rest` (latched) | `PoseStamped`, the run's start BASE pose (actual yaw): what go_to_start flies to |
+
+`maxTimeScale` also carries the refusal from its slowest probe, so when
+nothing is feasible the status names the binding bound (a geometry one, since
+rates vanish as the run slows) instead of a bare "no feasible time scale".
 | srv | `go_to_start`, `start` | `std_srvs/Trigger` |
 
 The run is a `Trajectory`, so the node's existing EXECUTING machinery streams
@@ -337,6 +341,13 @@ z-x-x-z OM-X chain:
    translated onto the held EE point. Yaw = the curve's tangent (ACTUAL
    azimuth), R_e = Rz(ψ_tan − π/2)·Rx(β_e) in the MODEL frame. The run's
    start rest is published latched on `ee_trajectory/start_rest`.
+   **The assigned q₂ and the fold are coupled and are checked before the
+   solve:** at rest q₃ = β_e − q₂ exactly, so the q₂ sinusoid's whole range
+   must leave q₃ inside its box. At the 80° fold that pins q₂ to [30°, 50°],
+   i.e. a centre of 40° with an amplitude up to 9° (10° grazes the +50° stop
+   once the thrust tilt is added). A split that does not fit is refused in
+   0.1 ms naming the fold, the implied q₃ range and the admissible centres,
+   rather than after several seconds of failed time-scale probes.
    **β_e (`ee_traj_fold_deg`, default 80° = the flown home fold) is the EE's
    roll about its heading.** A literally level EE (β_e = 0) is this arm's
    wrist singularity — joints 1 and 4 share the vertical axis — and violates

@@ -1200,8 +1200,10 @@ private:
           std::lock_guard<std::recursive_mutex> lk(lock_);
           if (ee_s_max_.has_value()) {s_max = *ee_s_max_;}
         }
+        std::string smax_reason;
         if (need_smax) {
-          s_max = EeTrajectoryPlanner::maxTimeScale(*vehicle_, hold, shape, opts);
+          s_max = EeTrajectoryPlanner::maxTimeScale(
+            *vehicle_, hold, shape, opts, 6.0, 0.02, &smax_reason);
         }
         std::shared_ptr<Trajectory> traj;
         EeTrajectoryDiag diag;
@@ -1209,7 +1211,11 @@ private:
         EeTrajectoryOptions o = opts;
         o.time_scale = std::max(0.05, std::min(s_req, s_max > 0.0 ? s_max : s_req));
         if (s_max <= 0.0) {
-          err = "no feasible time scale for this trajectory from the current hold";
+          // name the bound that refuses even the slowest run: a bare "no
+          // feasible time scale" leaves the operator with nothing to change
+          err = smax_reason.empty()
+            ? std::string("no feasible time scale for this trajectory from the current hold")
+            : smax_reason;
         } else {
           try {
             traj = EeTrajectoryPlanner::plan(*vehicle_, hold, shape, o, &diag);

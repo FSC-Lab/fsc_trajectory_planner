@@ -268,6 +268,47 @@ std::unique_ptr<Trajectory> EeTrajectoryPlanner::plan(
   traj->rest0_ = startRest(v, hold, shape, o);
   const WbReference rest_ref = restReference(P, traj->rest0_);
 
+  // ---- the assigned split against the joint box ----------------------------
+  // q2 is ASSIGNED and the fold beta_e is prescribed, so q3 = beta_e - q2 is
+  // fixed before anything is solved: at rest the two are exactly
+  // complementary. Checking it here costs nothing and names the coupling,
+  // instead of letting every time scale fail on a generic joint-box message
+  // several seconds later (the split and the fold are what the operator would
+  // otherwise have to work out from the numbers).
+  {
+    const double c = o.q2_center_deg * M_PI / 180.0, a = std::abs(o.q2_amp_deg) * M_PI / 180.0;
+    const double q2_lo = c - a, q2_hi = c + a;
+    const double beta = o.ee_fold_deg * M_PI / 180.0;
+    const double q3_lo = beta - q2_hi, q3_hi = beta - q2_lo;
+    const bool q2_ok = q2_lo >= v.q_min(1) - 1e-9 && q2_hi <= v.q_max(1) + 1e-9;
+    const bool q3_ok = q3_lo >= v.q_min(2) - 1e-9 && q3_hi <= v.q_max(2) + 1e-9;
+    if (!q2_ok || !q3_ok) {
+      const double deg = 180.0 / M_PI;
+      // the q2 centres that keep BOTH joints inside their stops at this fold
+      const double c_lo = std::max(v.q_min(1) + a, beta - v.q_max(2) + a);
+      const double c_hi = std::min(v.q_max(1) - a, beta - v.q_min(2) - a);
+      std::ostringstream m;
+      m.setf(std::ios::fixed);
+      m.precision(1);
+      m << "the assigned arm split does not fit the joint box: with the "
+        << "end-effector fold " << o.ee_fold_deg << " deg, q2 = " << o.q2_center_deg
+        << " +- " << std::abs(o.q2_amp_deg) << " deg forces q3 = fold - q2 = ["
+        << q3_lo * deg << ", " << q3_hi * deg << "] deg against ["
+        << v.q_min(2) * deg << ", " << v.q_max(2) * deg << "] (q2 box ["
+        << v.q_min(1) * deg << ", " << v.q_max(1) * deg << "]). ";
+      if (c_lo <= c_hi) {
+        m << "At this fold and amplitude the q2 centre must lie in [" << c_lo * deg
+          << ", " << c_hi * deg << "] deg";
+      } else {
+        m << "No q2 centre works at this amplitude: reduce ee_traj_q2_amp_deg, "
+          << "or change the fold (q2 + q3 = fold, so lowering one raises the other)";
+      }
+      d.violation = m.str();
+      d.summary = shape.type + ": INFEASIBLE: " + d.violation;
+      throw std::runtime_error(d.violation);
+    }
+  }
+
   // ---- grid and prescribed data --------------------------------------------
   const int N = static_cast<int>(std::floor(tp.T_total * o.sample_rate)) + 1;
   Eigen::VectorXd t = Eigen::VectorXd::LinSpaced(N, 0.0, tp.T_total);
@@ -494,8 +535,9 @@ std::unique_ptr<Trajectory> EeTrajectoryPlanner::plan(
 
 double EeTrajectoryPlanner::maxTimeScale(
   const VehicleModel & v, const RestSpec & hold, const EeShape & shape,
-  const EeTrajectoryOptions & o, double s_hi, double rel_tol)
+  const EeTrajectoryOptions & o, double s_hi, double rel_tol, std::string * reason)
 {
+  std::string last_err;
   // the ramps must leave phase for the laps (see makeProfile)
   const double s_cap = 0.9 * shape.laps * shape.lap_time / std::max(o.ramp_time, 1e-3);
   s_hi = std::min(s_hi, s_cap);
@@ -507,7 +549,8 @@ double EeTrajectoryPlanner::maxTimeScale(
       try {
         plan(v, hold, shape, oo, &dd);
         return true;
-      } catch (const std::exception &) {
+      } catch (const std::exception & e) {
+        last_err = e.what();
         return false;
       }
     };
@@ -515,7 +558,12 @@ double EeTrajectoryPlanner::maxTimeScale(
   // find a feasible lower bracket, halving from s_hi
   double probe = std::min(1.0, s_hi);
   while (probe > 0.02 && !feasible(probe)) {probe *= 0.5;}
-  if (probe <= 0.02) {return 0.0;}
+  if (probe <= 0.02) {
+    // every probe failed: the binding constraint is the one the slowest run
+    // still violates, which is the last message recorded
+    if (reason != nullptr) {*reason = last_err;}
+    return 0.0;
+  }
   lo = probe;
   // grow until infeasible or the cap
   while (lo < s_hi) {

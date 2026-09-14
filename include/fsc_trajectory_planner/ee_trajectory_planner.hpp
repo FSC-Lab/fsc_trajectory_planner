@@ -131,9 +131,13 @@ public:
     const EeTrajectoryOptions & o, EeTrajectoryDiag * diag);
 
   // Largest time scale (to `rel_tol`) at which plan() passes every check.
+  // Returns 0 when nothing is feasible — then `reason`, when given, carries
+  // the refusal from the SLOWEST probe, i.e. the bound that does not depend
+  // on how fast the run is flown (geometry, not rates).
   static double maxTimeScale(
     const VehicleModel & v, const RestSpec & hold, const EeShape & shape,
-    const EeTrajectoryOptions & o, double s_hi = 6.0, double rel_tol = 0.02);
+    const EeTrajectoryOptions & o, double s_hi = 6.0, double rel_tol = 0.02,
+    std::string * reason = nullptr);
 };
 
 }  // namespace fsc_trajectory_planner
