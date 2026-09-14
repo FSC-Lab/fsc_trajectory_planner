@@ -1,0 +1,49 @@
+# whole_body_trajectory_planner -- AM-T650 (T650 airframe + OM-X arm).
+#
+# Loaded by launch/whole_body_trajectory_planner_launch.py by default. The
+# flight stack's own yamls carry an identical section so one file can
+# describe a whole run; keep the two in step.
+/**/whole_body_trajectory_planner:
+  ros__parameters:
+    # Airframe + arm model, from the registry (src/vehicle_model.cpp).
+    vehicle: "t650_aerial_manipulator"
+    # Transition backend, from the registry (src/trajectory.cpp):
+    #   straight_line  Picard CoM fixed point on a straight-line EE path --
+    #                  the flight-validated one (hardware flies this)
+    #   bspline        flat B-spline outputs, constraints ENFORCED (rest,
+    #                  joint box, speed/accel, rotor + joint-torque bounds)
+    planner: "bspline"
+    stream_rate: 100.0          # WholeBodyReference + arm reference [Hz]
+
+    # --- kinematic bounds, honoured by BOTH backends ---------------------
+    v_max: 0.30                 # peak CoM speed               [m/s]
+    a_max: 0.15                 # peak CoM acceleration        [m/s^2]
+    w_max: 0.30                 # peak rate, any angle channel [rad/s]
+    t_min: 3.0                  # never faster than this       [s]
+
+    # --- bspline only ----------------------------------------------------
+    dw_max: 0.60                # peak angular acceleration    [rad/s^2]
+    t_max: 40.0                 # refuse rather than crawl     [s]
+    tau_joint_max: 3.0          # MUST equal the law's wb_tau_max; <= 0 disables
+    rotor_bounds: true          # rotor speed bounds via inverse dynamics
+    n_check: 101                # diagnostic grid; 0 disables
+
+    # The folded HOME pose (Go Home) [rad] = the arm controller's home_position.
+    home_pose: [0.0, 0.698132, 0.698132, 0.0]
+    # Bare-airframe CoM, MODEL frame [m]. MUST equal the node's wb_base_com_*.
+    base_com: [0.0, 0.0, 0.0]
+    # World-EE-anchored hold. Keep false (see the node header).
+    hold_ee_world: false
+    # ARM <-> MODEL joint sign map. Identity in Isaac; [-1, 1, 1, -1] on the
+    # URDF/Dynamixel hardware arm.
+    arm_joint_sign: [1.0, 1.0, 1.0, 1.0]
+
+    # Topic layout (relative to the vehicle namespace).
+    topic_prefix: "whole_body_planner"
+    mode_topic: "fsc_autopilot_ros2/whole_body_direct_actuation/mode"
+    reference_topic: "fsc_autopilot_ros2/whole_body_direct_actuation/reference"
+    gs_reference_topic: "fsc_autopilot_ros2/position_controller/reference"
+    odom_topic: "state_estimator/local_position/odom"
+    attitude_topic: "fmu/out/vehicle_attitude"
+    joint_states_topic: "fsc_open_manipulator/joint_states"
+    arm_reference_topic: "fsc_open_manipulator/external_torque_controller/reference_joint_trajectory"

@@ -1,0 +1,252 @@
+# CLAUDE.md — fsc_trajectory_planner
+
+Guidance for Claude Code (and anyone else) working in this package. Written
+2026-09-14, the day the package was created.
+
+## What this is
+
+`fsc_trajectory_planner` is a **self-contained C++17 / Eigen ROS 2 (ament_cmake,
+rclcpp) package** holding the whole-body trajectory planning of the FSC Lab
+aerial manipulator, and the `whole_body_trajectory_planner` node that streams
+the whole-body reference to `fsc_autopilot_ros2`'s
+`single_aerial_manipulator_whole_body_direct_actuation` flight node in DIRECT
+mode.
+
+It replaces the Python `whole_body_planner.py` that lived in
+`fsc_autopilot_ros2/.../single_aerial_manipulator_whole_body_direct_actuation/planner/`
+and imported its maths from `fsc_PegasusSimulator`'s
+`extensions/fsc_aerial_manipulation/.../robotic_arm/utils_planner`. That
+coupling — a flight-stack node importing a simulator extension by filesystem
+path — is gone: **nothing here depends on Pegasus or on `fsc_autopilot_ros2`.**
+The only workspace dependency is `fsc_autopilot_ros2_msgs` (the
+`WholeBodyReference` and `PositionControllerReference` messages) plus
+`px4_msgs`. The Python planner directory was DELETED from the autopilot repo
+the same day (nothing launched it any more); its four rig tests were ported
+here (`test/test_planner_loopback.py`, `test_go_home.py`,
+`test_replan_stream.py`, `test_traj_viz.py`) and pass against this node. The
+Python *maths* still exists in Pegasus (`utils_planner`, imported by its demos
+and truth generators) and is what `scripts/dump_python_fixtures.py` reads.
+
+Why C++: a plan is **~3-4 ms** here (straight-line Picard 4.1 ms, flat
+B-spline 2.9 ms, Release build) against 45-260 ms in Python. The whole-body
+model alone was 6 µs vs 1 ms per `dynamics()` call.
+
+## Layout
+
+```
+include/fsc_trajectory_planner/
+  wb_types.hpp            fixed-size Eigen types, WbReference (the law's 16-field reference)
+  wb_model.hpp            WholeBodyParams (+ t650Defaults), FK, computeDynamics  [copied from the flight node]
+  kinematics.hpp          RestSpec, Rz/Rx, minsnap3, buildR0, zxzAngles, armKinematics,
+                          armTaskJacobian, sigmaNd, restReference, ikPositionAzimuth, ikWorld,
+                          kArmQMin/kArmQMax, kSigmaNdMargin
+  vehicle_model.hpp       VehicleModel + VehicleOptions + the VEHICLE REGISTRY (name -> factory)
+  trajectory.hpp          Trajectory / HoldTrajectory / PlanOptions / PlanRequest /
+                          TrajectoryPlanner + the PLANNER REGISTRY (name -> factory)
+  transition_planner.hpp  StraightLineTransitionPlanner, FlatBSplineTransitionPlanner
+  flat_planner.hpp        the flat B-spline planner (ClampedBSpline, planFlatTransition) [copied]
+src/
+  wb_model.cpp, flat_planner.cpp           copied from fsc_autopilot_ros2's client_lib (see "Provenance")
+  kinematics.cpp                           port of transition_planner.py / compatible_trajectory.py helpers
+  transition_planner.cpp                   port of plan_transition() (Picard) + the bspline adapter
+  vehicle_model.cpp                        the registry: "t650_aerial_manipulator"
+  trajectory.cpp                           HoldTrajectory + the registry: "straight_line", "bspline"
+  whole_body_trajectory_planner_node.cpp   the rclcpp node (port of whole_body_planner.py's state machine)
+launch/whole_body_trajectory_planner_launch.py     uav_prefix -> namespace, params_file, overrides
+config/whole_body_trajectory_planner_t650_aerial_manipulator.yaml   the standalone default config
+test/  test_kinematics.cpp, test_transition_planner.cpp, test_flat_planner.cpp (gtest, parity vs Python)
+       test_planner_loopback.py, test_go_home.py, test_replan_stream.py, test_traj_viz.py
+         (rclpy rigs driving the built node end to end, no sim -- ported from the Python planner)
+       data/python_kinematics_t650.txt, python_transition_t650.txt, flat_plan_t650.txt (fixtures)
+scripts/dump_python_fixtures.py   DEV-ONLY: regenerates the python_* fixtures from Pegasus
+```
+
+Library target: `fsc_trajectory_planner::planner_lib` (static, PIC, exported)
+— pure Eigen, no ROS. Executable: `whole_body_trajectory_planner`.
+
+## Build / test
+
+```bash
+cd ~/Workspaces/fsc_autopilot_ws
+colcon build --packages-select fsc_trajectory_planner     # Release by default (see CMakeLists)
+colcon test  --packages-select fsc_trajectory_planner && colcon test-result --verbose
+# loopback against the built node (no sim, no PX4, ~40 s):
+source install/setup.bash && cd src/fsc_trajectory_planner/test
+python3 test_planner_loopback.py                          # yaml default backend (bspline)
+WB_GOV_PLANNER=straight_line python3 test_planner_loopback.py
+```
+
+`CMakeLists.txt` forces `CMAKE_BUILD_TYPE=Release` when none is given. Do not
+remove that: the 2026-08-27 finding in the autopilot repo was that an
+unoptimised Eigen build of this same model is ~160x slower, and the stream
+tick here runs at 100 Hz.
+
+### What the tests lock (all passing 2026-09-14, 13 gtests)
+
+| test | against | tolerance / result |
+|---|---|---|
+| `Kinematics.ParityWithPython` | `transition_planner.arm_fk_model/rest_ref/_sigma_nd/ik_world` on 6 random rests | 1e-12 m (FK), 1e-7 rad (IK), mass 1e-12 |
+| `StraightLine.ParityWithPython` | `transition_planner.plan_transition` on 4 cases × 41 samples, all 16 reference fields | prescribed channels 1e-9; solved CoM chain / q 5e-6 (measured worst **3.5e-9**) |
+| `StraightLine.EndpointsAndDerivativeChains` | the Python `_selftest` checks | endpoints on the holds, FD chains < 1e-4 |
+| `StraightLine.RefusesWristSingularGoal` | | throws with the reason |
+| `StraightLine.Timing` | | 4.1 ms/plan (python ~260 ms) |
+| `FlatBSpline.ParityWithPython` | `flat_bspline_planner.py` fixture (2 cases, 37 samples) | 1e-9, duration 1e-9, defect < 1e-9; 2.9 ms/plan |
+| loopback (`test_planner_loopback.py`) | the built node, both backends | SAFETY-silence → DIRECT hold @100 Hz → PENDING → PLANNED (ride-along) → EE target → Send → EXECUTING → completion HOLD → SAFETY silence |
+| `test_go_home.py` | the built node | Go Home plans to the home pose from an arbitrary arm pose |
+| `test_replan_stream.py` | the built node | unchanged drone target ignored; stream stays 100 Hz with no gap near the 250 ms staleness window while re-planning; the hold does not move |
+| `test_traj_viz.py` | the built node | viz_path/viz_pose layout, unit headings, nose/claw along the arm, curve starts on the hold, 20 Hz arrows, cleared on SAFETY |
+
+The straight-line solver differs from numpy only in the least-squares
+polynomial fit (Eigen JacobiSVD with numpy's column scaling and rcond); that is
+where the 1e-9 comes from, and the tolerance in the test is deliberately loose
+enough (5e-6) that a different LAPACK does not fail it.
+
+## The node — `whole_body_trajectory_planner`
+
+Behaviourally identical to the retired Python planner (same states, topics,
+services, semantics), so the arm ground station's "EE Whole-Body" tab, the
+drone ground station, the Isaac visualiser (`viz_path`/`viz_pose`) and
+`wb_l1_campaign_driver.py` all work unchanged.
+
+Run under a vehicle namespace — that is what "one UAV = one namespace" means
+here; every name below is relative:
+
+```bash
+ros2 launch fsc_trajectory_planner whole_body_trajectory_planner_launch.py uav_prefix:=uav_0 \
+    [params_file:=<yaml with a /**/whole_body_trajectory_planner section>] \
+    [planner:=straight_line|bspline] [vehicle:=t650_aerial_manipulator] \
+    [base_com:="[x,y,z]"] [arm_joint_sign:="[-1,1,1,-1]"] [hold_ee_world:=false]
+```
+
+| | name (under `/<uav_prefix>/`) |
+|---|---|
+| subscribes | `fsc_autopilot_ros2/whole_body_direct_actuation/mode` (String, latched), `fsc_autopilot_ros2/position_controller/reference` (drone GS), `fmu/out/vehicle_attitude` (PX4, best-effort), `state_estimator/local_position/odom` (position ONLY), `fsc_open_manipulator/joint_states`, `whole_body_planner/ee_target` (arm GS) |
+| publishes | `fsc_autopilot_ros2/whole_body_direct_actuation/reference` (WholeBodyReference, 100 Hz in DIRECT), `whole_body_planner/{status,pending_base,target_joints,workspace_rz,viz_path}` (latched), `whole_body_planner/{viz_pose,current_ee,current_ee_body}`, `fsc_open_manipulator/external_torque_controller/reference_joint_trajectory` (the arm reference, same sample as the law's) |
+| services | `whole_body_planner/{send,clear,go_home}` (std_srvs/Trigger) |
+
+The `whole_body_planner/` prefix is the `topic_prefix` parameter; it is kept
+so the two ground stations and the Isaac visualiser keep resolving. Every
+input topic is a parameter too (see the config yaml).
+
+States, printed verbatim on `status`: `IDLE` (SAFETY) → `HOLD` → `PENDING`
+(drone-GS target captured, never executed) → `CALCULATING` → `PLANNED T=..s`
+/ `INFEASIBLE: <reason>` → (Send) `EXECUTING T=..s` → `HOLD` at the goal.
+Any mode change to SAFETY drops everything instantly.
+
+Frames at the ROS boundary, exactly as the Python did and as the C++
+`frame_adapter` does: `R0_model = R0_actual · R_MODEL`, `phi_model =
+psi_actual − π/2`, GS/EE yaws are ACTUAL on the wire, the streamed message is
+MODEL frame. The hold is captured from MEASUREMENT throughout (odometry
+position, PX4 EKF2 attitude, encoder joints) — the 2026-09-04 decision.
+
+`hold_ee_world` stays **false** (default and in every launcher): the world-EE
+re-solve moves `x_cd` with base drift and leaves the position loop
+effectively open (2026-08-31 measurement). Do not flip it on a vehicle.
+
+The plan runs on a `std::thread` with a generation counter so a superseded
+result is discarded, and the 100 Hz stream never waits on a solve. A plan
+takes milliseconds; the thread is kept because a stalled solver must still
+never stall the stream.
+
+## Extending it
+
+**A new vehicle**: add one factory in `src/vehicle_model.cpp` returning a
+`VehicleModel` (whole-body params, rotor force limits, joint box, home pose,
+`sigma_nd` margin, fold guard, `r_model`), register it in
+`vehicleFactories()`, select it with the `vehicle` parameter. Nothing in the
+planners or the node names a vehicle. `WholeBodyParams` currently fixes the
+arm at 4 joints (`kNumJoints`), so a different arm is a bigger change than a
+different airframe.
+
+**A new trajectory shape (figure-8, circle, ...)**: implement
+`TrajectoryPlanner::plan(vehicle, request, options)` returning a `Trajectory`
+(`duration()`, `eval(t)` → `WbReference`, `goalRest()`, `diag()`), register
+it in `plannerFactories()` (`src/trajectory.cpp`), select it with the
+`planner` parameter. `PlanRequest` carries `rest0`, an optional `rest1`, and a
+free-form `shape` map (radius, period, laps, ...) so the node does not change
+when a shape needs more than two endpoints. The straight-line planner's
+`task()` shows the shape contract — prescribe every channel with analytic
+first and second time derivatives on a min-snap phase, then let the Picard
+loop solve the compatible CoM; a periodic EE path is the same machinery with a
+different `task()`. Reference: `compatible_trajectory.py`'s
+`_prescribed_task_showcase` in Pegasus is the multi-segment version of this
+(it fits one polynomial per rest-to-rest segment; a long periodic path needs
+that, a single degree-16 polynomial does not fit a lap). Today only the
+rest-to-rest transitions are wired from the ground stations; a shape would
+also need a trigger (a service taking name + parameters) in the node.
+
+**Rules that carry over from the Python planner and must not be lost:**
+
+- The node **never arms, never changes PX4 mode, never publishes in SAFETY**.
+- Min-snap (septic) phase is REQUIRED for the straight-line task, not a nicety:
+  the solved CoM velocity depends on the prescribed jerk, so min-jerk endpoints
+  step the CoM velocity at the hold joins.
+- `kArmQMin/kArmQMax`, `GRIPPER_OFF_WRIST` (0.108 m, inside `t650Defaults`),
+  `home_pose` and `tau_joint_max` each exist in several places (this package,
+  the flight node's `WbReferenceBuilder`, the arm controller, the Isaac plant,
+  the arm GS). Change one, change all.
+- `base_com` MUST equal the flight node's `wb_base_com_*` (the hardware
+  launcher cross-checks and refuses); the node builds `x_cd` from this model
+  while the law computes `x_c` from its own.
+- Unchanged drone-GS targets are ignored only while already
+  PENDING/CALCULATING/PLANNED/INFEASIBLE/EXECUTING — from HOLD an unchanged
+  target re-plans. Drivers must publish on CHANGE in DIRECT (Command.md §7.15.5).
+
+## Provenance and parity
+
+`wb_types.hpp`, `wb_model.{hpp,cpp}` and `flat_planner.{hpp,cpp}` are copies of
+the flight node's `client_lib` (namespace `nodelib::wb` → `fsc_trajectory_planner`,
+`WbReferenceBuilder::kQMin/kQMax` → `kArmQMin/kArmQMax`, `RestSpec` moved to
+`kinematics.hpp`, two anonymous helpers renamed to avoid clashes). They were
+copied rather than linked so this package builds without `fsc_autopilot_ros2`;
+the trade is that a model fix in one must be mirrored in the other — the
+parity fixtures (`flat_plan_t650.txt` is byte-identical to the flight node's)
+are what catch a drift. `kinematics.cpp` and `transition_planner.cpp` are
+fresh ports of the Python; `scripts/dump_python_fixtures.py` regenerates
+their fixtures from a Pegasus checkout (`FSC_PEGASUS_ROOT`, default
+`~/Source/fsc_PegasusSimulator`, run with `PYTHONNOUSERSITE=1 /usr/bin/python3`).
+
+## Where it is wired in
+
+- `fsc_autopilot_ros2/scripts/isaacsim/start_whole_body_{,l1_}direct_actuation_t650_aerial_manipulator_stack.sh`
+  — the `planner` tmux window now runs this node (`ros2 launch ... params_file:=<the flight yaml>`).
+- `fsc_autopilot_ros2/scripts/indoor_exp/start_whole_body_direct_actuation_stack_t650_aerial_manipulator.sh`
+  — same, passing the measured `base_com` and `arm_joint_sign:=[-1,1,1,-1]`; no Pegasus root, no interpreter probe.
+- The four whole-body yamls in `fsc_autopilot_ros2/config/` carry a
+  `/**/whole_body_trajectory_planner:` section (mirroring the old
+  `whole_body_planner:` one) so one file still describes a run.
+- `stop_isaacsim_stack.sh`, `stop_autopilot_stack.sh`, `status_autopilot_stack.sh`
+  know the executable name.
+
+## Simulation validation (Command.md §7.15.1 rig, 2026-09-14)
+
+See the section "Simulation validation record" at the end of this file.
+
+## Simulation validation record
+
+**2026-09-14, first flight of this package, Command.md §7.15.1 rig (AM-T650
+whole-body + L1, `params_single_aerial_manipulator_whole_body_l1_direct_actuation_t650_sim.yaml`,
+backend `bspline`), fsc_lab_machine, headless Isaac.** Run end to end by
+`fsc_PegasusSimulator/application/robotic_arm/utils/wb_l1_tune_cycle.sh l1 cpp_planner fsc_lab_machine`:
+clean slate → L1 stack (this node in the `planner` window, launched from the
+flight yaml) → Pegasus/PX4/arm → offboard → arm → SAFETY climb to 1 m →
+DIRECT → 20 s soak → the standard mission driven through the ground stations'
+ROS interface (`wb_l1_campaign_driver.py`: drone-GS reference topic for the
+x/y/yaw steps, arm-GS `whole_body_planner/ee_target` + `whole_body_planner/send`
+for the compatible trajectories) → SAFETY → land → disarm.
+
+Result: **10/10 legs completed, every target PLANNED within 10-20 ms, no
+INFEASIBLE, no abort, no watchdog trip**; the flight node reported the
+streamed reference fresh (debug[56] = 1) at 100.0 Hz for the whole DIRECT
+phase. Per-leg peak / settled CoM error: x steps 352-386 / 50-61 mm, y steps
+356-389 / 73-94 mm, yaw steps 70-166 / 40-45 mm, **compatible EE trajectory 34 /
+11 mm (back: 15 / 5 mm)**, whole-system base+arm move 199-211 / 69-71 mm.
+Record: `fsc_PegasusSimulator/docs/docs_aerial_manipulator/trajectory_planner_cpp_20260914/`
+(npz, metrics, stack/pegasus/driver logs) and Command.md §7.15.11. Not
+compared like-for-like against the Python planner in flight (the plant config
+has moved since the 2026-09-06 run E table); the reference streams are
+identical to 1e-9 by the parity tests, which is the claim that matters.
+
+Not yet done: a hardware flight with this node (the hardware launcher is
+wired and passes `base_com` / `arm_joint_sign`, unflown), and the figure-8 /
+circle shapes (registry hooks only).

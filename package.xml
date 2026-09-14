@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fsc_trajectory_planner</name>
+  <version>0.1.0</version>
+  <description>
+    Whole-body trajectory planner for FSC Lab aerial manipulators: a
+    self-contained C++ (Eigen) library of vehicle models, kinematics and
+    compatible-trajectory planners, plus the whole_body_trajectory_planner
+    ROS 2 node that streams the whole-body reference in DIRECT mode.
+  </description>
+  <maintainer email="longhao.qian@mail.utoronto.ca">Longhao Qian</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>px4_msgs</depend>
+  <depend>fsc_autopilot_ros2_msgs</depend>
+  <depend>eigen</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
