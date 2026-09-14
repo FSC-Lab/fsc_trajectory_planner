@@ -47,6 +47,10 @@ using nodelib::wb::FlatPlan;
 using nodelib::wb::FlatPlanDiag;
 using nodelib::wb::FlatPlanOptions;
 using nodelib::wb::planFlatTransition;
+using nodelib::wb::FlatAux;
+using nodelib::wb::FlatInputs;
+using nodelib::wb::flatState;
+using nodelib::wb::inverseInputs;
 
 // the validated OM-X working range, owned by the flight node's reference
 // builder (wb_reference_builder.hpp) -- one source for both processes.

@@ -38,6 +38,26 @@
     # URDF/Dynamixel hardware arm.
     arm_joint_sign: [1.0, 1.0, 1.0, 1.0]
 
+    # --- end-effector trajectory mode (arm GS "EE trajectory" tab) ------
+    ee_traj_circle_radius: 0.5      # [m]
+    ee_traj_fig8_a: 0.5             # figure-8 half-length along the heading [m]
+    ee_traj_fig8_b: 0.25            # half-width across it [m]
+    ee_traj_lap_time: 24.0          # one lap at time scale 1 [s]
+    ee_traj_laps: 2
+    ee_traj_ccw: true               # circle turns left of the start heading
+    ee_traj_ramp_time: 4.0          # min-snap ramp-in / ramp-out [s]
+    # EE attitude about its heading = the fold q2+q3 at rest. 80 deg is the
+    # flown home fold; 0 (a level EE) is this arm's wrist singularity -> refused.
+    ee_traj_fold_deg: 80.0
+    ee_traj_q2_center_deg: 40.0     # the assigned redundancy DoF: q2 sinusoid
+    ee_traj_q2_amp_deg: 8.0
+    ee_traj_q2_period_s: 0.0        # 0 -> one lap
+    ee_traj_qdot_max: 0.5           # [rad/s]
+    ee_traj_time_scale: 1.0         # the default request; the GS slider overrides
+    ee_traj_start_pos_tol: 0.05     # Start button gate: [m], [deg], [deg]
+    ee_traj_start_yaw_tol_deg: 5.0
+    ee_traj_start_joint_tol_deg: 3.0
+
     # Topic layout (relative to the vehicle namespace).
     topic_prefix: "whole_body_planner"
     mode_topic: "fsc_autopilot_ros2/whole_body_direct_actuation/mode"

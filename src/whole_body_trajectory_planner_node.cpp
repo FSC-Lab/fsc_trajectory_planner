@@ -22,6 +22,12 @@
 //     EXECUTING   after the operator's explicit Send (std_srvs/Trigger) the
 //                 plan streams sample-by-sample; on completion the goal
 //                 becomes the new HOLD
+//     EE TRAJECTORY MODE (2026-09-15): a periodic end-effector trajectory
+//                 (circle / figure-8) selected from the arm ground station
+//                 is planned as a whole run (ramp-in, laps, ramp-out) by
+//                 ee_trajectory_planner; `go_to_start` plans and executes the
+//                 compatible transition to its start rest, `start` streams it
+//                 -- refused unless the vehicle and arm are at that rest.
 //   Mode leaves DIRECT at ANY point -> streaming stops instantly.
 //
 // FRAMES: the ROS boundary is the ACTUAL world/FLU convention (odometry, GS
@@ -49,6 +55,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -59,6 +66,7 @@
 #include <fsc_autopilot_ros2_msgs/msg/position_controller_reference.hpp>
 #include <fsc_autopilot_ros2_msgs/msg/whole_body_reference.hpp>
 
+#include "fsc_trajectory_planner/ee_trajectory_planner.hpp"
 #include "fsc_trajectory_planner/kinematics.hpp"
 #include "fsc_trajectory_planner/trajectory.hpp"
 #include "fsc_trajectory_planner/vehicle_model.hpp"
@@ -72,6 +80,7 @@ namespace
 using geometry_msgs::msg::PoseStamped;
 using nav_msgs::msg::Odometry;
 using sensor_msgs::msg::JointState;
+using std_msgs::msg::Float64;
 using std_msgs::msg::Float64MultiArray;
 using std_msgs::msg::String;
 using std_srvs::srv::Trigger;
@@ -187,6 +196,28 @@ public:
       "arm_reference_topic",
       "fsc_open_manipulator/external_torque_controller/reference_joint_trajectory");
 
+    // --- end-effector trajectory mode -------------------------------------
+    declare_parameter<double>("ee_traj_circle_radius", 0.5);
+    declare_parameter<double>("ee_traj_fig8_a", 0.5);
+    declare_parameter<double>("ee_traj_fig8_b", 0.25);
+    declare_parameter<double>("ee_traj_lap_time", 24.0);
+    declare_parameter<int>("ee_traj_laps", 2);
+    declare_parameter<bool>("ee_traj_ccw", true);
+    declare_parameter<double>("ee_traj_ramp_time", 4.0);
+    // EE attitude about its heading (= the fold q2+q3 at rest). 80 deg is the
+    // flown home fold; 0 (a level EE) is this arm's wrist singularity and is
+    // refused by the planner's beta/sigma_nd guards.
+    declare_parameter<double>("ee_traj_fold_deg", 80.0);
+    declare_parameter<double>("ee_traj_q2_center_deg", 40.0);
+    declare_parameter<double>("ee_traj_q2_amp_deg", 8.0);
+    declare_parameter<double>("ee_traj_q2_period_s", 0.0);
+    declare_parameter<double>("ee_traj_qdot_max", 0.5);
+    declare_parameter<double>("ee_traj_time_scale", 1.0);
+    declare_parameter<double>("ee_traj_start_pos_tol", 0.05);
+    declare_parameter<double>("ee_traj_start_yaw_tol_deg", 5.0);
+    declare_parameter<double>("ee_traj_start_joint_tol_deg", 3.0);
+    ee_time_scale_req_ = get_parameter("ee_traj_time_scale").as_double();
+
     if (home.size() != kNumJoints || base_com.size() != 3 || sign.size() != kNumJoints) {
       throw std::runtime_error("home_pose/arm_joint_sign need 4 values, base_com 3");
     }
@@ -234,6 +265,27 @@ public:
     // source while it streams (the arm planner owns it in SAFETY).
     arm_ref_pub_ = create_publisher<JointTrajectory>(arm_ref_topic, 10);
 
+    // --- end-effector trajectory mode (arm GS "EE trajectory" tab) ---------
+    ee_status_pub_ = create_publisher<String>(prefix + "/ee_trajectory/status", latched);
+    ee_info_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/info", latched);
+    ee_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/path", latched);
+    ee_start_err_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/start_error", 10);
+    ee_ref_pose_pub_ = create_publisher<PoseStamped>(prefix + "/ee_trajectory/reference_pose", 10);
+    ee_select_sub_ = create_subscription<String>(
+      prefix + "/ee_trajectory/select", 10, [this](const String & m) {onEeSelect(m);});
+    ee_scale_sub_ = create_subscription<Float64>(
+      prefix + "/ee_trajectory/time_scale", 10, [this](const Float64 & m) {onEeTimeScale(m);});
+    ee_go_srv_ = create_service<Trigger>(
+      prefix + "/ee_trajectory/go_to_start",
+      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeGoToStart(r);});
+    ee_start_srv_ = create_service<Trigger>(
+      prefix + "/ee_trajectory/start",
+      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeStart(r);});
+    ee_err_timer_ = create_wall_timer(
+      std::chrono::milliseconds(100), [this]() {publishEeStartError();});
+    publishEeStatus("NONE");
+    publishEePath(nullptr);
+
     mode_sub_ = create_subscription<String>(
       mode_topic, latched, [this](const String & m) {onMode(m);});
     gs_sub_ = create_subscription<PositionControllerReference>(
@@ -277,6 +329,7 @@ public:
   ~WholeBodyTrajectoryPlanner() override
   {
     if (worker_.joinable()) {worker_.join();}
+    if (ee_worker_.joinable()) {ee_worker_.join();}
   }
 
 private:
@@ -363,6 +416,11 @@ private:
         plan_.reset();
         exec_t0_.reset();
         ++plan_gen_;
+        goal_override_.reset();
+        auto_send_ = false;
+        ee_traj_.reset();
+        ee_shape_type_.clear();
+        ++ee_gen_;
         RCLCPP_INFO(get_logger(), "SAFETY -- planner silent, targets dropped.");
       }
     }
@@ -371,6 +429,8 @@ private:
     if (!direct) {
       publishVizPath(nullptr);
       publishVizPose(nullptr);
+      publishEeStatus("NONE");
+      publishEePath(nullptr);
     }
   }
 
@@ -562,6 +622,11 @@ private:
   std::optional<RestSpec> goalRest(std::string * err, VecN * q_goal)
   {
     RestSpec g;
+    if (goal_override_.has_value()) {
+      g = *goal_override_;
+      *q_goal = g.q;
+      return g;
+    }
     if (pending_base_.has_value()) {
       g.x_b = pending_base_->first;
       g.phi = pending_base_->second;
@@ -658,8 +723,19 @@ private:
           } else {
             plan_ = traj;
             state_ = "PLANNED";
-            RCLCPP_INFO(get_logger(), "planned: %s -- awaiting Send.", traj->diag().summary.c_str());
+            if (auto_send_) {
+              auto_send_ = false;
+              goal_override_.reset();
+              exec_t0_ = Clock::now();
+              state_ = "EXECUTING";
+              RCLCPP_INFO(
+                get_logger(), "planned: %s -- executing now (go to start).",
+                traj->diag().summary.c_str());
+            } else {
+              RCLCPP_INFO(get_logger(), "planned: %s -- awaiting Send.", traj->diag().summary.c_str());
+            }
           }
+          if (!traj) {auto_send_ = false; goal_override_.reset();}
         }
         publishStatus();
         publishVizPath(traj.get());
@@ -787,7 +863,11 @@ private:
     // The arm reference, from the SAME sample the law gets, at the same rate.
     publishArmSync(ref.q_d, ref.qdot_d);
     viz_decim_ = (viz_decim_ + 1) % viz_decim_period_;
-    if (viz_decim_ == 0) {publishVizPose(&ref);}
+    if (viz_decim_ == 0) {
+      publishVizPose(&ref);
+      publishEeRefPose(ref);
+    }
+    if (finished) {refreshEeAfterHold();}
   }
 
   // World-EE-anchored HOLD: re-solve the arm against the CURRENT base pose.
@@ -989,6 +1069,382 @@ private:
     viz_pose_pub_->publish(m);
   }
 
+
+  // ================================================== EE trajectory mode
+  EeShape eeShape() const
+  {
+    EeShape sh;
+    sh.type = ee_shape_type_;
+    sh.radius = get_parameter("ee_traj_circle_radius").as_double();
+    sh.fig8_a = get_parameter("ee_traj_fig8_a").as_double();
+    sh.fig8_b = get_parameter("ee_traj_fig8_b").as_double();
+    sh.lap_time = get_parameter("ee_traj_lap_time").as_double();
+    sh.laps = static_cast<int>(get_parameter("ee_traj_laps").as_int());
+    sh.ccw = get_parameter("ee_traj_ccw").as_bool();
+    return sh;
+  }
+
+  EeTrajectoryOptions eeOptions() const
+  {
+    EeTrajectoryOptions o;
+    o.ramp_time = get_parameter("ee_traj_ramp_time").as_double();
+    o.ee_fold_deg = get_parameter("ee_traj_fold_deg").as_double();
+    o.q2_center_deg = get_parameter("ee_traj_q2_center_deg").as_double();
+    o.q2_amp_deg = get_parameter("ee_traj_q2_amp_deg").as_double();
+    o.q2_period_s = get_parameter("ee_traj_q2_period_s").as_double();
+    o.qdot_max = get_parameter("ee_traj_qdot_max").as_double();
+    o.v_max = get_parameter("v_max").as_double();
+    o.a_max = get_parameter("a_max").as_double();
+    o.w_max = get_parameter("w_max").as_double();
+    const double tjm = get_parameter("tau_joint_max").as_double();
+    o.tau_joint_max = tjm > 0.0 ? tjm : -1.0;
+    o.rotor_bounds = get_parameter("rotor_bounds").as_bool();
+    o.sigma_nd_min = vehicle_->sigma_nd_margin;
+    o.beta_min_deg = vehicle_->beta_min_deg;
+    return o;
+  }
+
+  void onEeSelect(const String & msg)
+  {
+    std::string type = msg.data;
+    std::transform(type.begin(), type.end(), type.begin(), ::tolower);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (type == "none" || type.empty()) {
+        ee_shape_type_.clear();
+        ee_traj_.reset();
+        ee_s_max_.reset();
+        ++ee_gen_;
+      } else {
+        if (type != "circle" && type != "figure8") {
+          publishEeStatus("INFEASIBLE: unknown trajectory '" + type + "' (circle | figure8)");
+          return;
+        }
+        const bool changed = type != ee_shape_type_;
+        ee_shape_type_ = type;
+        if (changed) {ee_s_max_.reset();}
+      }
+    }
+    if (type == "none" || type.empty()) {
+      publishEeStatus("NONE");
+      publishEePath(nullptr);
+      return;
+    }
+    startEePlanning();
+  }
+
+  void onEeTimeScale(const Float64 & msg)
+  {
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      ee_time_scale_req_ = msg.data;
+      if (ee_shape_type_.empty()) {return;}
+    }
+    startEePlanning();
+  }
+
+  // Re-anchor the selected trajectory on a NEW hold (a transition other than
+  // go-to-start finished): the run must start where the vehicle now is.
+  void refreshEeAfterHold()
+  {
+    bool replan = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (ee_shape_type_.empty() || !hold_.has_value()) {return;}
+      if (ee_traj_) {
+        const RestSpec r0 = ee_traj_->goalRest();
+        const bool same = (r0.x_b - hold_->x_b).norm() < 1e-3 &&
+          std::abs(wrapPi(r0.phi - hold_->phi)) < 2e-3 &&
+          (r0.q - hold_->q).cwiseAbs().maxCoeff() < 2e-3;
+        if (same) {return;}   // arrived at the run's own start rest
+      }
+      replan = true;
+    }
+    if (replan) {startEePlanning();}
+  }
+
+  void startEePlanning()
+  {
+    RestSpec hold;
+    EeShape shape;
+    EeTrajectoryOptions opts;
+    bool need_smax = false;
+    double s_req = 1.0;
+    unsigned gen = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (ee_shape_type_.empty()) {return;}
+      if (!mode_direct_ || !hold_.has_value()) {
+        publishEeStatus("NOT IN DIRECT");
+        return;
+      }
+      hold = *hold_;
+      shape = eeShape();
+      opts = eeOptions();
+      need_smax = !ee_s_max_.has_value();
+      s_req = ee_time_scale_req_;
+      gen = ++ee_gen_;
+    }
+    publishEeStatus("CALCULATING");
+    if (ee_worker_.joinable()) {ee_worker_.join();}
+    ee_worker_ = std::thread([this, hold, shape, opts, need_smax, s_req, gen]() {
+        double s_max = 0.0;
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (ee_s_max_.has_value()) {s_max = *ee_s_max_;}
+        }
+        if (need_smax) {
+          s_max = EeTrajectoryPlanner::maxTimeScale(*vehicle_, hold, shape, opts);
+        }
+        std::shared_ptr<Trajectory> traj;
+        EeTrajectoryDiag diag;
+        std::string err;
+        EeTrajectoryOptions o = opts;
+        o.time_scale = std::max(0.05, std::min(s_req, s_max > 0.0 ? s_max : s_req));
+        if (s_max <= 0.0) {
+          err = "no feasible time scale for this trajectory from the current hold";
+        } else {
+          try {
+            traj = EeTrajectoryPlanner::plan(*vehicle_, hold, shape, o, &diag);
+          } catch (const std::exception & e) {
+            err = e.what();
+          }
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != ee_gen_) {return;}          // superseded
+          ee_s_max_ = s_max;
+          ee_traj_ = traj;
+          ee_diag_ = diag;
+          ee_anchor_hold_ = hold;
+        }
+        if (!traj) {
+          RCLCPP_WARN(get_logger(), "EE trajectory infeasible: %s", err.c_str());
+          publishEeStatus("INFEASIBLE: " + err);
+          publishEePath(nullptr);
+          publishEeInfo(s_max, o.time_scale, diag);
+          return;
+        }
+        RCLCPP_INFO(
+          get_logger(), "EE trajectory READY (s_max %.2f): %s", s_max, diag.summary.c_str());
+        std::ostringstream m;
+        m.setf(std::ios::fixed);
+        m.precision(2);
+        m << "READY s=" << o.time_scale << " max=" << s_max << " T=" << diag.T_total
+          << "s EE err " << std::setprecision(1) << diag.ee_pos_err_max * 1e3 << "mm/"
+          << diag.ee_rot_err_max_deg << "deg";
+        publishEeStatus(m.str());
+        publishEeInfo(s_max, o.time_scale, diag);
+        publishEePath(traj.get());
+      });
+  }
+
+  void onEeGoToStart(Trigger::Response::SharedPtr resp)
+  {
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !hold_.has_value()) {
+        resp->success = false;
+        resp->message = "not in whole-body DIRECT";
+        return;
+      }
+      if (!ee_traj_) {
+        resp->success = false;
+        resp->message = "no EE trajectory is READY -- select one first";
+        return;
+      }
+      if (state_ == "EXECUTING") {
+        resp->success = false;
+        resp->message = "executing -- wait for the transition to finish";
+        return;
+      }
+      goal_override_ = ee_traj_->goalRest();
+      auto_send_ = true;
+      pending_base_.reset();
+      ee_target_.reset();
+      home_goal_ = false;
+    }
+    RCLCPP_INFO(get_logger(), "EE trajectory: planning the compatible transition to its start rest.");
+    startPlanning();
+    resp->success = true;
+    resp->message = "planning the compatible transition to the trajectory's start; it executes as soon as it is PLANNED";
+  }
+
+  // measured (x_b, phi, q) vs the run's start rest
+  bool startErrors(double * pos, double * yaw, double * joint)
+  {
+    Vec3 x_b;
+    Mat3 r0;
+    if (!ee_traj_ || !odomPair(&x_b, &r0) || !q_meas_.has_value()) {return false;}
+    const RestSpec r = ee_traj_->goalRest();
+    const Mat3 r0_model = r0 * vehicle_->r_model;
+    const double phi = std::atan2(r0_model(1, 0), r0_model(0, 0));
+    *pos = (x_b - r.x_b).norm();
+    *yaw = std::abs(wrapPi(phi - r.phi));
+    *joint = (*q_meas_ - r.q).cwiseAbs().maxCoeff();
+    return true;
+  }
+
+  bool atStart(double * pos, double * yaw, double * joint)
+  {
+    if (!startErrors(pos, yaw, joint)) {return false;}
+    return *pos <= get_parameter("ee_traj_start_pos_tol").as_double() &&
+           *yaw <= get_parameter("ee_traj_start_yaw_tol_deg").as_double() * M_PI / 180.0 &&
+           *joint <= get_parameter("ee_traj_start_joint_tol_deg").as_double() * M_PI / 180.0;
+  }
+
+  void onEeStart(Trigger::Response::SharedPtr resp)
+  {
+    double T = 0.0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !hold_.has_value()) {
+        resp->success = false;
+        resp->message = "not in whole-body DIRECT";
+        return;
+      }
+      if (!ee_traj_) {
+        resp->success = false;
+        resp->message = "no EE trajectory is READY";
+        return;
+      }
+      if (state_ != "HOLD" && state_ != "PLANNED" && state_ != "PENDING" && state_ != "INFEASIBLE") {
+        resp->success = false;
+        resp->message = "planner is " + state_ + " -- wait for HOLD";
+        return;
+      }
+      double pos = 0.0, yaw = 0.0, joint = 0.0;
+      if (!atStart(&pos, &yaw, &joint)) {
+        std::ostringstream m;
+        m.setf(std::ios::fixed);
+        m.precision(1);
+        m << "not at the trajectory's start: position " << pos * 100.0 << " cm, yaw "
+          << yaw * 180.0 / M_PI << " deg, joints " << joint * 180.0 / M_PI
+          << " deg off -- press Go to start first";
+        resp->success = false;
+        resp->message = m.str();
+        return;
+      }
+      plan_ = ee_traj_;
+      pending_base_.reset();
+      ee_target_.reset();
+      home_goal_ = false;
+      goal_override_.reset();
+      auto_send_ = false;
+      ++plan_gen_;
+      exec_t0_ = Clock::now();
+      state_ = "EXECUTING";
+      T = plan_->duration();
+    }
+    publishStatus();
+    publishVizPath(plan_.get());
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    m << "executing the EE trajectory, T = " << T << " s";
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "%s", resp->message.c_str());
+  }
+
+  void publishEeStartError()
+  {
+    Float64MultiArray m;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !ee_traj_) {return;}
+      double pos = 0.0, yaw = 0.0, joint = 0.0;
+      const bool ok = atStart(&pos, &yaw, &joint);
+      const bool ready = ok && state_ == "HOLD";
+      m.data = {pos, yaw * 180.0 / M_PI, joint * 180.0 / M_PI, ready ? 1.0 : 0.0};
+    }
+    ee_start_err_pub_->publish(m);
+  }
+
+  void publishEeStatus(const std::string & s)
+  {
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      ee_status_ = s;
+    }
+    String m;
+    m.data = s;
+    ee_status_pub_->publish(m);
+  }
+
+  void publishEeInfo(double s_max, double s, const EeTrajectoryDiag & d)
+  {
+    Float64MultiArray m;
+    const double type_id = ee_shape_type_ == "circle" ? 1.0 : (ee_shape_type_ == "figure8" ? 2.0 : 0.0);
+    m.data = {s, s_max, d.T_total, d.T_lap, static_cast<double>(d.laps), d.ramp_time, type_id,
+      d.ee_pos_err_max, d.ee_rot_err_max_deg, d.peak_v, d.peak_a, d.peak_qdot, d.peak_tau_joint,
+      d.min_sigma_nd};
+    ee_info_pub_->publish(m);
+  }
+
+  // The EE frame published for the operator: x = the claw axis (-R_e e3),
+  // z = the gripper's up (R_e e2), y = z x x -- a right-handed triad whose x
+  // points where the gripper points, in the shared world frame.
+  static void eeFrameQuat(const Mat3 & R0, const Mat3 & Re, geometry_msgs::msg::Quaternion * q)
+  {
+    Mat3 F;
+    F.col(0) = -Re.col(2);
+    F.col(1) = -Re.col(0);
+    F.col(2) = Re.col(1);
+    const Eigen::Quaterniond qq(R0 * F);
+    q->x = qq.x();
+    q->y = qq.y();
+    q->z = qq.z();
+    q->w = qq.w();
+  }
+
+  void eePoseOf(const WbReference & ref, PoseStamped * m) const
+  {
+    const Vec3 ac = ref.x_cd_ddot + vehicle_->params.g * Vec3{0.0, 0.0, 1.0};
+    Mat3 R0 = Mat3::Identity();
+    if (ac.norm() > 1e-9) {R0 = buildR0(ac / ac.norm(), ref.b1_d);}
+    Mat3 Re;
+    armKinematics(ref.q_d, vehicle_->params, nullptr, nullptr, &Re);
+    m->pose.position.x = ref.r_ed(0);
+    m->pose.position.y = ref.r_ed(1);
+    m->pose.position.z = ref.r_ed(2);
+    eeFrameQuat(R0, Re, &m->pose.orientation);
+  }
+
+  void publishEeRefPose(const WbReference & ref)
+  {
+    PoseStamped m;
+    m.header.stamp = now();
+    m.header.frame_id = "world";
+    eePoseOf(ref, &m);
+    ee_ref_pose_pub_->publish(m);
+  }
+
+  // [t, x, y, z, speed, qx, qy, qz, qw] per sample, world frame; empty = clear
+  void publishEePath(const Trajectory * traj)
+  {
+    Float64MultiArray m;
+    if (traj != nullptr) {
+      const int n = 400;
+      for (int k = 0; k < n; ++k) {
+        const double t = traj->duration() * k / (n - 1);
+        const WbReference ref = traj->eval(t);
+        PoseStamped ps;
+        eePoseOf(ref, &ps);
+        m.data.push_back(t);
+        m.data.push_back(ps.pose.position.x);
+        m.data.push_back(ps.pose.position.y);
+        m.data.push_back(ps.pose.position.z);
+        m.data.push_back(ref.r_ed_dot.norm());
+        m.data.push_back(ps.pose.orientation.x);
+        m.data.push_back(ps.pose.orientation.y);
+        m.data.push_back(ps.pose.orientation.z);
+        m.data.push_back(ps.pose.orientation.w);
+      }
+    }
+    ee_path_pub_->publish(m);
+  }
+
   // ---------------------------------------------------------------- status
   void publishStatus()
   {
@@ -1075,6 +1531,20 @@ private:
   std::string infeasible_reason_;
   std::optional<Clock::time_point> last_base_resolve_;
   std::thread worker_;
+  // go-to-start: the transition goal replaces the GS targets, and PLANNED
+  // executes without a Send
+  std::optional<RestSpec> goal_override_;
+  bool auto_send_{false};
+  // EE trajectory mode
+  std::string ee_shape_type_;
+  double ee_time_scale_req_{1.0};
+  std::optional<double> ee_s_max_;
+  std::shared_ptr<Trajectory> ee_traj_;
+  EeTrajectoryDiag ee_diag_;
+  RestSpec ee_anchor_hold_;
+  std::string ee_status_{"NONE"};
+  unsigned ee_gen_{0};
+  std::thread ee_worker_;
 
   // ---- live samples --------------------------------------------------------
   std::optional<Vec3> odom_p_;
@@ -1101,6 +1571,13 @@ private:
   rclcpp::Subscription<PoseStamped>::SharedPtr ee_sub_;
   rclcpp::Service<Trigger>::SharedPtr send_srv_, clear_srv_, home_srv_;
   rclcpp::TimerBase::SharedPtr stream_timer_, ee_timer_;
+  rclcpp::Publisher<String>::SharedPtr ee_status_pub_;
+  rclcpp::Publisher<Float64MultiArray>::SharedPtr ee_info_pub_, ee_path_pub_, ee_start_err_pub_;
+  rclcpp::Publisher<PoseStamped>::SharedPtr ee_ref_pose_pub_;
+  rclcpp::Subscription<String>::SharedPtr ee_select_sub_;
+  rclcpp::Subscription<Float64>::SharedPtr ee_scale_sub_;
+  rclcpp::Service<Trigger>::SharedPtr ee_go_srv_, ee_start_srv_;
+  rclcpp::TimerBase::SharedPtr ee_err_timer_;
 };
 
 }  // namespace fsc_trajectory_planner

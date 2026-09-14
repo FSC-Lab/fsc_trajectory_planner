@@ -56,9 +56,13 @@ include/fsc_trajectory_planner/
                           TrajectoryPlanner + the PLANNER REGISTRY (name -> factory)
   transition_planner.hpp  StraightLineTransitionPlanner, FlatBSplineTransitionPlanner (adapter
                           over wb_law's planFlatTransition)
+  ee_trajectory_planner.hpp  EeShape / EeTrajectoryOptions / EeTrajectoryDiag / EeTrajectoryPlanner
+                          (the periodic END-EFFECTOR TRAJECTORY mode, see its section)
+  bspline_fit.hpp         clamped uniform B-spline with sparse least-squares fitting and pinned ends
 src/
   kinematics.cpp                           port of transition_planner.py / compatible_trajectory.py helpers
   transition_planner.cpp                   port of plan_transition() (Picard) + the bspline adapter
+  ee_trajectory_planner.cpp, bspline_fit.cpp   the EE trajectory mode
   vehicle_model.cpp                        the registry: "t650_aerial_manipulator" (WholeBodyParams::t650Defaults + RotorModel::t650 from wb_law)
   trajectory.cpp                           HoldTrajectory + the registry: "straight_line", "bspline"
   whole_body_trajectory_planner_node.cpp   the rclcpp node (port of whole_body_planner.py's state machine)
@@ -171,7 +175,12 @@ planners or the node names a vehicle. `WholeBodyParams` currently fixes the
 arm at 4 joints (`kNumJoints`), so a different arm is a bigger change than a
 different airframe.
 
-**A new trajectory shape (figure-8, circle, ...)**: implement
+**Periodic end-effector trajectories** (circle, figure-8) are a separate MODE
+now — see "End-effector trajectory mode" below; a new periodic shape is one
+more branch of `localShape()` in `ee_trajectory_planner.cpp` (position and
+its τ-derivative in the shape's local frame, τ=0 tangent along +x).
+
+**A new rest-to-rest backend**: implement
 `TrajectoryPlanner::plan(vehicle, request, options)` returning a `Trajectory`
 (`duration()`, `eval(t)` → `WbReference`, `goalRest()`, `diag()`), register
 it in `plannerFactories()` (`src/trajectory.cpp`), select it with the
@@ -272,3 +281,111 @@ run-to-run scatter. Score in the same record directory.
 Not yet done: a hardware flight with this node (the hardware launcher is
 wired and passes `base_com` / `arm_joint_sign`, unflown), and the figure-8 /
 circle shapes (registry hooks only).
+
+## End-effector trajectory mode (2026-09-15)
+
+A second planning mode beside the rest-to-rest transitions: a PERIODIC
+end-effector pose trajectory (circle or figure-8) selected from the arm
+ground station's new **EE trajectory** tab, turned into a compatible
+whole-body reference and flown as one run.
+
+### What the operator sees (arm GS, `utils_custom_ground_station`, tab "EE trajectory")
+
+The Sine Test and Demos tabs were removed; this tab took their place
+(`src/ee_trajectory_panel.{hpp,cpp}`). Row 1: trajectory type (None / Circle /
+Figure-8), the time-scale slider (0 .. the planner's feasible maximum), **Go to
+start** (a compatible transition to the run's start rest, planned by the
+transition planner and executed without a Send), **Start trajectory** (enabled
+only while the planner reports vehicle position, yaw and joints within
+tolerance of that rest AND the planner is in HOLD). Below: a 3-D view of the
+planned EE path coloured by |v_ee| with a colour bar, the world triad and the
+planner's current reference EE frame (x = the claw axis, z = the gripper's up),
+drag to orbit, wheel to zoom; status lines are overlaid on the view.
+
+### Interface (`whole_body_planner/ee_trajectory/*`, relative to the vehicle namespace)
+
+| | name | type |
+|---|---|---|
+| in | `select` | `std_msgs/String` `circle` / `figure8` / `none` |
+| in | `time_scale` | `std_msgs/Float64` s (clamped to [0.05, s_max]) |
+| out | `status` (latched) | `NONE` / `NOT IN DIRECT` / `CALCULATING` / `READY s=.. max=.. T=..s EE err ..` / `INFEASIBLE: reason` |
+| out | `info` (latched) | `[s, s_max, T_total, T_lap, laps, ramp, type_id, ee_pos_err, ee_rot_err_deg, peak_v, peak_a, peak_qdot, peak_tau_j, min_sigma_nd]` |
+| out | `path` (latched) | 400 × `[t, x, y, z, speed, qx, qy, qz, qw]`, world frame |
+| out | `start_error` (10 Hz) | `[pos_err_m, yaw_err_deg, joint_err_deg, ready]` |
+| out | `reference_pose` (20 Hz while streaming) | `PoseStamped`, the current EE reference |
+| srv | `go_to_start`, `start` | `std_srvs/Trigger` |
+
+The run is a `Trajectory`, so the node's existing EXECUTING machinery streams
+it (100 Hz `WholeBodyReference` + the arm reference) and re-holds at its end.
+Selecting a shape anchors it on the CURRENT hold (EE at the held EE position,
+tangent along the drone's nose); a new hold re-anchors it, arriving at the
+run's own start rest does not. SAFETY drops everything.
+
+### The maths (`ee_trajectory_planner.{hpp,cpp}`, `bspline_fit.{hpp,cpp}`)
+
+Following the MATLAB task-space planner (`~/Downloads/Task-space Planner`,
+`main_redundant_zyxx.m` + `recover_motion_redundant.m`), adapted to the
+z-x-x-z OM-X chain:
+
+1. **EE pose curve** p_e(τ) is the circle `R (sin ωτ, ±(1−cos ωτ))` or the
+   figure-8 `(A sin ωτ, B sin 2ωτ)` rotated so its τ=0 tangent lies along the
+   drone's nose and translated onto the held EE point; yaw = the curve's
+   tangent (ACTUAL azimuth), R_e = Rz(ψ_tan − π/2)·Rx(β_e) in the MODEL frame.
+   **β_e (`ee_traj_fold_deg`, default 80° = the flown home fold) is the EE's
+   roll about its heading.** A literally level EE (β_e = 0) is this arm's
+   wrist singularity — joints 1 and 4 share the vertical axis — and violates
+   the β ≥ 5° / σ_nd ≥ 0.10 constraints the mode enforces, so it is refused
+   (the unit test `LevelEndEffectorIsRefusedAsSingular` locks that). In the
+   MATLAB model (z-y-x-x, arm hanging straight down at zero angles) the same
+   attitude is regular; the difference is the chain, not the maths.
+2. **Time scaling** τ(t): min-snap ramp-in over `ramp_time`, constant rate s
+   for `laps` whole periods minus the ramp phase, min-snap ramp-out — the run
+   starts and ends AT REST on the same pose (`startRest()`), which is what
+   makes Go-to-start a rest-to-rest transition.
+3. **Flat outputs** at every grid sample: thrust direction r → R2(r) (the
+   MATLAB `R2_from_t` minimal tilt), A = R2ᵀR_e, (ψ, β, γ) = zxz(A): the first
+   z angle is the DRONE yaw (q1 is fixed at 0), β = q2 + q3 with q2 the
+   ASSIGNED slow sinusoid (`q2_center_deg` + `q2_amp_deg` sin(2πτ/P)), γ = q4;
+   ψ is then refined onto the law's own `build(b3, b1)` attitude so `flatState`
+   reproduces exactly this R0; x_c = p_e + R0(r0c − r0e)(q) (A6).
+4. **Feasibility**: where the MATLAB script minimises the residual
+   r − normalize(ẍ_c + g e3) with fmincon over a trig-series r, this solves the
+   same equation as a **Picard fixed point** with x_c a clamped B-spline (degree
+   7, 0.5 s spans, 5 coincident end points ⇒ rest ends) and **under-relaxed
+   thrust updates (0.5)**. The relaxation is not cosmetic: the map amplifies a
+   thrust perturbation at frequency ω by L·ω²/g (L ≈ 0.2 m lever), i.e. it is
+   NOT a contraction above ~1 Hz, and the first version diverged from a 1.8×/
+   iteration mode at the ramp-out junction. A coarse basis plus relaxation
+   makes every representable mode contract (21 iterations, 7e-5 m).
+5. **Fitting**: ψ (deg 5, unwrapped) and q (deg 5, 4 channels) as B-splines
+   with 3 coincident end points; then `flatState()` (wb_law) on the fitted
+   (x_c⁽⁰⁻⁴⁾, ψ⁽⁰⁻²⁾, q⁽⁰⁻²⁾) is the 16-field reference.
+6. **Checks on the whole run** (the artifact's constraint set + rates):
+   joint box, β ≥ 5°, σ_nd ≥ 0.10, |v| ≤ v_max, |a| ≤ a_max, |ψ̇| ≤ w_max,
+   |q̇| ≤ `qdot_max`, |τ_j| ≤ `tau_joint_max` and rotor forces inside the
+   T650 model via `inverseInputs()`, rest at both ends, and the **FK round
+   trip**: the EE pose recomputed from the fitted flat outputs against the
+   prescribed curve (position and rotation angle; circle 0.1 mm / 0.0°,
+   figure-8 0.0 mm / 0.0°). The first violated bound is the refusal reason.
+7. **s_max** (`maxTimeScale`): bracket then bisect to 2 % on the full check;
+   ~0.2 s. The GS slider spans [0, s_max]. On the T650 defaults the circle
+   (0.5 m, 24 s lap) is limited by the yaw rate at s_max 1.13, the figure-8
+   (0.5 × 0.25 m) by the acceleration at 0.36.
+
+Tests: `test_ee_trajectory_planner.cpp` (4 gtests: both shapes compatible and
+bounded at 0.9 s_max, s_max positive and binding, level EE refused) and
+`test/test_ee_trajectory_loopback.py` (the whole ROS flow against the built
+node: select → READY → rescale → start refused 20 cm off → go-to-start → at
+start → start → 8888 streamed samples round the circle → HOLD at the start).
+Sim: `test/ee_trajectory_sim_cycle.sh <tag> [cfg] [shape] [scale]` flies it on
+the Command.md 7.15.1 rig with `test/ee_trajectory_sim_driver.py`.
+
+**Sim validation of the EE trajectory mode (2026-09-15, 7.15.1 rig, L1
+stack):** two complete circle flights (0.5 m, 2 laps) at s = 0.90 and 0.45 of
+the 1.13 maximum — select → Go-to-start → Start → run → HOLD → SAFETY → land.
+The reference's FK round trip was 0.0-0.1 mm; the measured EE trailed it by a
+~2 s first-order lag with gain < 1 (raw error 214 mm at 0.118 m/s, 138 mm at
+0.059 m/s; 102 / 56 mm after removing the lag; flown radius 0.40 / 0.45 m of
+0.50). That is the whole-body law's position-loop bandwidth, the same
+behaviour §7.15.5 measured on steps, not a planning error. Record: Command.md
+§7.15.12, data in `trajectory_planner_cpp_20260914/ee_circle_*.npz`.
