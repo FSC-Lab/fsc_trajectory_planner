@@ -406,3 +406,13 @@ The reference's FK round trip was 0.0-0.1 mm; the measured EE trailed it by a
 0.50). That is the whole-body law's position-loop bandwidth, the same
 behaviour §7.15.5 measured on steps, not a planning error. Record: Command.md
 §7.15.12, data in `trajectory_planner_cpp_20260914/ee_circle_*.npz`.
+
+**Third flight, 2026-09-15, the ORIGIN-CENTRED circle** (`ee_circle_origin_circle.npz`),
+same rig and speed: the reference sits at 0.500 m from the world origin with a
+standard deviation of **0 mm**, the flown circle is concentric to ~5 cm at
+0.387 m, and the error decomposes exactly as before (1.90 s lag, 104 mm
+residual). It is also the first flight in which **Go-to-start was a real
+transition** — 0.56 m and 90° of yaw, complete in 15 s — and the Start gate's
+5 cm / 5° / 3° tolerance passed on the first try. That gate is the thing to
+watch when the circle is moved away from the vehicle: §7.15.5 measures
+50-90 mm of settled error after a 0.5 m leg, the same order as the tolerance.
