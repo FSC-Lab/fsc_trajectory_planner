@@ -72,6 +72,7 @@ install(PROGRAMS
   test/test_replan_stream.py
   test/test_traj_viz.py
   test/test_ee_trajectory_loopback.py
+  test/test_ee_trajectory_pause.py
   test/ee_trajectory_sim_driver.py
   test/ee_trajectory_sim_cycle.sh
   scripts/dump_python_fixtures.py

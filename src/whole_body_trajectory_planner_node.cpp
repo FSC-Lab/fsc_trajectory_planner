@@ -42,6 +42,7 @@
 #include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -273,8 +274,15 @@ public:
     ee_status_pub_ = create_publisher<String>(prefix + "/ee_trajectory/status", latched);
     ee_info_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/info", latched);
     ee_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/path", latched);
+    // The same run seen at the AIRFRAME. A separate topic rather than more
+    // fields on /path: that array's 9-double stride is what its consumers
+    // reshape by.
+    ee_drone_path_pub_ = create_publisher<Float64MultiArray>(
+      prefix + "/ee_trajectory/drone_path", latched);
     ee_start_err_pub_ = create_publisher<Float64MultiArray>(prefix + "/ee_trajectory/start_error", 10);
     ee_ref_pose_pub_ = create_publisher<PoseStamped>(prefix + "/ee_trajectory/reference_pose", 10);
+    ee_drone_ref_pose_pub_ = create_publisher<PoseStamped>(
+      prefix + "/ee_trajectory/drone_reference_pose", 10);
     // the run's start rest as a BASE pose (actual yaw), latched: what
     // go_to_start flies to and what the Start gate measures against
     ee_start_rest_pub_ = create_publisher<PoseStamped>(prefix + "/ee_trajectory/start_rest", latched);
@@ -288,6 +296,15 @@ public:
     ee_start_srv_ = create_service<Trigger>(
       prefix + "/ee_trajectory/start",
       [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeStart(r);});
+    ee_pause_srv_ = create_service<Trigger>(
+      prefix + "/ee_trajectory/pause",
+      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEePause(r);});
+    ee_resume_srv_ = create_service<Trigger>(
+      prefix + "/ee_trajectory/resume",
+      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeResume(r);});
+    ee_origin_srv_ = create_service<Trigger>(
+      prefix + "/ee_trajectory/back_to_origin",
+      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeBackToOrigin(r);});
     ee_err_timer_ = create_wall_timer(
       std::chrono::milliseconds(100), [this]() {publishEeStartError();});
     publishEeStatus("NONE");
@@ -422,6 +439,7 @@ private:
         home_goal_ = false;
         plan_.reset();
         exec_t0_.reset();
+        exec_pause_t_.reset();
         ++plan_gen_;
         goal_override_.reset();
         auto_send_ = false;
@@ -475,6 +493,7 @@ private:
       if (msg.yaw_unit == PositionControllerReference::DEGREES) {yaw *= M_PI / 180.0;}
       const double phi = yaw - 0.5 * M_PI;  // actual yaw -> model heading
       const Vec3 x_b{msg.position.x, msg.position.y, msg.position.z};
+      gs_ref_z_ = x_b(2);
       // Ignore an UNCHANGED target: ground stations re-send the same
       // setpoint, and each copy would restart the solve.
       if (pending_base_.has_value()) {
@@ -734,6 +753,7 @@ private:
               auto_send_ = false;
               goal_override_.reset();
               exec_t0_ = Clock::now();
+              exec_pause_t_.reset();
               state_ = "EXECUTING";
               RCLCPP_INFO(
                 get_logger(), "planned: %s -- executing now (go to start).",
@@ -760,6 +780,7 @@ private:
         return;
       }
       exec_t0_ = Clock::now();
+      exec_pause_t_.reset();
       state_ = "EXECUTING";
       T = plan_->duration();
     }
@@ -837,7 +858,9 @@ private:
       }
       bool have_ref = false;
       if (state_ == "EXECUTING" && plan_) {
-        const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
+        const double t = exec_pause_t_.has_value()
+          ? *exec_pause_t_
+          : std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
         if (t >= plan_->duration()) {
           finished = true;
         } else {
@@ -851,6 +874,7 @@ private:
         pending_base_.reset();
         ee_target_.reset();
         home_goal_ = false;
+        exec_pause_t_.reset();
         state_ = "HOLD";
         logHold("transition complete");
       }
@@ -873,6 +897,7 @@ private:
     if (viz_decim_ == 0) {
       publishVizPose(&ref);
       publishEeRefPose(ref);
+      publishEeDroneRefPose(ref);
     }
     if (finished) {refreshEeAfterHold();}
   }
@@ -1128,9 +1153,13 @@ private:
           publishEeStatus("INFEASIBLE: unknown trajectory '" + type + "' (circle | figure8)");
           return;
         }
-        const bool changed = type != ee_shape_type_;
+        // ALWAYS re-measure the feasible time scale, even when the type is
+        // unchanged: the shape parameters (ee_traj_circle_radius, fig8_a/b,
+        // lap_time, laps) are live and a station edits them and re-selects to
+        // apply them. Caching s_max across that would size the run by the
+        // previous shape.
         ee_shape_type_ = type;
-        if (changed) {ee_s_max_.reset();}
+        ee_s_max_.reset();
       }
     }
     if (type == "none" || type.empty()) {
@@ -1348,6 +1377,7 @@ private:
       auto_send_ = false;
       ++plan_gen_;
       exec_t0_ = Clock::now();
+      exec_pause_t_.reset();
       state_ = "EXECUTING";
       T = plan_->duration();
     }
@@ -1362,6 +1392,109 @@ private:
     RCLCPP_INFO(get_logger(), "%s", resp->message.c_str());
   }
 
+  // PAUSE / RESUME. The run's clock stops; the reference stays on the point
+  // of the planned run it had reached. Its velocity therefore STEPS to zero
+  // (and back on resume) -- the reference is no longer dynamically
+  // compatible across that instant, and the law absorbs the step. Sized for
+  // an operator stopping a slow EE run to look at something, not for an
+  // abort: to abort, revert to SAFETY.
+  void onEePause(Trigger::Response::SharedPtr resp)
+  {
+    double t = 0.0, T = 0.0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (state_ != "EXECUTING" || !plan_ || !exec_t0_.has_value()) {
+        resp->success = false;
+        resp->message = "nothing is executing";
+        return;
+      }
+      if (exec_pause_t_.has_value()) {
+        resp->success = false;
+        resp->message = "already paused";
+        return;
+      }
+      t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
+      T = plan_->duration();
+      exec_pause_t_ = std::min(std::max(t, 0.0), T);
+    }
+    publishStatus();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    m << "paused at t = " << t << " / " << T << " s -- the reference is held on the run";
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "EE trajectory: %s", resp->message.c_str());
+  }
+
+  void onEeResume(Trigger::Response::SharedPtr resp)
+  {
+    double t = 0.0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!exec_pause_t_.has_value()) {
+        resp->success = false;
+        resp->message = "not paused";
+        return;
+      }
+      t = *exec_pause_t_;
+      // rewind the clock's origin so the run continues from where it froze
+      exec_t0_ = Clock::now() - std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(t));
+      exec_pause_t_.reset();
+    }
+    publishStatus();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    m << "resumed from t = " << t << " s";
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "EE trajectory: %s", resp->message.c_str());
+  }
+
+  // BACK TO ORIGIN: the hover point [0, 0, z] with the arm folded home, z
+  // being the drone GS's own commanded altitude (its last reference; the
+  // current hold's height when it has sent none). Planned like any other
+  // goal and left at PLANNED -- it is a room-crossing move, so it waits for
+  // the operator's Start rather than flying on the button press the way
+  // go_to_start does.
+  void onEeBackToOrigin(Trigger::Response::SharedPtr resp)
+  {
+    double z = 0.0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !hold_.has_value()) {
+        resp->success = false;
+        resp->message = "not in whole-body DIRECT";
+        return;
+      }
+      if (state_ == "EXECUTING") {
+        resp->success = false;
+        resp->message = "executing -- wait for the run to finish (or pause it) first";
+        return;
+      }
+      z = gs_ref_z_.value_or(hold_->x_b(2));
+      pending_base_ = std::make_pair(Vec3{0.0, 0.0, z}, hold_->phi);
+      home_goal_ = true;
+      ee_target_.reset();
+      goal_override_.reset();
+      auto_send_ = false;
+      state_ = "PENDING";
+    }
+    publishBaseAnchor();
+    publishStatus();
+    startPlanning();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(2);
+    m << "planning the transition to the hover point [0, 0, " << z
+      << "] with the arm home -- press Start once it reads PLANNED";
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "Back to origin: %s", resp->message.c_str());
+  }
+
   void publishEeStartError()
   {
     Float64MultiArray m;
@@ -1371,7 +1504,13 @@ private:
       double pos = 0.0, yaw = 0.0, joint = 0.0;
       const bool ok = atStart(&pos, &yaw, &joint);
       const bool ready = ok && state_ == "HOLD";
-      m.data = {pos, yaw * 180.0 / M_PI, joint * 180.0 / M_PI, ready ? 1.0 : 0.0};
+      // [0..3] the three errors and the gate; [4..6] the tolerances each is
+      // measured against, so a station can show the bound beside the value
+      // instead of hard-coding this node's parameters.
+      m.data = {pos, yaw * 180.0 / M_PI, joint * 180.0 / M_PI, ready ? 1.0 : 0.0,
+        get_parameter("ee_traj_start_pos_tol").as_double(),
+        get_parameter("ee_traj_start_yaw_tol_deg").as_double(),
+        get_parameter("ee_traj_start_joint_tol_deg").as_double()};
     }
     ee_start_err_pub_->publish(m);
   }
@@ -1407,7 +1546,11 @@ private:
     const double type_id = ee_shape_type_ == "circle" ? 1.0 : (ee_shape_type_ == "figure8" ? 2.0 : 0.0);
     m.data = {s, s_max, d.T_total, d.T_lap, static_cast<double>(d.laps), d.ramp_time, type_id,
       d.ee_pos_err_max, d.ee_rot_err_max_deg, d.peak_v, d.peak_a, d.peak_qdot, d.peak_tau_joint,
-      d.min_sigma_nd};
+      d.min_sigma_nd,
+      // [14] the drone GS's commanded altitude -- the height this run
+      // inherits, and where Back To Origin returns to. NaN until the GS has
+      // sent a setpoint in DIRECT.
+      gs_ref_z_.value_or(std::numeric_limits<double>::quiet_NaN())};
     ee_info_pub_->publish(m);
   }
 
@@ -1449,6 +1592,37 @@ private:
     ee_ref_pose_pub_->publish(m);
   }
 
+  // The AIRFRAME the same reference implies: body ORIGIN (not the system CoM
+  // the law tracks -- x_b = x_cd - R0 r_0c(q_d), the base the odometry
+  // reports) and the ACTUAL body attitude, R0 Rz(+pi/2), so its x axis is
+  // the vehicle's nose.
+  void dronePoseOf(const WbReference & ref, PoseStamped * m) const
+  {
+    const Vec3 ac = ref.x_cd_ddot + vehicle_->params.g * Vec3{0.0, 0.0, 1.0};
+    Mat3 R0 = Mat3::Identity();
+    if (ac.norm() > 1e-9) {R0 = buildR0(ac / ac.norm(), ref.b1_d);}
+    Vec3 r0c;
+    armKinematics(ref.q_d, vehicle_->params, &r0c, nullptr, nullptr);
+    const Vec3 x_b = ref.x_cd - R0 * r0c;
+    m->pose.position.x = x_b(0);
+    m->pose.position.y = x_b(1);
+    m->pose.position.z = x_b(2);
+    const Eigen::Quaterniond q(R0 * Rz(0.5 * M_PI));
+    m->pose.orientation.x = q.x();
+    m->pose.orientation.y = q.y();
+    m->pose.orientation.z = q.z();
+    m->pose.orientation.w = q.w();
+  }
+
+  void publishEeDroneRefPose(const WbReference & ref)
+  {
+    PoseStamped m;
+    m.header.stamp = now();
+    m.header.frame_id = "world";
+    dronePoseOf(ref, &m);
+    ee_drone_ref_pose_pub_->publish(m);
+  }
+
   // [t, x, y, z, speed, qx, qy, qz, qw] per sample, world frame; empty = clear
   void publishEePath(const Trajectory * traj)
   {
@@ -1472,6 +1646,48 @@ private:
       }
     }
     ee_path_pub_->publish(m);
+    publishEeDronePath(traj);
+  }
+
+  // The same run at the airframe, same [t, x, y, z, speed, quat] layout as
+  // /path. Speed is |dx_b/dt| by central difference on this grid: the body's
+  // velocity is not a field of WbReference (x_cd_dot is the CoM's, and the
+  // two differ by the arm's own motion), and this is a colour scale.
+  void publishEeDronePath(const Trajectory * traj)
+  {
+    Float64MultiArray m;
+    if (traj != nullptr) {
+      const int n = 400;
+      const double T = traj->duration();
+      std::vector<double> t(n);
+      std::vector<PoseStamped> pose(n);
+      for (int k = 0; k < n; ++k) {
+        t[k] = T * k / (n - 1);
+        dronePoseOf(traj->eval(t[k]), &pose[k]);
+      }
+      for (int k = 0; k < n; ++k) {
+        const int a = std::max(0, k - 1), b = std::min(n - 1, k + 1);
+        const double dt = t[b] - t[a];
+        double speed = 0.0;
+        if (dt > 1e-9) {
+          speed = std::hypot(
+            std::hypot(
+              pose[b].pose.position.x - pose[a].pose.position.x,
+              pose[b].pose.position.y - pose[a].pose.position.y),
+            pose[b].pose.position.z - pose[a].pose.position.z) / dt;
+        }
+        m.data.push_back(t[k]);
+        m.data.push_back(pose[k].pose.position.x);
+        m.data.push_back(pose[k].pose.position.y);
+        m.data.push_back(pose[k].pose.position.z);
+        m.data.push_back(speed);
+        m.data.push_back(pose[k].pose.orientation.x);
+        m.data.push_back(pose[k].pose.orientation.y);
+        m.data.push_back(pose[k].pose.orientation.z);
+        m.data.push_back(pose[k].pose.orientation.w);
+      }
+    }
+    ee_drone_path_pub_->publish(m);
   }
 
   // ---------------------------------------------------------------- status
@@ -1490,7 +1706,10 @@ private:
       } else if (state_ == "INFEASIBLE") {
         s = "INFEASIBLE: " + infeasible_reason_;
       } else if (state_ == "EXECUTING" && plan_) {
+        // A SUFFIX, never a new state word: every consumer of this topic
+        // tests the first token, and a pause is still an execution.
         m << "EXECUTING T=" << plan_->duration() << "s";
+        if (exec_pause_t_.has_value()) {m << " PAUSED t=" << *exec_pause_t_ << "s";}
         s = m.str();
       }
     }
@@ -1552,10 +1771,20 @@ private:
   std::optional<WbReference> hold_ref_;
   std::optional<std::pair<Vec3, double>> hold_anchor_;  // (p_e_world, model az)
   std::optional<std::pair<Vec3, double>> pending_base_;  // (x_b, phi)
+  // The drone GS's last commanded altitude, kept after pending_base_ is
+  // consumed: it is the hover height Back To Origin returns to, and the arm
+  // GS shows it as the height the trajectory inherits.
+  std::optional<double> gs_ref_z_;
   std::optional<std::pair<Vec3, double>> ee_target_;     // (p_e_world, az)
   bool home_goal_{false};
   std::shared_ptr<Trajectory> plan_;
   std::optional<Clock::time_point> exec_t0_;
+  // EE-trajectory PAUSE: the elapsed time the run is frozen at. While it is
+  // set the stream keeps publishing plan_->eval(*exec_pause_t_), so the law
+  // holds a reference that is STILL a point of the planned run rather than a
+  // new hold -- resume is exact, at the cost of a step to zero in the
+  // reference's velocity at the instant it is pressed.
+  std::optional<double> exec_pause_t_;
   unsigned plan_gen_{0};
   std::string infeasible_reason_;
   std::optional<Clock::time_point> last_base_resolve_;
@@ -1602,10 +1831,13 @@ private:
   rclcpp::TimerBase::SharedPtr stream_timer_, ee_timer_;
   rclcpp::Publisher<String>::SharedPtr ee_status_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr ee_info_pub_, ee_path_pub_, ee_start_err_pub_;
+  rclcpp::Publisher<Float64MultiArray>::SharedPtr ee_drone_path_pub_;
   rclcpp::Publisher<PoseStamped>::SharedPtr ee_ref_pose_pub_, ee_start_rest_pub_;
+  rclcpp::Publisher<PoseStamped>::SharedPtr ee_drone_ref_pose_pub_;
   rclcpp::Subscription<String>::SharedPtr ee_select_sub_;
   rclcpp::Subscription<Float64>::SharedPtr ee_scale_sub_;
   rclcpp::Service<Trigger>::SharedPtr ee_go_srv_, ee_start_srv_;
+  rclcpp::Service<Trigger>::SharedPtr ee_pause_srv_, ee_resume_srv_, ee_origin_srv_;
   rclcpp::TimerBase::SharedPtr ee_err_timer_;
 };
 
