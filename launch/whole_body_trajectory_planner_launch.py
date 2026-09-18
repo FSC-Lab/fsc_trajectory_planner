@@ -1,7 +1,7 @@
 """Launch the whole-body trajectory planner (rclcpp node) for one vehicle.
 
     ros2 launch fsc_trajectory_planner whole_body_trajectory_planner_launch.py \
-        uav_prefix:=uav_0 [params_file:=<yaml>] [planner:=straight_line|bspline]
+        uav_prefix:=uav_0 [params_file:=<yaml>] [planner:=bspline]
 
 `uav_prefix` becomes the node's namespace, so every topic and service the
 node offers (whole_body_planner/*, the WholeBodyReference stream, the arm

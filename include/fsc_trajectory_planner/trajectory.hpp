@@ -91,13 +91,6 @@ struct PlanOptions
   double tau_joint_max{3.0};
   bool rotor_bounds{true};
   int n_check{101};      // diagnostic grid, 0 disables
-  // straight_line (Picard) knobs -- the classic planner's defaults
-  int deg{16};
-  int N{201};
-  int maxit{60};
-  double tol{1e-10};
-  double relax{1.0};
-  int Nfine{801};
   // Called periodically inside a solve so a caller can yield (unused by the
   // C++ node -- solves run on a worker thread -- kept for parity).
   std::function<void()> yield_hook;

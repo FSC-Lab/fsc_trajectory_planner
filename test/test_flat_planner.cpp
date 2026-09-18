@@ -1,6 +1,7 @@
 // Parity of the flat B-spline backend against the Python
-// flat_bspline_planner.py, through the registry. The fixture is the flight
-// stack's own (share/fsc_autopilot_ros2/test_data/flat_plan_t650.txt, from
+// flat_bspline_planner.py, through the registry, plus the registry's own
+// contract. The fixture is the flight stack's own
+// (share/fsc_autopilot_ros2/test_data/flat_plan_t650.txt, from
 // fsc_PegasusSimulator's dump_flat_reference.py); its path is compiled in.
 #include <gtest/gtest.h>
 
@@ -97,4 +98,16 @@ TEST(FlatBSpline, ParityWithPython)
             << std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - t0).count() / 10
             << " ms (python: ~45-190 ms)\n";
+}
+
+// The registry is the extension point for a new backend. One entry since
+// 2026-09-17, when the straight_line Picard backend was removed.
+TEST(PlannerRegistry, NamesAndUnknown)
+{
+  const auto names = plannerNames();
+  ASSERT_EQ(names.size(), 1u);
+  EXPECT_EQ(names[0], "bspline");
+  EXPECT_NO_THROW(makePlanner("bspline"));
+  EXPECT_THROW(makePlanner("straight_line"), std::runtime_error);
+  EXPECT_THROW(makePlanner("figure8"), std::runtime_error);
 }

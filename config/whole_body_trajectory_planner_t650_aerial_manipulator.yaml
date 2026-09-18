@@ -7,15 +7,16 @@
   ros__parameters:
     # Airframe + arm model, from the registry (src/vehicle_model.cpp).
     vehicle: "t650_aerial_manipulator"
-    # Transition backend, from the registry (src/trajectory.cpp):
-    #   straight_line  Picard CoM fixed point on a straight-line EE path --
-    #                  the flight-validated one (hardware flies this)
+    # Transition backend, from the registry (src/trajectory.cpp). One entry
+    # since 2026-09-17:
     #   bspline        flat B-spline outputs, constraints ENFORCED (rest,
     #                  joint box, speed/accel, rotor + joint-torque bounds)
+    # (the straight_line Picard backend was removed that day; the registry is
+    # still the extension point for a new one.)
     planner: "bspline"
     stream_rate: 100.0          # WholeBodyReference + arm reference [Hz]
 
-    # --- kinematic bounds, honoured by BOTH backends ---------------------
+    # --- kinematic bounds ------------------------------------------------
     v_max: 0.30                 # peak CoM speed               [m/s]
     a_max: 0.15                 # peak CoM acceleration        [m/s^2]
     w_max: 0.30                 # peak rate, any angle channel [rad/s]

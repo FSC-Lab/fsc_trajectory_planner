@@ -89,9 +89,6 @@ if(BUILD_TESTING)
   ament_add_gtest(test_kinematics test/test_kinematics.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_kinematics planner_lib)
-  ament_add_gtest(test_transition_planner test/test_transition_planner.cpp
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
-  target_link_libraries(test_transition_planner planner_lib)
   ament_add_gtest(test_flat_planner test/test_flat_planner.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_flat_planner planner_lib)

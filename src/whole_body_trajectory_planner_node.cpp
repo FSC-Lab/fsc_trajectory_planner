@@ -145,8 +145,9 @@ public:
     // ---- parameters -------------------------------------------------------
     // The airframe + arm model, from the registry (vehicle_model.cpp).
     vehicle_name_ = declare_parameter<std::string>("vehicle", "t650_aerial_manipulator");
-    // "straight_line" (Picard, flight-validated) or "bspline" (flat outputs,
-    // constraints enforced). Default bspline: what the sim configs fly.
+    // "bspline" (flat outputs, constraints enforced) -- the only backend since
+    // 2026-09-17, when the straight_line Picard backend was removed. Kept as a
+    // parameter so the registry stays the extension point for a new one.
     planner_name_ = declare_parameter<std::string>("planner", "bspline");
     stream_rate_ = declare_parameter<double>("stream_rate", 100.0);
     declare_parameter<double>("v_max", 0.30);

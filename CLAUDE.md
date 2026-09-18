@@ -37,8 +37,8 @@ The Python planner directory was DELETED from the autopilot repo the same day
 exists in Pegasus (`utils_planner`, imported by its demos and truth
 generators) and is what `scripts/dump_python_fixtures.py` reads.
 
-Why C++: a plan is **~3-4 ms** here (straight-line Picard 4.1 ms, flat
-B-spline 2.9 ms, Release build) against 45-260 ms in Python. The whole-body
+Why C++: a plan is **~3 ms** here (flat B-spline 2.9 ms, Release build)
+against 45-260 ms in Python. The whole-body
 model alone was 6 µs vs 1 ms per `dynamics()` call.
 
 ## Layout
@@ -54,17 +54,17 @@ include/fsc_trajectory_planner/
   vehicle_model.hpp       VehicleModel + VehicleOptions + the VEHICLE REGISTRY (name -> factory)
   trajectory.hpp          Trajectory / HoldTrajectory / PlanOptions / PlanRequest /
                           TrajectoryPlanner + the PLANNER REGISTRY (name -> factory)
-  transition_planner.hpp  StraightLineTransitionPlanner, FlatBSplineTransitionPlanner (adapter
-                          over wb_law's planFlatTransition)
+  transition_planner.hpp  FlatBSplineTransitionPlanner (adapter over wb_law's
+                          planFlatTransition) -- the only transition backend
   ee_trajectory_planner.hpp  EeShape / EeTrajectoryOptions / EeTrajectoryDiag / EeTrajectoryPlanner
                           (the periodic END-EFFECTOR TRAJECTORY mode, see its section)
   bspline_fit.hpp         clamped uniform B-spline with sparse least-squares fitting and pinned ends
 src/
   kinematics.cpp                           port of transition_planner.py / compatible_trajectory.py helpers
-  transition_planner.cpp                   port of plan_transition() (Picard) + the bspline adapter
+  transition_planner.cpp                   the bspline adapter over wb_law's planFlatTransition
   ee_trajectory_planner.cpp, bspline_fit.cpp   the EE trajectory mode
   vehicle_model.cpp                        the registry: "t650_aerial_manipulator" (WholeBodyParams::t650Defaults + RotorModel::t650 from wb_law)
-  trajectory.cpp                           HoldTrajectory + the registry: "straight_line", "bspline"
+  trajectory.cpp                           HoldTrajectory + the registry: "bspline"
   whole_body_trajectory_planner_node.cpp   the rclcpp node (port of whole_body_planner.py's state machine)
 launch/whole_body_trajectory_planner_launch.py     uav_prefix -> namespace, params_file, overrides
 config/whole_body_trajectory_planner_t650_aerial_manipulator.yaml   the standalone default config
@@ -90,7 +90,6 @@ colcon test  --packages-select fsc_trajectory_planner && colcon test-result --ve
 # loopback against the built node (no sim, no PX4, ~40 s):
 source install/setup.bash && cd src/fsc_trajectory_planner/test
 python3 test_planner_loopback.py                          # yaml default backend (bspline)
-WB_GOV_PLANNER=straight_line python3 test_planner_loopback.py
 ```
 
 `CMakeLists.txt` forces `CMAKE_BUILD_TYPE=Release` when none is given. Do not
@@ -98,25 +97,29 @@ remove that: the 2026-08-27 finding in the autopilot repo was that an
 unoptimised Eigen build of this same model is ~160x slower, and the stream
 tick here runs at 100 Hz.
 
-### What the tests lock (all passing 2026-09-14, 13 gtests)
+### What the tests lock (all passing 2026-09-17, 10 gtests)
 
 | test | against | tolerance / result |
 |---|---|---|
 | `Kinematics.ParityWithPython` | `transition_planner.arm_fk_model/rest_ref/_sigma_nd/ik_world` on 6 random rests | 1e-12 m (FK), 1e-7 rad (IK), mass 1e-12 |
-| `StraightLine.ParityWithPython` | `transition_planner.plan_transition` on 4 cases × 41 samples, all 16 reference fields | prescribed channels 1e-9; solved CoM chain / q 5e-6 (measured worst **3.5e-9**) |
-| `StraightLine.EndpointsAndDerivativeChains` | the Python `_selftest` checks | endpoints on the holds, FD chains < 1e-4 |
-| `StraightLine.RefusesWristSingularGoal` | | throws with the reason |
-| `StraightLine.Timing` | | 4.1 ms/plan (python ~260 ms) |
+| `PlannerRegistry.NamesAndUnknown` | the registry's contract | one backend, `bspline`; an unknown name throws |
 | `FlatBSpline.ParityWithPython` | `flat_bspline_planner.py` fixture (2 cases, 37 samples) | 1e-9, duration 1e-9, defect < 1e-9; 2.9 ms/plan |
-| loopback (`test_planner_loopback.py`) | the built node, both backends | SAFETY-silence → DIRECT hold @100 Hz → PENDING → PLANNED (ride-along) → EE target → Send → EXECUTING → completion HOLD → SAFETY silence |
+| loopback (`test_planner_loopback.py`) | the built node | SAFETY-silence → DIRECT hold @100 Hz → PENDING → PLANNED (ride-along) → EE target → Send → EXECUTING → completion HOLD → SAFETY silence |
 | `test_go_home.py` | the built node | Go Home plans to the home pose from an arbitrary arm pose |
 | `test_replan_stream.py` | the built node | unchanged drone target ignored; stream stays 100 Hz with no gap near the 250 ms staleness window while re-planning; the hold does not move |
 | `test_traj_viz.py` | the built node | viz_path/viz_pose layout, unit headings, nose/claw along the arm, curve starts on the hold, 20 Hz arrows, cleared on SAFETY |
 
-The straight-line solver differs from numpy only in the least-squares
-polynomial fit (Eigen JacobiSVD with numpy's column scaling and rcond); that is
-where the 1e-9 comes from, and the tolerance in the test is deliberately loose
-enough (5e-6) that a different LAPACK does not fail it.
+**THE STRAIGHT-LINE BACKEND WAS REMOVED 2026-09-17 (user request).** It was
+the C++ port of Pegasus's `utils_planner/transition_planner.py`: a straight EE
+line with the CoM on a degree-16 polynomial solved by a Picard fixed point and
+the joints recovered per sample. Every shipped config had already moved to
+`bspline` (sim and hardware alike, same day), which enforces what it only
+verified and additionally bounds rotor force and joint torque. Gone with it:
+its registry entry, `StraightLine.*` gtests, `test/data/python_transition_t650
+.txt`, the transition half of `scripts/dump_python_fixtures.py`, the
+`straight_line`-only `PlanOptions` knobs, and the Python `plan_transition` in
+Pegasus. Recover from git if a transit ever needs a guaranteed straight EE
+line -- it was also the backend of the 2026-09-12 hardware flight.
 
 ## The node — `whole_body_trajectory_planner`
 
@@ -131,7 +134,7 @@ here; every name below is relative:
 ```bash
 ros2 launch fsc_trajectory_planner whole_body_trajectory_planner_launch.py uav_prefix:=uav_0 \
     [params_file:=<yaml with a /**/whole_body_trajectory_planner section>] \
-    [planner:=straight_line|bspline] [vehicle:=t650_aerial_manipulator] \
+    [planner:=bspline] [vehicle:=t650_aerial_manipulator] \
     [base_com:="[x,y,z]"] [arm_joint_sign:="[-1,1,1,-1]"] [hold_ee_world:=false]
 ```
 
@@ -186,11 +189,10 @@ its τ-derivative in the shape's local frame, τ=0 tangent along +x).
 it in `plannerFactories()` (`src/trajectory.cpp`), select it with the
 `planner` parameter. `PlanRequest` carries `rest0`, an optional `rest1`, and a
 free-form `shape` map (radius, period, laps, ...) so the node does not change
-when a shape needs more than two endpoints. The straight-line planner's
-`task()` shows the shape contract — prescribe every channel with analytic
-first and second time derivatives on a min-snap phase, then let the Picard
-loop solve the compatible CoM; a periodic EE path is the same machinery with a
-different `task()`. Reference: `compatible_trajectory.py`'s
+when a shape needs more than two endpoints. `ee_trajectory_planner.cpp`'s
+`localShape()` / `eeAt()` show the shape contract — prescribe every channel
+with analytic derivatives against the phase, then let the Picard loop solve the
+compatible CoM. Reference: `compatible_trajectory.py`'s
 `_prescribed_task_showcase` in Pegasus is the multi-segment version of this
 (it fits one polynomial per rest-to-rest segment; a long periodic path needs
 that, a single degree-16 polynomial does not fit a lap). Today only the
@@ -200,9 +202,9 @@ also need a trigger (a service taking name + parameters) in the node.
 **Rules that carry over from the Python planner and must not be lost:**
 
 - The node **never arms, never changes PX4 mode, never publishes in SAFETY**.
-- Min-snap (septic) phase is REQUIRED for the straight-line task, not a nicety:
-  the solved CoM velocity depends on the prescribed jerk, so min-jerk endpoints
-  step the CoM velocity at the hold joins.
+- Min-snap (septic) phasing is REQUIRED wherever a task is prescribed against a
+  phase (the EE-trajectory ramps), not a nicety: the solved CoM velocity depends
+  on the prescribed jerk, so min-jerk endpoints step it at the hold joins.
 - `GRIPPER_OFF_WRIST` (0.108 m, inside `t650Defaults`), the joint box, `home_pose`
   and `tau_joint_max` each exist in several places (the flight node — which this
   package now shares by linking — the arm controller, the Isaac plant, the arm

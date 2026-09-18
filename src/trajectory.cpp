@@ -19,8 +19,6 @@ HoldTrajectory::HoldTrajectory(const WholeBodyParams & p, const RestSpec & rest)
 const std::map<std::string, PlannerFactory> & plannerFactories()
 {
   static const std::map<std::string, PlannerFactory> table = {
-    {"straight_line",
-      []() {return std::unique_ptr<TrajectoryPlanner>(new StraightLineTransitionPlanner());}},
     {"bspline",
       []() {return std::unique_ptr<TrajectoryPlanner>(new FlatBSplineTransitionPlanner());}},
     // Future shapes (circle, figure8, ...) register here: implement

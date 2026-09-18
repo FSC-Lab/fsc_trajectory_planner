@@ -193,7 +193,7 @@ def main():
         assert len(path) >= 50, f"only {len(path)} path samples"
         # It must START where the vehicle is holding: a curve that begins
         # somewhere else is the frame being wrong, which is the whole risk in
-        # this feed. 1 mm, NOT machine precision — straight_line fits its CoM
+        # this feed. 1 mm, NOT machine precision — the planner fits its CoM
         # with an unconstrained polynomial and lands ~1e-5 m off its own
         # endpoint (bspline is exact there). A frame error is metres or a
         # swapped axis, so this still catches every failure worth catching.

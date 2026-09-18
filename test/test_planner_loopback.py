@@ -6,7 +6,6 @@ Run it after any planner change -- ~40 s, needs only a sourced workspace with
 fsc_trajectory_planner and fsc_autopilot_ros2_msgs built:
 
     python3 test_planner_loopback.py                 # the yaml default (bspline)
-    WB_GOV_PLANNER=straight_line python3 test_planner_loopback.py
 
 Emulates the WB node's mode topic, odometry, PX4 attitude, the arm's
 measured joint_states and a DECOY smoothed reference 2.3 deg away from it;
@@ -47,7 +46,7 @@ GOV_CMD = ["ros2", "launch", "fsc_trajectory_planner",
 # here is backend-agnostic by construction — both planners take the same
 # options and return the same reference keys — so the same suite is what
 # qualifies a new backend.  WB_GOV_PLANNER=bspline exercises the flat B-spline
-# one; unset keeps the whole-body planner's own default (straight_line).
+# one; unset keeps the whole-body planner's own default (bspline).
 _PLANNER = os.environ.get("WB_GOV_PLANNER", "").strip()
 GOV_ARGS = ([f"planner:={_PLANNER}"] if _PLANNER else [])
 
