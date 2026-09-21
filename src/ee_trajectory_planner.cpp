@@ -261,6 +261,18 @@ std::unique_ptr<Trajectory> EeTrajectoryPlanner::plan(
   d.T_total = tp.T_total;
   d.T_lap = shape.lap_time / tp.s;
   d.ramp_time = tp.Tr;
+  {
+    // first t with tau(t) = one period; tau is monotone, so bisect the
+    // profile itself rather than assume where the ramp-in leaves the phase
+    double lo = 0.0, hi = tp.T_total;
+    for (int k = 0; k < 60; ++k) {
+      const double mid = 0.5 * (lo + hi);
+      double tau, d1, d2;
+      tp.at(mid, &tau, &d1, &d2);
+      (tau < shape.lap_time ? lo : hi) = mid;
+    }
+    d.t_lap_end = hi;
+  }
   d.laps = shape.laps;
   d.s = tp.s;
 

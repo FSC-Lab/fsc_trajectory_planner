@@ -97,6 +97,11 @@ struct EeTrajectoryOptions
 struct EeTrajectoryDiag
 {
   double T_total{0.0}, T_lap{0.0}, ramp_time{0.0};
+  // Run time at which the FIRST lap's phase is complete (ramp-in included).
+  // The EE shape repeats every lap but the airframe need not -- with
+  // q2_period_s longer than a lap the arm is at a different fold on each lap
+  // -- so a display that wants ONE airframe loop cuts the path here.
+  double t_lap_end{0.0};
   int laps{0};
   double s{0.0};
   int iterations{0};
