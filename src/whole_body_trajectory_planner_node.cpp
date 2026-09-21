@@ -220,7 +220,7 @@ public:
     declare_parameter<double>("ee_traj_time_scale", 1.0);
     declare_parameter<double>("ee_traj_start_pos_tol", 0.05);
     declare_parameter<double>("ee_traj_start_yaw_tol_deg", 5.0);
-    declare_parameter<double>("ee_traj_start_joint_tol_deg", 3.0);
+    declare_parameter<double>("ee_traj_start_joint_tol_deg", 5.0);
     ee_time_scale_req_ = get_parameter("ee_traj_time_scale").as_double();
 
     if (home.size() != kNumJoints || base_com.size() != 3 || sign.size() != kNumJoints) {

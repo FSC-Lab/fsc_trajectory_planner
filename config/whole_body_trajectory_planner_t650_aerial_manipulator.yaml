@@ -58,7 +58,7 @@
     ee_traj_time_scale: 1.0         # the default request; the GS slider overrides
     ee_traj_start_pos_tol: 0.05     # Start button gate: [m], [deg], [deg]
     ee_traj_start_yaw_tol_deg: 5.0
-    ee_traj_start_joint_tol_deg: 3.0
+    ee_traj_start_joint_tol_deg: 5.0
 
     # Topic layout (relative to the vehicle namespace).
     topic_prefix: "whole_body_planner"
