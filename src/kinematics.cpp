@@ -119,6 +119,16 @@ void armKinematics(
   }
 }
 
+void armChainPoints(const VecN & q, const WholeBodyParams & p, std::array<Vec3, 5> * pts)
+{
+  Mat3 R = Mat3::Identity();
+  (*pts)[0] = Vec3::Zero();
+  for (int i = 0; i < N; ++i) {
+    R = R * jointRotation(p.h_i_im1[i], q(i));
+    (*pts)[i + 1] = (*pts)[i] + R * p.l_i[i];
+  }
+}
+
 Mat4 armTaskJacobian(const VecN & q, const WholeBodyParams & p)
 {
   std::array<Mat3, N + 1> R;

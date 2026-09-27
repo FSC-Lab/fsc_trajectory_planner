@@ -14,6 +14,7 @@
 #ifndef FSC_TRAJECTORY_PLANNER_KINEMATICS_HPP_
 #define FSC_TRAJECTORY_PLANNER_KINEMATICS_HPP_
 
+#include <array>
 #include <string>
 
 #include "fsc_trajectory_planner/wb_law.hpp"
@@ -50,6 +51,10 @@ double unwrapNear(double a, double ref);
 void armKinematics(
   const VecN & q, const WholeBodyParams & p, Vec3 * r0c, Vec3 * r0e,
   Mat3 * Re);
+// The chain's points in the base frame: [0] the base origin (joint 1's pivot
+// in the model), [1..3] joints 2..4, [4] the grasp point -- the four arm
+// links a display draws.
+void armChainPoints(const VecN & q, const WholeBodyParams & p, std::array<Vec3, 5> * pts);
 // Arm-only EE task Jacobian J_3y^0 (3 position rows + 1 EE-yaw row).
 Mat4 armTaskJacobian(const VecN & q, const WholeBodyParams & p);
 // sigma_min of J_3y^0 with the translational rows scaled by 1/Lchar.
