@@ -22,6 +22,10 @@ section (the whole-body flight yaml's) serves both rigs from this launch file:
     mode_topic:=fsc_autopilot_ros2/geometric_l1_direct_actuation/mode \
     arm_reference_topic:=fsc_open_manipulator/position_controller/reference_joint_trajectory
 Empty (the default) leaves the yaml's whole-body wiring alone.
+
+`ee_traj_start_pos_tol:=` (2026-09-29) overrides the Start gate's position
+tolerance [m] the same way: the decoupled stack passes 0.30 (its airframe
+tracking is looser), the whole-body stack keeps the yaml's 0.05.
 """
 import os
 
@@ -54,6 +58,8 @@ def _launch_node(context):
         overrides["mode_topic"] = arg("mode_topic")
     if arg("arm_reference_topic"):
         overrides["arm_reference_topic"] = arg("arm_reference_topic")
+    if arg("ee_traj_start_pos_tol"):
+        overrides["ee_traj_start_pos_tol"] = float(arg("ee_traj_start_pos_tol"))
     if overrides:
         params.append(overrides)
     return [Node(
@@ -94,5 +100,9 @@ def generate_launch_description():
                                           "reference_joint_trajectory; the decoupled stack passes "
                                           "fsc_open_manipulator/position_controller/"
                                           "reference_joint_trajectory)"),
+        DeclareLaunchArgument("ee_traj_start_pos_tol", default_value="",
+                              description="override the EE-trajectory Start gate's "
+                                          "position tolerance [m] (the decoupled stack "
+                                          "passes 0.30; empty keeps the yaml's)"),
         OpaqueFunction(function=_launch_node),
     ])
