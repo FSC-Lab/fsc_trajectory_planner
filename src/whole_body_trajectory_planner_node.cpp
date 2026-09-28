@@ -182,6 +182,11 @@ public:
     // equal the flight node's wb_base_com_x/y/z.
     const auto base_com = declare_parameter<std::vector<double>>(
       "base_com", std::vector<double>{0.0, 0.0, 0.0});
+    // Servo armature structure. MUST equal the flight node's
+    // wb_armature_joint_diag / wb_armature_j1..j4 (false = the flown link model).
+    const bool armature_joint_diag = declare_parameter<bool>("armature_joint_diag", false);
+    const auto armature = declare_parameter<std::vector<double>>(
+      "armature", std::vector<double>{0.010, 0.0194, 0.0097, 0.0097});
     // World-EE-anchored HOLD: re-solve the arm IK against the CURRENT base
     // pose so the EE holds its inertial position. OFF by default (2026-08-31):
     // the re-solve moves x_cd with base drift and leaves the position loop
@@ -281,8 +286,10 @@ public:
       throw std::runtime_error("teleop_axes/teleop_axis_signs need 6 values, teleop_buttons 5");
     }
 
-    if (home.size() != kNumJoints || base_com.size() != 3 || sign.size() != kNumJoints) {
-      throw std::runtime_error("home_pose/arm_joint_sign need 4 values, base_com 3");
+    if (home.size() != kNumJoints || base_com.size() != 3 || sign.size() != kNumJoints ||
+      armature.size() != kNumJoints)
+    {
+      throw std::runtime_error("home_pose/arm_joint_sign/armature need 4 values, base_com 3");
     }
     for (int j = 0; j < kNumJoints; ++j) {
       home_pose_(j) = home[j];
@@ -293,6 +300,11 @@ public:
     }
     VehicleOptions vo;
     vo.base_com = Vec3{base_com[0], base_com[1], base_com[2]};
+    vo.armature_joint_diag = armature_joint_diag;
+    for (int j = 0; j < kNumJoints; ++j) {
+      if (!(armature[j] >= 0.0)) {throw std::runtime_error("armature must be >= 0");}
+      vo.armature(j) = armature[j];
+    }
     vehicle_ = makeVehicleModel(vehicle_name_, vo);
     planner_ = makePlanner(planner_name_);
     RCLCPP_INFO(
@@ -300,6 +312,13 @@ public:
       "[%+.5f %+.5f %+.5f] m model frame -- must match the node's wb_base_com_*)",
       vehicle_->name.c_str(), vehicle_->params.totalMass(), vo.base_com(0),
       vo.base_com(1), vo.base_com(2));
+    if (armature_joint_diag) {
+      RCLCPP_INFO(
+        get_logger(), "armature: joint-diagonal [%.4f %.4f %.4f %.4f] kg m^2 -- must match "
+        "the node's wb_armature_j1..j4", armature[0], armature[1], armature[2], armature[3]);
+    } else {
+      RCLCPP_INFO(get_logger(), "armature: link structure (the flown model)");
+    }
     RCLCPP_INFO(
       get_logger(), "transition planner: %s (%s)", planner_->name().c_str(),
       planner_->description().c_str());

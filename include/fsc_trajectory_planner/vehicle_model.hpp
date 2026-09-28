@@ -46,6 +46,13 @@ struct VehicleOptions
   // the asset's own answer (simulation); on hardware a flight measurement
   // that MUST equal the flight node's wb_base_com_*.
   Vec3 base_com{Vec3::Zero()};
+  // Servo armature structure (2026-09-26). false: the flown link structure
+  // (WholeBodyParams::kLinkArmature h h^T on each arm link). true: `armature`
+  // [kg m^2] on the joint diagonal. MUST equal the flight node's
+  // wb_armature_joint_diag / wb_armature_j1..j4 -- the planner's joint-torque
+  // feasibility and reference torques use this model.
+  bool armature_joint_diag{false};
+  VecN armature{VecN::Zero()};
 };
 
 using VehicleFactory = std::function<VehicleModel(const VehicleOptions &)>;

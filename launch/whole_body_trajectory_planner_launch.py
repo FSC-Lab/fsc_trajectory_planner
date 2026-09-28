@@ -13,6 +13,15 @@ section: this package's config, or the flight node's own yaml so one file
 describes the whole run. `planner:=`, `vehicle:=`, `hold_ee_world:=`,
 `base_com:=` and `arm_joint_sign:=` override the file when given; an empty
 value leaves the yaml's setting alone.
+
+`mode_topic:=` and `arm_reference_topic:=` (2026-09-26) override the two
+topics that differ between the WHOLE-BODY and the DECOUPLED flight stacks --
+which flight node's /mode this planner follows, and which arm controller's
+reference_joint_trajectory receives the joint half of the plan -- so ONE yaml
+section (the whole-body flight yaml's) serves both rigs from this launch file:
+    mode_topic:=fsc_autopilot_ros2/geometric_l1_direct_actuation/mode \
+    arm_reference_topic:=fsc_open_manipulator/position_controller/reference_joint_trajectory
+Empty (the default) leaves the yaml's whole-body wiring alone.
 """
 import os
 
@@ -41,6 +50,10 @@ def _launch_node(context):
     if arg("arm_joint_sign"):
         overrides["arm_joint_sign"] = [float(v) for v in
                                        arg("arm_joint_sign").strip("[]").split(",")]
+    if arg("mode_topic"):
+        overrides["mode_topic"] = arg("mode_topic")
+    if arg("arm_reference_topic"):
+        overrides["arm_reference_topic"] = arg("arm_reference_topic")
     if overrides:
         params.append(overrides)
     return [Node(
@@ -72,5 +85,14 @@ def generate_launch_description():
                               description="override base_com, e.g. [0.0, 0.0, 0.0]"),
         DeclareLaunchArgument("arm_joint_sign", default_value="",
                               description="override arm_joint_sign, e.g. [-1,1,1,-1]"),
+        DeclareLaunchArgument("mode_topic", default_value="",
+                              description="override mode_topic (the flight node's /mode "
+                                          "this planner follows; the decoupled stack passes "
+                                          "fsc_autopilot_ros2/geometric_l1_direct_actuation/mode)"),
+        DeclareLaunchArgument("arm_reference_topic", default_value="",
+                              description="override arm_reference_topic (the arm controller's "
+                                          "reference_joint_trajectory; the decoupled stack passes "
+                                          "fsc_open_manipulator/position_controller/"
+                                          "reference_joint_trajectory)"),
         OpaqueFunction(function=_launch_node),
     ])
