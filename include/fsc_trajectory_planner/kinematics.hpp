@@ -54,6 +54,12 @@ void armKinematics(
 Mat4 armTaskJacobian(const VecN & q, const WholeBodyParams & p);
 // sigma_min of J_3y^0 with the translational rows scaled by 1/Lchar.
 double sigmaNd(const VecN & q, const WholeBodyParams & p);
+// World azimuth of the claw's lateral axis b1_e = R0 R_e e1 (MODEL
+// convention, R0 the body attitude in the model frame): the angle ikWorld()
+// solves for, so ikWorld(x_b, phi, claw, clawAzimuth(Rz(phi), q)) returns q.
+// Defined in the claw-down pose too (b1_e stays horizontal there); *ok is
+// false only when b1_e is vertical.
+double clawAzimuth(const WholeBodyParams & p, const Mat3 & R0, const VecN & q, bool * ok = nullptr);
 
 // Full whole-body reference for a STATIC HOLD: all derivatives zero,
 // compatible by construction (thrust vertical at rest => R0 = Rz(phi)).

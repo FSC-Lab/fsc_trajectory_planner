@@ -151,6 +151,15 @@ double sigmaNd(const VecN & q, const WholeBodyParams & p)
   return J.jacobiSvd().singularValues()(3);
 }
 
+double clawAzimuth(const WholeBodyParams & p, const Mat3 & R0, const VecN & q, bool * ok)
+{
+  Mat3 Re;
+  armKinematics(q, p, nullptr, nullptr, &Re);
+  const Vec3 b1e = R0 * Re.col(0);
+  if (ok != nullptr) {*ok = std::hypot(b1e(0), b1e(1)) > 1e-6;}
+  return std::atan2(b1e(1), b1e(0));
+}
+
 WbReference restReference(const WholeBodyParams & p, const RestSpec & rest)
 {
   const Mat3 r0 = Rz(rest.phi);

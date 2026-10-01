@@ -38,7 +38,10 @@ add_library(planner_lib STATIC
   src/transition_planner.cpp
   src/bspline_fit.cpp
   src/ee_trajectory_planner.cpp
-  src/trajectory.cpp)
+  src/trajectory.cpp
+  src/arm_sweep_planner.cpp
+  src/pick_place.cpp
+  src/workspace.cpp)
 set_target_properties(planner_lib PROPERTIES
   POSITION_INDEPENDENT_CODE ON
   OUTPUT_NAME fsc_trajectory_planner)
@@ -73,8 +76,11 @@ install(PROGRAMS
   test/test_traj_viz.py
   test/test_ee_trajectory_loopback.py
   test/test_ee_trajectory_pause.py
+  test/test_pick_place_loopback.py
   test/ee_trajectory_sim_driver.py
   test/ee_trajectory_sim_cycle.sh
+  test/pick_place_sim_driver.py
+  test/pick_place_sim_cycle.sh
   scripts/dump_python_fixtures.py
   DESTINATION lib/${PROJECT_NAME})
 
@@ -96,6 +102,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_ee_trajectory_planner test/test_ee_trajectory_planner.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_ee_trajectory_planner planner_lib)
+  ament_add_gtest(test_pick_place test/test_pick_place.cpp
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(test_pick_place planner_lib)
   # The parity fixture is the flight stack's own (installed beside its
   # flat_planner_selftest), so the two tests can never disagree on the truth.
   get_filename_component(_wb_share "${fsc_autopilot_ros2_DIR}/.." ABSOLUTE)

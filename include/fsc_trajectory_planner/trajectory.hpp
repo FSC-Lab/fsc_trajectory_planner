@@ -78,6 +78,27 @@ private:
   PlanDiag diag_;
 };
 
+// Rest-to-rest trajectories flown back to back. Every segment starts and ends
+// AT REST (all derivatives zero), so the joins are as smooth as the segments
+// themselves; the constructor refuses a chain whose segments do not meet.
+class SequenceTrajectory : public Trajectory
+{
+public:
+  explicit SequenceTrajectory(std::vector<std::shared_ptr<const Trajectory>> segments);
+  double duration() const override {return T_;}
+  WbReference eval(double t) const override;
+  RestSpec goalRest() const override {return segments_.back()->goalRest();}
+  const PlanDiag & diag() const override {return diag_;}
+  // Elapsed time at which each segment starts (size = number of segments).
+  const std::vector<double> & segmentStarts() const {return t0_;}
+
+private:
+  std::vector<std::shared_ptr<const Trajectory>> segments_;
+  std::vector<double> t0_;
+  double T_{0.0};
+  PlanDiag diag_;
+};
+
 struct PlanOptions
 {
   // kinematic bounds, honoured by every backend

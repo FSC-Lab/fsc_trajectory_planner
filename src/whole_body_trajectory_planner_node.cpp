@@ -28,6 +28,12 @@
 //                 ee_trajectory_planner; `go_to_start` plans and executes the
 //                 compatible transition to its start rest, `start` streams it
 //                 -- refused unless the vehicle and arm are at that rest.
+//     PICK-AND-PLACE MODE (2026-10-01): six legs (go_to_start, execute_pick,
+//                 go_to_place_start, execute_place, go_to_land_start,
+//                 execute_land) between calibrated base poses and claw
+//                 targets measured from mocap (obj_0 / drop_0). `plan` dry-
+//                 runs the whole mission; each leg's service re-plans it from
+//                 the CURRENT hold and executes it at once (pick_place.hpp).
 //   Mode leaves DIRECT at ANY point -> streaming stops instantly.
 //
 // FRAMES: the ROS boundary is the ACTUAL world/FLU convention (odometry, GS
@@ -38,9 +44,12 @@
 // launch file's uav_prefix) namespaces the whole interface per vehicle.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -64,13 +73,16 @@
 
 #include <px4_msgs/msg/vehicle_attitude.hpp>
 
+#include <fsc_autopilot_ros2_msgs/msg/mocap.hpp>
 #include <fsc_autopilot_ros2_msgs/msg/position_controller_reference.hpp>
 #include <fsc_autopilot_ros2_msgs/msg/whole_body_reference.hpp>
 
 #include "fsc_trajectory_planner/ee_trajectory_planner.hpp"
 #include "fsc_trajectory_planner/kinematics.hpp"
+#include "fsc_trajectory_planner/pick_place.hpp"
 #include "fsc_trajectory_planner/trajectory.hpp"
 #include "fsc_trajectory_planner/vehicle_model.hpp"
+#include "fsc_trajectory_planner/workspace.hpp"
 
 namespace fsc_trajectory_planner
 {
@@ -88,6 +100,7 @@ using std_srvs::srv::Trigger;
 using trajectory_msgs::msg::JointTrajectory;
 using trajectory_msgs::msg::JointTrajectoryPoint;
 using px4_msgs::msg::VehicleAttitude;
+using fsc_autopilot_ros2_msgs::msg::Mocap;
 using fsc_autopilot_ros2_msgs::msg::PositionControllerReference;
 using fsc_autopilot_ros2_msgs::msg::WholeBodyReference;
 
@@ -102,6 +115,12 @@ const char * const kArmJointNames[kNumJoints] = {"joint1", "joint2", "joint3",
 constexpr double kOdomFreshS = 0.5;
 // The capture is a REST spec; warn if the arm is still moving at capture.
 constexpr double kArmRestQdot = 0.05;
+
+// Pick-and-place: the point each leg flies to, indexed like the legs
+// (PickPlaceLeg). Names the pick_place_<point>_topic parameters and the
+// capture_<point> services.
+const char * const kPpPoint[kNumPickPlaceLegs] = {
+  "start", "pick", "place_start", "place", "land_start", "land"};
 
 // NED/FRD -> ENU/FLU, byte-for-byte the C++ getNEDqFromENUq (ros2_support).
 const Mat3 kRIE = (Mat3() << 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -1.0)
@@ -223,6 +242,66 @@ public:
     declare_parameter<double>("ee_traj_start_joint_tol_deg", 3.0);
     ee_time_scale_req_ = get_parameter("ee_traj_time_scale").as_double();
 
+    // --- pick-and-place mode (pick_place.hpp) ------------------------------
+    // Base poses [x, y, z, yaw_deg], WORLD frame, ACTUAL yaw (the drone GS's
+    // convention). PLACEHOLDERS: every one is shifted by the Adjust offset,
+    // and any one can be measured instead from a mocap body through its
+    // pick_place_<point>_topic + capture_<point> (x, y measured; z and yaw
+    // stay these).
+    declare_parameter<std::vector<double>>("pick_place_start", std::vector<double>{0.0, 0.0, 1.0, 0.0});
+    declare_parameter<std::vector<double>>(
+      "pick_place_place_start", std::vector<double>{0.0, -1.0, 1.0, 0.0});
+    declare_parameter<std::vector<double>>(
+      "pick_place_land_start", std::vector<double>{-1.0, 0.0, 1.0, 0.0});
+    // the hover over the landing spot: >= 0.5 m above the 0.305 m standing
+    // height (a 0.4 m hover brushed the floor in Isaac, 2026-10-01)
+    declare_parameter<std::vector<double>>("pick_place_land", std::vector<double>{-1.0, 0.0, 0.8, 0.0});
+    // Arm poses [deg]. Pick / place: [0, 0, 0, 0] = upper arm straight down,
+    // forearm out along the nose, claw straight down (the pitch joints at a
+    // right angle each); carry: the folded home.
+    declare_parameter<std::vector<double>>("pick_place_pick_pose_deg", std::vector<double>{0.0, 0.0, 0.0, 0.0});
+    declare_parameter<std::vector<double>>("pick_place_place_pose_deg", std::vector<double>{0.0, 0.0, 0.0, 0.0});
+    declare_parameter<std::vector<double>>(
+      "pick_place_carry_pose_deg", std::vector<double>{0.0, 40.0, 40.0, 0.0});
+    // claw target = measured mocap point + offset, world [m]
+    declare_parameter<std::vector<double>>("pick_place_pick_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter<std::vector<double>>("pick_place_place_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter<bool>("pick_place_face_target", true);
+    // before go_to_place_start / go_to_land_start: climb, then back off [m]
+    declare_parameter<double>("pick_place_retreat_dz", 0.15);
+    declare_parameter<double>("pick_place_retreat_back", 0.20);
+    // execute_place: the arm sweeps these bands [deg] (lo == hi: not swept)
+    declare_parameter<std::vector<double>>(
+      "pick_place_sweep_lo_deg", std::vector<double>{-25.0, 10.0, 0.0, 0.0});
+    declare_parameter<std::vector<double>>(
+      "pick_place_sweep_hi_deg", std::vector<double>{25.0, 45.0, 0.0, 0.0});
+    declare_parameter<std::vector<double>>(
+      "pick_place_sweep_phase_deg", std::vector<double>{0.0, 90.0, 0.0, 0.0});
+    declare_parameter<int>("pick_place_sweep_cycles", 2);
+    declare_parameter<double>("pick_place_sweep_ramp_frac", 0.2);
+    declare_parameter<double>("pick_place_sweep_qdot_max", 0.5);
+    declare_parameter<double>("pick_place_sweep_t_min", 8.0);
+    declare_parameter<double>("pick_place_sweep_t_max", 120.0);
+    // claw (pick / place) or base (other legs) within this of its target:
+    // the fine-correction gate reported on pick_place/arrival_error [m]
+    declare_parameter<double>("pick_place_arrival_tol", 0.05);
+    // Adjust shifts x, y; z and yaw too only when these are set
+    declare_parameter<bool>("pick_place_adjust_z", false);
+    declare_parameter<bool>("pick_place_adjust_yaw", false);
+    // mocap bodies (fsc_autopilot_ros2_msgs/Mocap, ABSOLUTE topics); "" = none
+    for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+      const char * dflt = k == kExecutePick ? "/obj_0/mocap" : (k == kExecutePlace ? "/drop_0/mocap" : "");
+      pp_topic_[k] = declare_parameter<std::string>(
+        std::string("pick_place_") + kPpPoint[k] + "_topic", dflt);
+    }
+    // a capture averages the samples of the last this-many seconds, and is
+    // REFUSED when they scatter more than this: two publishers on one topic
+    // (the Isaac emulator's phantom obj_0 at the origin did exactly that on
+    // the first sim flight, 2026-10-01: 856 mm, averaged and flown) or a
+    // moving / mis-tracked body must never become a goal [m]
+    declare_parameter<double>("pick_place_capture_window", 0.5);
+    declare_parameter<double>("pick_place_capture_max_spread", 0.02);
+
     if (home.size() != kNumJoints || base_com.size() != 3 || sign.size() != kNumJoints) {
       throw std::runtime_error("home_pose/arm_joint_sign need 4 values, base_com 3");
     }
@@ -258,6 +337,7 @@ public:
     joints_pub_ = create_publisher<Float64MultiArray>(prefix + "/target_joints", latched);
     // The WHOLE-BODY usable workspace as an (r, z) occupancy grid.
     ws_pub_ = create_publisher<Float64MultiArray>(prefix + "/workspace_rz", latched);
+    pp_ws_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/workspace_rz", latched);
     // Isaac visualisation: planned path (latched) and current sample (~20 Hz),
     // 12 world-frame doubles per sample: x_cd, nose, r_ed, claw.
     viz_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/viz_path", latched);
@@ -266,6 +346,11 @@ public:
     // node's model: inertial (gated on fresh odometry) and drone-body.
     cur_ee_pub_ = create_publisher<PoseStamped>(prefix + "/current_ee", 10);
     cur_ee_body_pub_ = create_publisher<PoseStamped>(prefix + "/current_ee_body", 10);
+    // ... and its HEADING in the ee_target convention (ACTUAL yaw, rad): the
+    // yaw an ee_target must carry to leave the wrist where it is. current_ee
+    // carries no orientation, and a station seeding a target without this
+    // asks for a wrist swing nobody commanded (the PS4 Remote tab did).
+    cur_ee_heading_pub_ = create_publisher<Float64>(prefix + "/current_ee_heading", 10);
     // THE ARM REFERENCE IN DIRECT: this node is the arm's only reference
     // source while it streams (the arm planner owns it in SAFETY).
     arm_ref_pub_ = create_publisher<JointTrajectory>(arm_ref_topic, 10);
@@ -309,6 +394,39 @@ public:
       std::chrono::milliseconds(100), [this]() {publishEeStartError();});
     publishEeStatus("NONE");
     publishEePath(nullptr);
+
+    // --- pick-and-place mode (arm GS "Pick & Place" tab) -------------------
+    pp_status_pub_ = create_publisher<String>(prefix + "/pick_place/status", latched);
+    pp_info_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/info", latched);
+    // the planned mission (all six legs back to back), same 9-double stride
+    // as ee_trajectory/path, at the claw and at the airframe
+    pp_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/path", latched);
+    pp_drone_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/drone_path", latched);
+    pp_arrival_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/arrival_error", 10);
+    const auto trigger = [this](const std::string & name, std::function<void(Trigger::Response::SharedPtr)> fn) {
+        pp_srvs_.push_back(create_service<Trigger>(
+          name, [fn](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {fn(r);}));
+      };
+    trigger(prefix + "/pick_place/adjust", [this](Trigger::Response::SharedPtr r) {onPpAdjust(r);});
+    trigger(prefix + "/pick_place/plan", [this](Trigger::Response::SharedPtr r) {onPpPlan(r);});
+    trigger(prefix + "/pick_place/reset", [this](Trigger::Response::SharedPtr r) {onPpReset(r);});
+    for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+      trigger(
+        prefix + "/pick_place/" + pickPlaceLegName(k),
+        [this, k](Trigger::Response::SharedPtr r) {onPpFly(k, r);});
+      trigger(
+        prefix + "/pick_place/capture_" + kPpPoint[k],
+        [this, k](Trigger::Response::SharedPtr r) {onPpCapture(k, r);});
+      if (!pp_topic_[k].empty()) {
+        // SensorData QoS (best effort) matches a reliable publisher as well
+        pp_mocap_subs_.push_back(create_subscription<Mocap>(
+          pp_topic_[k], rclcpp::SensorDataQoS(), [this, k](const Mocap & m) {onPpMocap(k, m);}));
+      }
+    }
+    pp_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() {publishPpArrival();});
+    publishPpStatus();
+    publishPpInfo();
+    publishPpPaths(nullptr);
 
     mode_sub_ = create_subscription<String>(
       mode_topic, latched, [this](const String & m) {onMode(m);});
@@ -354,6 +472,7 @@ public:
   {
     if (worker_.joinable()) {worker_.join();}
     if (ee_worker_.joinable()) {ee_worker_.join();}
+    if (pp_worker_.joinable()) {pp_worker_.join();}
   }
 
 private:
@@ -446,6 +565,14 @@ private:
         ee_traj_.reset();
         ee_shape_type_.clear();
         ++ee_gen_;
+        // pick-and-place: the plan and any leg in flight go; the captures,
+        // the calibration and the progress stay (they are measurements and
+        // the operator's bookkeeping), so a re-Plan resumes the mission
+        pp_wp_.reset();
+        pp_flying_.reset();
+        pp_exec_plan_.reset();
+        pp_planning_ = false;
+        ++pp_gen_;
         RCLCPP_INFO(get_logger(), "SAFETY -- planner silent, targets dropped.");
       }
     }
@@ -456,7 +583,10 @@ private:
       publishVizPose(nullptr);
       publishEeStatus("NONE");
       publishEePath(nullptr);
+      publishPpPaths(nullptr);
     }
+    publishPpStatus();
+    publishPpInfo();
   }
 
   void setHold(const RestSpec & rest, bool keep_anchor = false)
@@ -632,6 +762,13 @@ private:
       return;
     }
     const Vec3 p = x_b + r0 * v;
+    bool heading_ok = false;
+    const double az = clawAzimuth(vehicle_->params, r0 * vehicle_->r_model, *q, &heading_ok);
+    if (heading_ok) {
+      Float64 h;
+      h.data = wrapPi(az + 0.5 * M_PI);   // model azimuth -> ACTUAL yaw, as ee_target reads it
+      cur_ee_heading_pub_->publish(h);
+    }
     PoseStamped world;
     world.header.stamp = stamp;
     world.header.frame_id = "world";
@@ -707,6 +844,9 @@ private:
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !hold_.has_value()) {return;}
       if (state_ == "EXECUTING") {return;}
+      // any other target supersedes a pick-and-place leg still planning
+      pp_flying_.reset();
+      pp_exec_plan_.reset();
       req.rest0 = *hold_;
       std::string err;
       VecN q_goal;
@@ -726,6 +866,7 @@ private:
       opts = planOptions();
     }
     publishStatus();
+    publishPpStatus();
 
     // The solve runs on a worker thread so the reference stream keeps its
     // rate. In C++ a plan takes a few ms, but a stalled solver must still
@@ -833,9 +974,12 @@ private:
       home_goal_ = false;
       plan_.reset();
       ++plan_gen_;
+      pp_flying_.reset();
+      pp_exec_plan_.reset();
       if (mode_direct_) {state_ = "HOLD";}
     }
     publishStatus();
+    publishPpStatus();
     publishBaseAnchor();
     publishVizPath(nullptr);
     resp->success = true;
@@ -869,6 +1013,12 @@ private:
         }
       }
       if (finished) {
+        if (pp_flying_.has_value() && pp_exec_plan_ && pp_exec_plan_ == plan_) {
+          pp_completed_ = *pp_flying_;
+          RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", pickPlaceLegName(pp_completed_));
+        }
+        pp_flying_.reset();
+        pp_exec_plan_.reset();
         setHold(plan_->goalRest());
         plan_.reset();
         pending_base_.reset();
@@ -889,6 +1039,8 @@ private:
       publishStatus();
       publishBaseAnchor();
       publishVizPath(nullptr);
+      publishPpStatus();
+      publishPpInfo();
     }
     publishRef(ref);
     // The arm reference, from the SAME sample the law gets, at the same rate.
@@ -966,69 +1118,50 @@ private:
   }
 
   // ------------------------------------------------------ usable workspace
-  // Rasterise the reachable (r, z) set of the WHOLE-BODY chain, keeping only
-  // poses the planner can use (fold beta >= beta_min_deg), as a filled grid:
-  // [r_min, r_max, z_min, z_max, nr, nz, cells(nr*nz row-major, rows = z
-  // from z_max down)]. (r, z) depends on (q2, q3) alone.
+  // The reachable (r, z) set of the WHOLE-BODY chain as a filled grid
+  // (workspace.hpp): [r_min, r_max, z_min, z_max, nr, nz, cells(nr*nz
+  // row-major, rows = z from z_max down)], on two topics:
+  //   workspace_rz             fold beta >= beta_min_deg, as it always was --
+  //                            the EE Whole-Body and PS4 Remote tabs' envelope
+  //   pick_place/workspace_rz  the floor lowered to just under the
+  //                            pick-and-place poses when they fold below it
+  //                            (the claw-down [0, 0, 0, 0] has beta = 0), those
+  //                            extra poses keeping sigma_nd >= the margin: the
+  //                            Pick & Place PS4 tab's envelope, without which
+  //                            its fine correction could not move at the pick
   void publishWorkspace()
   {
-    const WholeBodyParams & P = vehicle_->params;
-    const double beta_min = vehicle_->beta_min_deg * M_PI / 180.0;
-    std::vector<double> rs, zs;
-    const int n2 = 241, n3 = 181;
-    for (int i = 0; i < n2; ++i) {
-      const double q2 = vehicle_->q_min(1) + (vehicle_->q_max(1) - vehicle_->q_min(1)) * i / (n2 - 1);
-      for (int k = 0; k < n3; ++k) {
-        const double q3 = vehicle_->q_min(2) + (vehicle_->q_max(2) - vehicle_->q_min(2)) * k / (n3 - 1);
-        if (q2 + q3 < beta_min) {continue;}
-        VecN q;
-        q << 0.0, q2, q3, 0.0;
-        Vec3 r0e;
-        armKinematics(q, P, nullptr, &r0e, nullptr);
-        const Vec3 v = vehicle_->r_model * r0e;
-        rs.push_back(std::hypot(v(0), v(1)));
-        zs.push_back(v(2));
+    const double guard = vehicle_->beta_min_deg * M_PI / 180.0;
+    double fold_min = guard;
+    for (const char * name : {"pick_place_pick_pose_deg", "pick_place_place_pose_deg"}) {
+      const auto q = get_parameter(name).as_double_array();
+      if (q.size() == kNumJoints) {
+        fold_min = std::min(fold_min, (q[1] + q[2] - 1.0) * M_PI / 180.0);
       }
     }
-    if (rs.empty()) {
+    const WorkspaceGrid g = usableWorkspace(*vehicle_, guard);
+    const WorkspaceGrid gp = fold_min < guard ? usableWorkspace(*vehicle_, fold_min) : g;
+    if (g.cells.empty() || gp.cells.empty()) {
       RCLCPP_ERROR(get_logger(), "usable workspace is EMPTY -- check the joint limits.");
       return;
     }
-    const double pad = 0.012;
-    const double r_min = 0.0;
-    const double r_max = *std::max_element(rs.begin(), rs.end()) + pad;
-    const double z_min = *std::min_element(zs.begin(), zs.end()) - pad;
-    const double z_max = std::max(0.0, *std::max_element(zs.begin(), zs.end())) + pad;
-    const int nr = 192, nz = 192;
-    std::vector<uint8_t> grid(static_cast<size_t>(nr) * nz, 0);
-    for (size_t i = 0; i < rs.size(); ++i) {
-      const int ci = static_cast<int>((rs[i] - r_min) / (r_max - r_min) * (nr - 1) + 0.5);
-      const int ri = static_cast<int>((z_max - zs[i]) / (z_max - z_min) * (nz - 1) + 0.5);
-      if (ci < 0 || ci >= nr || ri < 0 || ri >= nz) {continue;}
-      // 3x3 stamp seals the sampling holes so the region draws as an area
-      for (int dr = -1; dr <= 1; ++dr) {
-        for (int dc = -1; dc <= 1; ++dc) {
-          const int rr = std::min(nz - 1, std::max(0, ri + dr));
-          const int cc = std::min(nr - 1, std::max(0, ci + dc));
-          grid[static_cast<size_t>(rr) * nr + cc] = 1;
-        }
-      }
-    }
-    Float64MultiArray m;
-    m.data = {r_min, r_max, z_min, z_max, static_cast<double>(nr), static_cast<double>(nz)};
-    m.data.reserve(6 + grid.size());
-    double filled = 0.0;
-    for (uint8_t c : grid) {
-      m.data.push_back(c);
-      filled += c;
-    }
-    ws_pub_->publish(m);
+    ws_pub_->publish(gridMsg(g));
+    pp_ws_pub_->publish(gridMsg(gp));
     RCLCPP_INFO(
       get_logger(), "usable workspace published: %dx%d grid, r [%.3f, %.3f] m, z "
-      "[%.3f, %.3f] m, %.0f%% filled (fold beta >= %.0f deg)", nr, nz,
-      *std::min_element(rs.begin(), rs.end()), *std::max_element(rs.begin(), rs.end()),
-      *std::min_element(zs.begin(), zs.end()), *std::max_element(zs.begin(), zs.end()),
-      100.0 * filled / grid.size(), vehicle_->beta_min_deg);
+      "[%.3f, %.3f] m, %.0f%% filled (fold beta >= %.0f deg); pick-and-place envelope "
+      "down to fold %.0f deg (sigma_nd >= %.2f): z >= %.3f m", g.nr, g.nz, g.rs_min, g.rs_max,
+      g.zs_min, g.zs_max, 100.0 * g.filledFraction(), vehicle_->beta_min_deg,
+      fold_min * 180.0 / M_PI, vehicle_->sigma_nd_margin, gp.zs_min);
+  }
+
+  static Float64MultiArray gridMsg(const WorkspaceGrid & g)
+  {
+    Float64MultiArray m;
+    m.data = {g.r_min, g.r_max, g.z_min, g.z_max, static_cast<double>(g.nr), static_cast<double>(g.nz)};
+    m.data.reserve(6 + g.cells.size());
+    for (uint8_t c : g.cells) {m.data.push_back(c);}
+    return m;
   }
 
   void publishTargetJoints(const VecN & q)
@@ -1370,6 +1503,8 @@ private:
         return;
       }
       plan_ = ee_traj_;
+      pp_flying_.reset();
+      pp_exec_plan_.reset();
       pending_base_.reset();
       ee_target_.reset();
       home_goal_ = false;
@@ -1627,67 +1762,635 @@ private:
   void publishEePath(const Trajectory * traj)
   {
     Float64MultiArray m;
-    if (traj != nullptr) {
-      const int n = 400;
-      for (int k = 0; k < n; ++k) {
-        const double t = traj->duration() * k / (n - 1);
-        const WbReference ref = traj->eval(t);
-        PoseStamped ps;
-        eePoseOf(ref, &ps);
-        m.data.push_back(t);
-        m.data.push_back(ps.pose.position.x);
-        m.data.push_back(ps.pose.position.y);
-        m.data.push_back(ps.pose.position.z);
-        m.data.push_back(ref.r_ed_dot.norm());
-        m.data.push_back(ps.pose.orientation.x);
-        m.data.push_back(ps.pose.orientation.y);
-        m.data.push_back(ps.pose.orientation.z);
-        m.data.push_back(ps.pose.orientation.w);
-      }
-    }
+    if (traj != nullptr) {eePathRows(*traj, 400, &m.data);}
     ee_path_pub_->publish(m);
     publishEeDronePath(traj);
   }
 
-  // The same run at the airframe, same [t, x, y, z, speed, quat] layout as
-  // /path. Speed is |dx_b/dt| by central difference on this grid: the body's
-  // velocity is not a field of WbReference (x_cd_dot is the CoM's, and the
-  // two differ by the arm's own motion), and this is a colour scale.
   void publishEeDronePath(const Trajectory * traj)
   {
     Float64MultiArray m;
-    if (traj != nullptr) {
-      const int n = 400;
-      const double T = traj->duration();
-      std::vector<double> t(n);
-      std::vector<PoseStamped> pose(n);
-      for (int k = 0; k < n; ++k) {
-        t[k] = T * k / (n - 1);
-        dronePoseOf(traj->eval(t[k]), &pose[k]);
+    if (traj != nullptr) {dronePathRows(*traj, 400, &m.data);}
+    ee_drone_path_pub_->publish(m);
+  }
+
+  // n samples of the claw along a trajectory: [t, x, y, z, |v_ee|, quat].
+  void eePathRows(const Trajectory & traj, int n, std::vector<double> * out) const
+  {
+    for (int k = 0; k < n; ++k) {
+      const double t = traj.duration() * k / (n - 1);
+      const WbReference ref = traj.eval(t);
+      PoseStamped ps;
+      eePoseOf(ref, &ps);
+      out->push_back(t);
+      out->push_back(ps.pose.position.x);
+      out->push_back(ps.pose.position.y);
+      out->push_back(ps.pose.position.z);
+      out->push_back(ref.r_ed_dot.norm());
+      out->push_back(ps.pose.orientation.x);
+      out->push_back(ps.pose.orientation.y);
+      out->push_back(ps.pose.orientation.z);
+      out->push_back(ps.pose.orientation.w);
+    }
+  }
+
+  // The same trajectory at the airframe, same [t, x, y, z, speed, quat]
+  // layout. Speed is |dx_b/dt| by central difference on this grid: the body's
+  // velocity is not a field of WbReference (x_cd_dot is the CoM's, and the
+  // two differ by the arm's own motion), and this is a colour scale.
+  void dronePathRows(const Trajectory & traj, int n, std::vector<double> * out) const
+  {
+    const double T = traj.duration();
+    std::vector<double> t(n);
+    std::vector<PoseStamped> pose(n);
+    for (int k = 0; k < n; ++k) {
+      t[k] = T * k / (n - 1);
+      dronePoseOf(traj.eval(t[k]), &pose[k]);
+    }
+    for (int k = 0; k < n; ++k) {
+      const int a = std::max(0, k - 1), b = std::min(n - 1, k + 1);
+      const double dt = t[b] - t[a];
+      double speed = 0.0;
+      if (dt > 1e-9) {
+        speed = std::hypot(
+          std::hypot(
+            pose[b].pose.position.x - pose[a].pose.position.x,
+            pose[b].pose.position.y - pose[a].pose.position.y),
+          pose[b].pose.position.z - pose[a].pose.position.z) / dt;
       }
-      for (int k = 0; k < n; ++k) {
-        const int a = std::max(0, k - 1), b = std::min(n - 1, k + 1);
-        const double dt = t[b] - t[a];
-        double speed = 0.0;
-        if (dt > 1e-9) {
-          speed = std::hypot(
-            std::hypot(
-              pose[b].pose.position.x - pose[a].pose.position.x,
-              pose[b].pose.position.y - pose[a].pose.position.y),
-            pose[b].pose.position.z - pose[a].pose.position.z) / dt;
+      out->push_back(t[k]);
+      out->push_back(pose[k].pose.position.x);
+      out->push_back(pose[k].pose.position.y);
+      out->push_back(pose[k].pose.position.z);
+      out->push_back(speed);
+      out->push_back(pose[k].pose.orientation.x);
+      out->push_back(pose[k].pose.orientation.y);
+      out->push_back(pose[k].pose.orientation.z);
+      out->push_back(pose[k].pose.orientation.w);
+    }
+  }
+
+  // ================================================= pick-and-place mode
+  // Six legs (pick_place.hpp), each its own button. The goals come from the
+  // nominal base poses (shifted by the Adjust offset) and the claw points
+  // captured from mocap; `plan` dry-runs the whole mission from the hold, and
+  // each leg's service re-plans that leg from the CURRENT hold -- the vehicle
+  // may have been nudged since (the PS4 fine correction) -- and executes it
+  // as soon as it is planned. Legs are flown in order; any earlier leg may be
+  // flown again, none may be skipped.
+  bool ppJoints(const std::string & name, VecN * q, std::string * err) const
+  {
+    const auto v = get_parameter(name).as_double_array();
+    if (v.size() != kNumJoints) {
+      *err = name + " needs 4 joint angles [deg]";
+      return false;
+    }
+    for (int j = 0; j < kNumJoints; ++j) {(*q)(j) = v[j] * M_PI / 180.0;}
+    return true;
+  }
+
+  bool ppVec3(const std::string & name, Vec3 * p, std::string * err) const
+  {
+    const auto v = get_parameter(name).as_double_array();
+    if (v.size() != 3) {
+      *err = name + " needs [x, y, z]";
+      return false;
+    }
+    *p = Vec3{v[0], v[1], v[2]};
+    return true;
+  }
+
+  // [x, y, z, yaw_deg] -> BasePose (ACTUAL yaw, rad)
+  bool ppBase(const std::string & name, BasePose * b, std::string * err) const
+  {
+    const auto v = get_parameter(name).as_double_array();
+    if (v.size() != 4) {
+      *err = name + " needs [x, y, z, yaw_deg]";
+      return false;
+    }
+    b->p = Vec3{v[0], v[1], v[2]};
+    b->yaw = v[3] * M_PI / 180.0;
+    return true;
+  }
+
+  bool ppConfig(PickPlaceConfig * c, std::string * err) const
+  {
+    c->home = home_pose_;
+    if (!ppJoints("pick_place_carry_pose_deg", &c->carry, err) ||
+      !ppJoints("pick_place_pick_pose_deg", &c->pick_pose, err) ||
+      !ppJoints("pick_place_place_pose_deg", &c->place_pose, err) ||
+      !ppVec3("pick_place_pick_ee_offset", &c->pick_ee_offset, err) ||
+      !ppVec3("pick_place_place_ee_offset", &c->place_ee_offset, err) ||
+      !ppJoints("pick_place_sweep_lo_deg", &c->sweep.lo, err) ||
+      !ppJoints("pick_place_sweep_hi_deg", &c->sweep.hi, err) ||
+      !ppJoints("pick_place_sweep_phase_deg", &c->sweep.phase, err))
+    {
+      return false;
+    }
+    c->face_target = get_parameter("pick_place_face_target").as_bool();
+    c->retreat_dz = get_parameter("pick_place_retreat_dz").as_double();
+    c->retreat_back = get_parameter("pick_place_retreat_back").as_double();
+    ArmSweepOptions & o = c->sweep;
+    o.cycles = static_cast<int>(get_parameter("pick_place_sweep_cycles").as_int());
+    o.ramp_frac = get_parameter("pick_place_sweep_ramp_frac").as_double();
+    o.qdot_max = get_parameter("pick_place_sweep_qdot_max").as_double();
+    o.T_min = get_parameter("pick_place_sweep_t_min").as_double();
+    o.T_max = get_parameter("pick_place_sweep_t_max").as_double();
+    o.v_max = get_parameter("v_max").as_double();
+    o.a_max = get_parameter("a_max").as_double();
+    o.w_max = get_parameter("w_max").as_double();
+    const double tjm = get_parameter("tau_joint_max").as_double();
+    o.tau_joint_max = tjm > 0.0 ? tjm : -1.0;
+    o.rotor_bounds = get_parameter("rotor_bounds").as_bool();
+    o.sigma_nd_min = vehicle_->sigma_nd_margin;
+    return true;
+  }
+
+  // The goals' inputs: the nominal base poses + the Adjust offset (x, y from
+  // a mocap capture instead when one was taken) and the captured claw
+  // points. Called under the lock.
+  bool ppTargets(PickPlaceTargets * t, std::string * err) const
+  {
+    BasePose * base[kNumPickPlaceLegs] = {
+      &t->start, nullptr, &t->place_start, nullptr, &t->land_start, &t->land};
+    std::string missing;
+    for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+      if (base[k] != nullptr) {
+        if (!ppBase(std::string("pick_place_") + kPpPoint[k], base[k], err)) {return false;}
+        base[k]->p += pp_offset_;
+        base[k]->yaw += pp_yaw_offset_;
+        if (pp_capture_[k].has_value()) {
+          base[k]->p.head<2>() = pp_capture_[k]->head<2>();   // measured: no offset
         }
-        m.data.push_back(t[k]);
-        m.data.push_back(pose[k].pose.position.x);
-        m.data.push_back(pose[k].pose.position.y);
-        m.data.push_back(pose[k].pose.position.z);
-        m.data.push_back(speed);
-        m.data.push_back(pose[k].pose.orientation.x);
-        m.data.push_back(pose[k].pose.orientation.y);
-        m.data.push_back(pose[k].pose.orientation.z);
-        m.data.push_back(pose[k].pose.orientation.w);
+        continue;
+      }
+      if (!pp_capture_[k].has_value()) {
+        missing += (missing.empty() ? "" : " and ") + std::string(kPpPoint[k]) + " (" +
+          (pp_topic_[k].empty() ? "no topic set" : pp_topic_[k]) + ")";
+        continue;
+      }
+      (k == kExecutePick ? t->pick : t->place) = *pp_capture_[k];
+    }
+    if (!missing.empty()) {
+      *err = "capture " + missing + " first";
+      return false;
+    }
+    return true;
+  }
+
+  void onPpMocap(int k, const Mocap & msg)
+  {
+    const Vec3 p{msg.pose.position.x, msg.pose.position.y, msg.pose.position.z};
+    if (!p.allFinite()) {return;}
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    auto & d = pp_mocap_[k];
+    d.emplace_back(Clock::now(), p);
+    while (d.size() > 1 && (secondsSince(d.front().first) > 2.0 || d.size() > 2000)) {
+      d.pop_front();
+    }
+  }
+
+  // The inputs changed: a plan made from the old ones must not be flown.
+  // Called under the lock.
+  void ppInvalidate()
+  {
+    pp_wp_.reset();
+    pp_planning_ = false;
+    pp_error_.clear();
+    ++pp_gen_;
+  }
+
+  void onPpCapture(int k, Trigger::Response::SharedPtr resp)
+  {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pp_flying_.has_value()) {
+        resp->success = false;
+        resp->message = "a pick-and-place leg is in flight -- capture once it holds";
+        return;
+      }
+      if (pp_topic_[k].empty()) {
+        resp->success = false;
+        resp->message = std::string("no mocap body for ") + kPpPoint[k] + " -- set pick_place_" +
+          kPpPoint[k] + "_topic (the nominal pick_place_" + kPpPoint[k] + " is used meanwhile)";
+        return;
+      }
+      const double window = get_parameter("pick_place_capture_window").as_double();
+      Vec3 sum = Vec3::Zero();
+      std::vector<Vec3> pts;
+      for (const auto & s : pp_mocap_[k]) {
+        if (secondsSince(s.first) <= window) {pts.push_back(s.second);}
+      }
+      if (pts.empty()) {
+        m.precision(2);
+        m << "no sample on " << pp_topic_[k] << " in the last " << window
+          << " s -- is the body tracked and broadcast?";
+        resp->success = false;
+        resp->message = m.str();
+        return;
+      }
+      for (const Vec3 & p : pts) {sum += p;}
+      const Vec3 mean = sum / static_cast<double>(pts.size());
+      double spread = 0.0;
+      for (const Vec3 & p : pts) {spread = std::max(spread, (p - mean).norm());}
+      const double max_spread = get_parameter("pick_place_capture_max_spread").as_double();
+      if (spread > max_spread) {
+        m.precision(1);
+        m << pts.size() << " samples from " << pp_topic_[k] << " in " << window
+          << " s scatter " << spread * 1e3 << " mm (> " << max_spread * 1e3
+          << " mm): more than one publisher on the topic, or the body is moving or "
+             "mis-tracked -- NOT captured";
+        resp->success = false;
+        resp->message = m.str();
+        RCLCPP_WARN(get_logger(), "pick-and-place capture refused: %s", resp->message.c_str());
+        return;
+      }
+      const bool was_planned = pp_wp_.has_value();
+      pp_capture_[k] = mean;
+      ppInvalidate();
+      m.precision(3);
+      m << "captured " << kPpPoint[k] << " at [" << mean(0) << ", " << mean(1) << ", " << mean(2)
+        << "] m from " << pp_topic_[k] << " (" << pts.size() << " samples, spread "
+        << std::setprecision(1) << spread * 1e3 << " mm)";
+      if (k != kExecutePick && k != kExecutePlace) {m << "; x, y replace the nominal pose";}
+      if (was_planned) {m << " -- the plan is stale, press Plan";}
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
+    publishPpStatus();
+    publishPpInfo();
+    publishPpPaths(nullptr);
+  }
+
+  // ADJUST: the vehicle is at the physical start mark (on the ground or in a
+  // hover); its measured position minus the nominal start is the offset every
+  // nominal point is shifted by -- the mocap centring changes between
+  // sessions, the room does not.
+  void onPpAdjust(Trigger::Response::SharedPtr resp)
+  {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(3);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pp_flying_.has_value()) {
+        resp->success = false;
+        resp->message = "a pick-and-place leg is in flight -- adjust once it holds";
+        return;
+      }
+      if (!odom_p_.has_value() || secondsSince(odom_p_time_) > kOdomFreshS) {
+        resp->success = false;
+        resp->message = "no fresh odometry -- cannot measure the vehicle's position";
+        return;
+      }
+      BasePose nominal;
+      std::string err;
+      if (!ppBase("pick_place_start", &nominal, &err)) {
+        resp->success = false;
+        resp->message = err;
+        return;
+      }
+      Vec3 off = *odom_p_ - nominal.p;
+      if (!get_parameter("pick_place_adjust_z").as_bool()) {off(2) = 0.0;}
+      double yoff = 0.0;
+      if (get_parameter("pick_place_adjust_yaw").as_bool()) {
+        if (!att_R_.has_value() || secondsSince(att_time_) > kOdomFreshS) {
+          resp->success = false;
+          resp->message = "pick_place_adjust_yaw is set but there is no fresh PX4 attitude";
+          return;
+        }
+        yoff = wrapPi(std::atan2((*att_R_)(1, 0), (*att_R_)(0, 0)) - nominal.yaw);
+      }
+      pp_offset_ = off;
+      pp_yaw_offset_ = yoff;
+      ppInvalidate();
+      m << "offset [" << off(0) << ", " << off(1) << ", " << off(2) << "] m, yaw "
+        << std::setprecision(1) << yoff * 180.0 / M_PI
+        << " deg -- every nominal point is shifted by it; press Plan";
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "pick-and-place adjust: %s", resp->message.c_str());
+    publishPpStatus();
+    publishPpInfo();
+    publishPpPaths(nullptr);
+  }
+
+  void onPpPlan(Trigger::Response::SharedPtr resp)
+  {
+    PickPlaceTargets tg;
+    PickPlaceConfig cfg;
+    PlanOptions opts;
+    RestSpec from;
+    unsigned gen = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !hold_.has_value()) {
+        resp->success = false;
+        resp->message = "not in whole-body DIRECT (the first leg is planned from the hold)";
+        return;
+      }
+      if (pp_flying_.has_value() || state_ == "EXECUTING") {
+        // the first leg is dry-run from the hold, which an execution is
+        // about to replace
+        resp->success = false;
+        resp->message = "planner is " + state_ + " -- plan once it holds";
+        return;
+      }
+      std::string err;
+      if (!ppConfig(&cfg, &err) || !ppTargets(&tg, &err)) {
+        resp->success = false;
+        resp->message = err;
+        return;
+      }
+      opts = planOptions();
+      from = *hold_;
+      ppInvalidate();
+      gen = pp_gen_;
+      pp_planning_ = true;
+    }
+    publishPpStatus();
+    publishPpPaths(nullptr);
+    if (pp_worker_.joinable()) {pp_worker_.join();}
+    pp_worker_ = std::thread([this, tg, cfg, opts, from, gen]() {
+        std::optional<PickPlaceWaypoints> wp;
+        std::vector<std::shared_ptr<const Trajectory>> legs;
+        std::shared_ptr<Trajectory> whole;
+        std::string err;
+        try {
+          wp = pickPlaceWaypoints(*vehicle_, cfg, tg);
+          legs = planPickPlaceMission(*vehicle_, *planner_, opts, cfg, *wp, from);
+          whole = std::make_shared<SequenceTrajectory>(legs);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != pp_gen_) {return;}   // superseded
+          pp_planning_ = false;
+          if (!err.empty()) {
+            pp_error_ = err;
+            RCLCPP_WARN(get_logger(), "pick-and-place plan refused: %s", err.c_str());
+          } else {
+            pp_wp_ = wp;
+            for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+              pp_leg_T_[k] = legs[k]->duration();
+              RCLCPP_INFO(
+                get_logger(), "pick-and-place %s: %s", pickPlaceLegName(k),
+                legs[k]->diag().summary.c_str());
+            }
+            RCLCPP_INFO(get_logger(), "pick-and-place planned: %.1f s of flight in six legs.", whole->duration());
+          }
+        }
+        publishPpStatus();
+        publishPpInfo();
+        publishPpPaths(whole.get());
+      });
+    resp->success = true;
+    resp->message = "planning the six legs from the current hold -- the status reads READY when done";
+  }
+
+  void onPpFly(int leg, Trigger::Response::SharedPtr resp)
+  {
+    RestSpec from;
+    PickPlaceWaypoints wp;
+    PickPlaceConfig cfg;
+    PlanOptions opts;
+    unsigned gen = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::string err;
+      if (!mode_direct_ || !hold_.has_value()) {
+        err = "not in whole-body DIRECT";
+      } else if (pp_planning_) {
+        err = "the mission is still planning";
+      } else if (!pp_wp_.has_value()) {
+        err = "not planned -- capture the pick / place points and press Plan";
+      } else if (state_ == "EXECUTING" || state_ == "CALCULATING") {
+        err = "planner is " + state_ + " -- wait for HOLD";
+      } else if (leg > pp_completed_ + 1) {
+        err = std::string("out of order -- the next leg is ") + pickPlaceLegName(pp_completed_ + 1);
+      }
+      if (err.empty()) {ppConfig(&cfg, &err);}
+      if (!err.empty()) {
+        resp->success = false;
+        resp->message = err;
+        return;
+      }
+      from = *hold_;
+      wp = *pp_wp_;
+      opts = planOptions();
+      gen = ++plan_gen_;
+      state_ = "CALCULATING";
+      plan_.reset();
+      goal_override_.reset();
+      auto_send_ = false;
+      pending_base_.reset();
+      ee_target_.reset();
+      home_goal_ = false;
+      exec_pause_t_.reset();
+      pp_flying_ = leg;
+      pp_exec_plan_.reset();
+      pp_error_.clear();
+    }
+    publishStatus();
+    publishPpStatus();
+    publishPpInfo();
+    if (worker_.joinable()) {worker_.join();}
+    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen]() {
+        std::shared_ptr<Trajectory> traj;
+        std::string err;
+        try {
+          traj = planPickPlaceLeg(*vehicle_, *planner_, opts, cfg, wp, leg, from);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != plan_gen_ || state_ != "CALCULATING") {return;}   // superseded
+          if (!traj) {
+            state_ = "INFEASIBLE";
+            infeasible_reason_ = err;
+            pp_error_ = err;
+            pp_flying_.reset();
+            RCLCPP_WARN(get_logger(), "pick-and-place leg refused: %s", err.c_str());
+          } else {
+            plan_ = traj;
+            pp_exec_plan_ = traj;
+            exec_t0_ = Clock::now();
+            exec_pause_t_.reset();
+            state_ = "EXECUTING";
+            RCLCPP_INFO(
+              get_logger(), "pick-and-place %s: executing -- %s", pickPlaceLegName(leg),
+              traj->diag().summary.c_str());
+          }
+        }
+        publishStatus();
+        publishPpStatus();
+        publishPpInfo();
+        publishVizPath(traj.get());
+      });
+    resp->success = true;
+    resp->message = std::string("planning ") + pickPlaceLegName(leg) +
+      " from the current hold; it executes as soon as it is planned";
+    RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
+  }
+
+  void onPpReset(Trigger::Response::SharedPtr resp)
+  {
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pp_flying_.has_value()) {
+        resp->success = false;
+        resp->message = "a pick-and-place leg is in flight -- revert to SAFETY to abort it";
+        return;
+      }
+      pp_completed_ = -1;
+      ppInvalidate();
+    }
+    resp->success = true;
+    resp->message = "pick-and-place progress and plan cleared (captures and the Adjust offset kept)";
+    publishPpStatus();
+    publishPpInfo();
+    publishPpPaths(nullptr);
+  }
+
+  // 10 Hz: how far the leg in flight (else the last leg flown) is from its
+  // target, measured -- the claw (FK on the encoders, odometry position, PX4
+  // attitude) for execute_pick / execute_place, the body origin otherwise.
+  // [0] leg, [1] 1 = claw target / 0 = base target, [2] |error| [m],
+  // [3..5] error target - measured, world [m], [6] tolerance [m],
+  // [7] within tolerance, [8] within AND holding: fine correction OK.
+  void publishPpArrival()
+  {
+    Float64MultiArray m;
+    bool gate_changed = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !pp_wp_.has_value()) {return;}
+      const int leg = pp_flying_.has_value() ? *pp_flying_ : pp_completed_;
+      if (leg < 0) {return;}
+      Vec3 x_b;
+      Mat3 r0;
+      if (!odomPair(&x_b, &r0) || odomAge() > kOdomFreshS || !q_meas_.has_value()) {return;}
+      const bool claw = pickPlaceLegIsClaw(leg);
+      Vec3 meas = x_b, want = pp_wp_->goal[leg].x_b;
+      if (claw) {
+        Vec3 r0e;
+        armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
+        meas = x_b + r0 * (vehicle_->r_model * r0e);
+        want = pp_wp_->ee[leg];
+      }
+      const Vec3 e = want - meas;
+      const double tol = get_parameter("pick_place_arrival_tol").as_double();
+      const bool within = e.norm() <= tol;
+      const bool settled = within && !pp_flying_.has_value() && state_ == "HOLD";
+      m.data = {static_cast<double>(leg), claw ? 1.0 : 0.0, e.norm(), e(0), e(1), e(2), tol,
+        within ? 1.0 : 0.0, settled ? 1.0 : 0.0};
+      if (settled != pp_settled_ || leg != pp_err_leg_) {
+        pp_settled_ = settled;
+        pp_err_leg_ = leg;
+        gate_changed = true;
       }
     }
-    ee_drone_path_pub_->publish(m);
+    pp_arrival_pub_->publish(m);
+    if (gate_changed) {publishPpStatus();}
+  }
+
+  void publishPpStatus()
+  {
+    std::string s;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::ostringstream m;
+      m.setf(std::ios::fixed);
+      m.precision(1);
+      if (!mode_direct_) {
+        m << "NOT IN DIRECT";
+      } else if (pp_planning_) {
+        m << "PLANNING";
+      } else if (pp_flying_.has_value()) {
+        m << "FLYING " << pickPlaceLegName(*pp_flying_);
+        if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
+      } else if (!pp_error_.empty()) {
+        m << "INFEASIBLE: " << pp_error_;
+      } else if (!pp_wp_.has_value()) {
+        PickPlaceTargets t;
+        std::string err;
+        m << "NOT PLANNED: " << (ppTargets(&t, &err) ? std::string("press Plan") : err);
+      } else if (pp_completed_ >= kNumPickPlaceLegs - 1) {
+        m << "COMPLETE -- touch down with SAFETY -> land";
+      } else if (pp_completed_ < 0) {
+        m << "READY next=" << pickPlaceLegName(0);
+      } else {
+        m << "DONE " << pickPlaceLegName(pp_completed_) << " next="
+          << pickPlaceLegName(pp_completed_ + 1);
+        if (pickPlaceLegIsClaw(pp_completed_)) {
+          m << (pp_settled_ ? " -- claw within tolerance: fine correction OK"
+                            : " -- claw outside tolerance");
+        }
+      }
+      s = m.str();
+    }
+    String msg;
+    msg.data = s;
+    pp_status_pub_->publish(msg);
+  }
+
+  // [0..2] Adjust offset [m], [3] yaw offset [deg], [4] planned, [5] last
+  // leg completed (-1 none), [6] leg in flight (-1 none), [7] arrival
+  // tolerance [m], [8..13] each leg's planned duration [s], [14..55] per leg
+  // [goal base x, y, z, actual yaw deg, claw x, y, z], [56..79] per point
+  // (start, pick, place_start, place, land_start, land) [captured x, y, z,
+  // valid]. NaN where there is nothing.
+  void publishPpInfo()
+  {
+    Float64MultiArray m;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      m.data = {pp_offset_(0), pp_offset_(1), pp_offset_(2), pp_yaw_offset_ * 180.0 / M_PI,
+        pp_wp_.has_value() ? 1.0 : 0.0, static_cast<double>(pp_completed_),
+        pp_flying_.has_value() ? static_cast<double>(*pp_flying_) : -1.0,
+        get_parameter("pick_place_arrival_tol").as_double()};
+      for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+        m.data.push_back(pp_wp_.has_value() ? pp_leg_T_[k] : nan);
+      }
+      for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+        if (!pp_wp_.has_value()) {
+          m.data.insert(m.data.end(), 7, nan);
+          continue;
+        }
+        const RestSpec & g = pp_wp_->goal[k];
+        const Vec3 & e = pp_wp_->ee[k];
+        m.data.insert(
+          m.data.end(), {g.x_b(0), g.x_b(1), g.x_b(2), wrapPi(g.phi + 0.5 * M_PI) * 180.0 / M_PI,
+            e(0), e(1), e(2)});
+      }
+      for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+        if (pp_capture_[k].has_value()) {
+          const Vec3 & p = *pp_capture_[k];
+          m.data.insert(m.data.end(), {p(0), p(1), p(2), 1.0});
+        } else {
+          m.data.insert(m.data.end(), {nan, nan, nan, 0.0});
+        }
+      }
+    }
+    pp_info_pub_->publish(m);
+  }
+
+  void publishPpPaths(const Trajectory * whole)
+  {
+    Float64MultiArray a, b;
+    if (whole != nullptr) {
+      eePathRows(*whole, 600, &a.data);
+      dronePathRows(*whole, 600, &b.data);
+    }
+    pp_path_pub_->publish(a);
+    pp_drone_path_pub_->publish(b);
   }
 
   // ---------------------------------------------------------------- status
@@ -1803,6 +2506,23 @@ private:
   std::string ee_status_{"NONE"};
   unsigned ee_gen_{0};
   std::thread ee_worker_;
+  // pick-and-place mode
+  std::array<std::string, kNumPickPlaceLegs> pp_topic_;          // mocap body per point
+  Vec3 pp_offset_{Vec3::Zero()};                                  // Adjust
+  double pp_yaw_offset_{0.0};
+  std::array<std::optional<Vec3>, kNumPickPlaceLegs> pp_capture_;
+  std::array<std::deque<std::pair<Clock::time_point, Vec3>>, kNumPickPlaceLegs> pp_mocap_;
+  std::optional<PickPlaceWaypoints> pp_wp_;                       // set by Plan
+  std::array<double, kNumPickPlaceLegs> pp_leg_T_{};
+  bool pp_planning_{false};
+  std::string pp_error_;
+  int pp_completed_{-1};                                          // last leg flown to the end
+  std::optional<int> pp_flying_;                                  // leg planning / executing
+  std::shared_ptr<Trajectory> pp_exec_plan_;                      // ... and its trajectory
+  bool pp_settled_{false};
+  int pp_err_leg_{-1};
+  unsigned pp_gen_{0};
+  std::thread pp_worker_;
 
   // ---- live samples --------------------------------------------------------
   std::optional<Vec3> odom_p_;
@@ -1819,6 +2539,7 @@ private:
   rclcpp::Publisher<WholeBodyReference>::SharedPtr ref_pub_;
   rclcpp::Publisher<String>::SharedPtr status_pub_;
   rclcpp::Publisher<PoseStamped>::SharedPtr base_pub_, cur_ee_pub_, cur_ee_body_pub_;
+  rclcpp::Publisher<Float64>::SharedPtr cur_ee_heading_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr joints_pub_, ws_pub_, viz_path_pub_, viz_pose_pub_;
   rclcpp::Publisher<JointTrajectory>::SharedPtr arm_ref_pub_;
   rclcpp::Subscription<String>::SharedPtr mode_sub_;
@@ -1839,6 +2560,12 @@ private:
   rclcpp::Service<Trigger>::SharedPtr ee_go_srv_, ee_start_srv_;
   rclcpp::Service<Trigger>::SharedPtr ee_pause_srv_, ee_resume_srv_, ee_origin_srv_;
   rclcpp::TimerBase::SharedPtr ee_err_timer_;
+  rclcpp::Publisher<String>::SharedPtr pp_status_pub_;
+  rclcpp::Publisher<Float64MultiArray>::SharedPtr pp_info_pub_, pp_path_pub_, pp_drone_path_pub_;
+  rclcpp::Publisher<Float64MultiArray>::SharedPtr pp_arrival_pub_, pp_ws_pub_;
+  std::vector<rclcpp::Service<Trigger>::SharedPtr> pp_srvs_;
+  std::vector<rclcpp::Subscription<Mocap>::SharedPtr> pp_mocap_subs_;
+  rclcpp::TimerBase::SharedPtr pp_timer_;
 };
 
 }  // namespace fsc_trajectory_planner

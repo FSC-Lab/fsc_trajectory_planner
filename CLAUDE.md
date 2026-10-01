@@ -59,12 +59,20 @@ include/fsc_trajectory_planner/
   ee_trajectory_planner.hpp  EeShape / EeTrajectoryOptions / EeTrajectoryDiag / EeTrajectoryPlanner
                           (the periodic END-EFFECTOR TRAJECTORY mode, see its section)
   bspline_fit.hpp         clamped uniform B-spline with sparse least-squares fitting and pinned ends
+  arm_sweep_planner.hpp   ArmSweepOptions / ArmSweepDiag / ArmSweepPlanner + nonicPhase: a rest-to-rest
+                          leg with joints sweeping between limits (pick-and-place execute_place)
+  pick_place.hpp          PickPlaceLeg / PickPlaceConfig / PickPlaceTargets / PickPlaceWaypoints,
+                          pickPlaceWaypoints, retreatRest, planPickPlaceLeg, planPickPlaceMission
+                          (the PICK-AND-PLACE mode, see its section)
+  workspace.hpp           WorkspaceGrid / usableWorkspace: the (r, z) envelope published on workspace_rz
 src/
   kinematics.cpp                           port of transition_planner.py / compatible_trajectory.py helpers
   transition_planner.cpp                   the bspline adapter over wb_law's planFlatTransition
   ee_trajectory_planner.cpp, bspline_fit.cpp   the EE trajectory mode
+  arm_sweep_planner.cpp, pick_place.cpp        the pick-and-place mode
+  workspace.cpp                            the workspace_rz grid (moved out of the node 2026-10-01, unchanged)
   vehicle_model.cpp                        the registry: "t650_aerial_manipulator" (WholeBodyParams::t650Defaults + RotorModel::t650 from wb_law)
-  trajectory.cpp                           HoldTrajectory + the registry: "bspline"
+  trajectory.cpp                           HoldTrajectory, SequenceTrajectory (rest-to-rest legs back to back) + the registry: "bspline"
   whole_body_trajectory_planner_node.cpp   the rclcpp node (port of whole_body_planner.py's state machine)
 launch/whole_body_trajectory_planner_launch.py     uav_prefix -> namespace, params_file, overrides
 config/whole_body_trajectory_planner_t650_aerial_manipulator.yaml   the standalone default config
@@ -141,7 +149,7 @@ ros2 launch fsc_trajectory_planner whole_body_trajectory_planner_launch.py uav_p
 | | name (under `/<uav_prefix>/`) |
 |---|---|
 | subscribes | `fsc_autopilot_ros2/whole_body_direct_actuation/mode` (String, latched), `fsc_autopilot_ros2/position_controller/reference` (drone GS), `fmu/out/vehicle_attitude` (PX4, best-effort), `state_estimator/local_position/odom` (position ONLY), `fsc_open_manipulator/joint_states`, `whole_body_planner/ee_target` (arm GS) |
-| publishes | `fsc_autopilot_ros2/whole_body_direct_actuation/reference` (WholeBodyReference, 100 Hz in DIRECT), `whole_body_planner/{status,pending_base,target_joints,workspace_rz,viz_path}` (latched), `whole_body_planner/{viz_pose,current_ee,current_ee_body}`, `fsc_open_manipulator/external_torque_controller/reference_joint_trajectory` (the arm reference, same sample as the law's) |
+| publishes | `fsc_autopilot_ros2/whole_body_direct_actuation/reference` (WholeBodyReference, 100 Hz in DIRECT), `whole_body_planner/{status,pending_base,target_joints,workspace_rz,viz_path}` (latched), `whole_body_planner/{viz_pose,current_ee,current_ee_body}`, `whole_body_planner/current_ee_heading` (Float64, the measured claw heading in the ee_target yaw convention, 2026-10-01), `fsc_open_manipulator/external_torque_controller/reference_joint_trajectory` (the arm reference, same sample as the law's) |
 | services | `whole_body_planner/{send,clear,go_home}` (std_srvs/Trigger) |
 
 The `whole_body_planner/` prefix is the `topic_prefix` parameter; it is kept
@@ -418,3 +426,170 @@ transition** — 0.56 m and 90° of yaw, complete in 15 s — and the Start gate
 5 cm / 5° / 3° tolerance passed on the first try. That gate is the thing to
 watch when the circle is moved away from the vehicle: §7.15.5 measures
 50-90 mm of settled error after a 0.5 m leg, the same order as the tolerance.
+
+
+## Pick-and-place mode (2026-10-01)
+
+A third planning mode beside the transitions and the EE trajectories: SIX
+operator-triggered legs, each a compatible whole-body move that ends AT REST,
+one service (one GS button) per leg, flown in order:
+
+| # | service (`whole_body_planner/pick_place/...`) | goal |
+|---|---|---|
+| 0 | `go_to_start` | `pick_place_start` + Adjust offset, arm home |
+| 1 | `execute_pick` | claw ON the captured `obj_0` point (+ `pick_place_pick_ee_offset`), arm in `pick_place_pick_pose_deg`, nose turned to face it |
+| 2 | `go_to_place_start` | RETREAT (climb `retreat_dz`, back off `retreat_back` along -nose), then `pick_place_place_start` + offset, arm in the carry pose |
+| 3 | `execute_place` | claw on the captured `drop_0` point, **the arm sweeping its bands on the way** (`ArmSweepPlanner`) |
+| 4 | `go_to_land_start` | retreat, then `pick_place_land_start` + offset, arm home |
+| 5 | `execute_land` | `pick_place_land` + offset: the hover over the landing spot (0.8 m by default -- NOT lower, see the Isaac record below). The node never lands / arms / changes PX4 mode -- touchdown is the operator's SAFETY -> land |
+
+Base poses are `[x, y, z, yaw_deg]`, world frame, ACTUAL yaw; they are
+PLACEHOLDERS in the yaml. **Adjust** (`pick_place/adjust`, works in SAFETY too):
+with the vehicle on the physical start mark, `measured - nominal start` (x, y;
+z / yaw only with `pick_place_adjust_z` / `_yaw`) becomes the offset every
+nominal pose is shifted by -- the mocap centring changes between sessions.
+**Captures** (`pick_place/capture_<point>`, point = start | pick | place_start |
+place | land_start | land): average the point's mocap body
+(`pick_place_<point>_topic`, `fsc_autopilot_ros2_msgs/Mocap`, ABSOLUTE topic,
+SensorData QoS) over `pick_place_capture_window` (0.5 s). pick = `/obj_0/mocap`
+and place = `/drop_0/mocap` by default and are REQUIRED; the four base points
+have no topic yet (refused, the nominal pose is used) -- set one to measure
+that pose's x, y from a marker (z and yaw stay nominal, no offset applied).
+Mocap and odometry share the ENU world frame (the indoor bridge passes mocap
+through); an EKF2-fused stack must keep its local origin on the mocap origin.
+
+**Plan** (`pick_place/plan`, DIRECT only) dry-runs the whole mission on a
+worker thread (leg 0 from the hold, each later leg from the previous goal) and
+publishes it; any change to a capture or the offset invalidates it. Each leg
+service then RE-PLANS that leg from the CURRENT hold (the PS4 fine correction
+may have moved it) and executes it as soon as it is planned (like
+Go-to-start). A leg may be flown again, none skipped (`leg <= completed + 1`).
+`reset` forgets progress + plan (captures and offset stay). SAFETY drops the
+plan and any leg in flight, keeps captures, offset and progress.
+
+Geometry. A claw goal puts the grasp point on the target with the arm's
+horizontal reach on the bearing from the previous leg's base to the target, so
+the nose turns to face the object over the whole leg (the flat planner's
+heading channel is smooth and `w_max`-bounded). **The pick / place pose
+`[0, 0, 0, 0]`** (user spec "both joints at 90 deg, arm facing down, EE away
+from the drone"): upper arm straight down, forearm out along the nose, claw
+straight DOWN; grasp point 0.155 m ahead of and 0.340 m below the body origin,
+sigma_nd 0.169 (> 0.10; the beta >= 5 deg guard is an EE-trajectory-mode rule,
+the transitions plan joints directly). **It is the bottom of the arm's
+reach**: with the base fixed (the PS4 / ee_target path) IK cannot lower the
+claw even 2 cm nor push it 5 cm further out from there -- only up, in, or
+sideways. Lowering onto an object is the base's job.
+
+**The arm-sweep leg** (`arm_sweep_planner.{hpp,cpp}`): every flat output in
+closed form -- x_c and psi on a NONIC phase (rest through snap: a septic one
+steps snap, i.e. the body-torque reference, at the joins), q = (1 - w) q_lin +
+w (c + a sin(omega (t - r) + phase)) for swept joints with w a nonic plateau
+window -- mapped through `flatState()`; no fixed point (nothing is prescribed in
+task space). Defaults q1 +-25 deg, q2 [10, 45] deg, 90 deg apart, 2 cycles.
+T = the shortest duration (bracket + bisection to 2 %) passing joint box,
+sigma_nd, v/a/yaw rate, `pick_place_sweep_qdot_max`, joint torque and rotor
+force on a 401-point grid; on the test scene 19.2 s, bound by the joint rate,
+48 ms to plan.
+
+Outputs: `pick_place/status` (latched; `NOT IN DIRECT` / `NOT PLANNED: <what
+is missing>` / `PLANNING` / `READY next=<leg>` / `FLYING <leg> T=..s` /
+`DONE <leg> next=<leg> [-- claw within tolerance: fine correction OK]` /
+`INFEASIBLE: <leg>: <reason>` / `COMPLETE -- touch down with SAFETY -> land`),
+`pick_place/info` (latched, 80 doubles: [0..2] offset, [3] yaw offset deg,
+[4] planned, [5] last leg completed, [6] leg in flight, [7] tolerance,
+[8..13] leg durations, [14..55] per leg [goal base x y z, actual yaw deg, claw
+x y z], [56..79] per point [captured x y z, valid]), `pick_place/path` and
+`pick_place/drone_path` (latched, the planned mission at the claw / airframe,
+600 x the ee_trajectory/path 9-double stride), `pick_place/arrival_error`
+(10 Hz: [leg, claw?, |e|, e_xyz, tol, within, within AND holding] -- the claw
+by FK on the measured state for the execute legs, the body otherwise; the
+50 mm `pick_place_arrival_tol` gate is when the arm GS's separate "Pick &
+Place PS4" tab may engage the gamepad fine correction).
+
+Two node changes made for that fine correction (2026-10-01):
+- **`pick_place/workspace_rz`** (latched, the workspace_rz layout). The
+  plain `workspace_rz` keeps only folds beta >= 5 deg (the EE-trajectory
+  guard), which puts the claw-down grasp point (z -0.340 m) OUTSIDE it (lowest
+  point -0.331 m): a tab saturating on it refuses every stick increment there.
+  This second grid lowers the floor to 1 deg under `pick_place_pick_pose_deg` /
+  `_place_pose_deg` when they fold below the guard, those extra poses also
+  needing sigma_nd >= 0.10; lowest point -0.345 m, no original cell lost
+  (`usableWorkspace`, `workspace.hpp`). Only the Pick & Place PS4 tab reads
+  it; `workspace_rz` itself is unchanged, so the EE Whole-Body and PS4 Remote
+  tabs behave exactly as before.
+- **`current_ee_heading`** (Float64, 15 Hz, same freshness gate as
+  current_ee): the measured claw heading as ee_target reads it (actual yaw;
+  `clawAzimuth` + pi/2). current_ee carries no orientation, and a target
+  seeded without it asks for a wrist swing; ikWorld with this heading returns
+  the current joints (gtest).
+
+Tests: `test_pick_place.cpp` (9 gtests: the workspace floor admits the
+claw-down pose -- up / in / sideways yes, down / out no -- and loses no
+original cell (the node publishes it on pick_place/workspace_rz); ikWorld with clawAzimuth returns the current joints, claw-down
+included; goals put the claw on the target
+facing it, an impossible arm pose is refused naming the leg, the retreat, the
+sweep leg compatible / at rest / analytic derivatives = central differences /
+visits its band / every bound / shortest T, a band outside the box refused,
+the six-leg mission dry run chained through the retreat points,
+SequenceTrajectory refuses a gap) and `test/test_pick_place_loopback.py` (the
+whole ROS flow against the built node with rig-private mocap topics: Adjust in
+SAFETY -> captures -> Plan -> out-of-order refused -> six legs with the
+perfect-plant teleport -> fine-correction gate at 50 mm both ways -> retreat
+climb 0.150 m -> sweep q1 +-25 / q2 45 deg -> COMPLETE -> reset -> SAFETY
+silence, plus current_ee_heading and the claw-down point inside
+pick_place/workspace_rz but still outside the unchanged workspace_rz;
+~90 s). The arm GS (fsc_om_ws, utils_custom_ground_station) has the **Pick &
+Place** tab (the buttons) and the separate **Pick & Place PS4** tab (the fine
+correction); its `test/test_pick_place_fine_integration.py` drives both
+against this node (14 checks). Not yet flown in sim or on hardware -- in sim
+`obj_0` is the EE marker cube welded into the gripper, so a sim run needs a
+separate pickup body first.
+
+### Isaac Sim record (2026-10-01, `test/pick_place_sim_cycle.sh`)
+
+The sim twin of the indoor run sheet: the 4-D L1 EKF2-fused stack
+(`isaacsim/start_whole_body_l1_4d_direct_actuation_t650_aerial_manipulator_stack_fused.sh`)
+plus Pegasus `start_t650_aerial_manipulator_whole_body_L1_adaptive_4D_fused_direct_actuation_sitl.sh`,
+on the STRESSED `..._l1_4d_..._t650_sim.yaml` (mass/inertia x1.10, CoM shift,
+arm friction/mass x1.05, +17.6 % allocator kf), driven by
+`test/pick_place_sim_driver.py`. The scene has no table objects, so the driver
+publishes stand-in pick / drop points on private topics
+(`FSC_PICK_PLACE_PICK_TOPIC` / `_PLACE_TOPIC` -> the launch file's
+`pick_place_*_topic` overrides). Logs and npz under `fsc_autopilot_ws/log/pick_place_sim/`.
+
+- **Two full missions flown** (all six legs, the 19.2 s sweep, retreats, the
+  hover over the landing spot) with no refusal or abort from the flight node.
+- **Phantom obj_0.** The emulator on this machine (master, without the
+  skip-until-first-pose change) publishes obj_0 at the origin when no marker
+  cube is spawned; with the stand-in on the same topic the first capture
+  averaged two publishers (856 mm scatter) and flew it. Hence
+  `pick_place_capture_max_spread` (20 mm): such a capture is now refused.
+- **Vertical oscillation in DIRECT.** SAFETY hover 36-49 mm peak to peak;
+  the moment DIRECT is engaged, arm folded and no leg flown, 161 mm at
+  0.36 Hz, and 115-226 mm at 0.32-0.49 Hz in every hold after a leg, while
+  the planner's hold reference is dead still (0.000 mm). It is the closed
+  loop, not the plan; the long holds' 0.32 Hz equals the L1 translational
+  filter bandwidth `wb_l1_omega_c_t` = 2 rad/s. **Confirmed by the matched
+  plant** (`..._sim_ps4test.yaml` swapped in, pp3): DIRECT hover 161 -> 6 mm
+  peak to peak, claw-down hold 226 -> 17 mm, go_to_start claw error 5.8 mm
+  mean -- the oscillation is the law against the injected mismatch.
+- **The 50 mm gate flickers in it.** The claw swings through the tolerance
+  (30-190 mm), so the Pick & Place PS4 tab's engage was refused each time
+  (correctly) and no fine correction was flown in sim.
+- **Fine correction flown in Isaac** on the matched plant: the gate held for
+  2 s at 3.7 mm (pick) and 30.8 mm (place), the Pick & Place PS4 tab engaged,
+  one stick push was planned, sent by the tab and flown (+9.5 / +8.7 mm).
+- **Tilt-watchdog trips with the arm extended (open).** pp3 (matched): the
+  translational L1 estimate F_hat rang and GREW while holding claw-down at
+  the place (1.5 -> 9 -> 13.7 N, sign alternating along one direction in the
+  arm's vertical plane, starting before the fine correction) and reached
+  66.9 N in the retreat -> "DIRECT WATCHDOG TRIPPED: excess tilt 20.4/20.0
+  deg". The same pose at the pick was stable in the same flight. pp4
+  (stressed): the same trip 8 s into the sweep (F_hat 12 N); pp1/pp2 swept
+  through. The watchdog reverted to SAFETY and the vehicle landed each time.
+  A flight-law question (wb_l1_*), not a plan one; the planner can only
+  excite it less (slower / narrower sweep, a better-conditioned pick pose).
+- **The 0.4 m land hover crashed.** The body stands at 0.305 m on its gear;
+  the hover dipped to 0.318 m, brushed the floor, saturated the allocator, and
+  the vehicle tumbled on the switch to SAFETY. `pick_place_land` defaults to
+  0.8 m since -- not yet flown (pp3 / pp4 tripped before execute_land).

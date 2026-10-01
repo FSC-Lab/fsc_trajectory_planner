@@ -13,13 +13,21 @@ section: this package's config, or the flight node's own yaml so one file
 describes the whole run. `planner:=`, `vehicle:=`, `hold_ee_world:=`,
 `base_com:=` and `arm_joint_sign:=` override the file when given; an empty
 value leaves the yaml's setting alone.
+
+`pick_place_pick_topic:=` / `pick_place_place_topic:=` override the mocap
+bodies the pick-and-place mode captures (default /obj_0/mocap, /drop_0/mocap).
+Their defaults come from the environment variables FSC_PICK_PLACE_PICK_TOPIC /
+FSC_PICK_PLACE_PLACE_TOPIC, so a stack script that launches this file without
+knowing about them can still be redirected -- the Isaac pick-and-place cycle
+does that, because the emulator publishes a phantom obj_0 at the origin when
+no gripper marker cube is spawned.
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -41,6 +49,9 @@ def _launch_node(context):
     if arg("arm_joint_sign"):
         overrides["arm_joint_sign"] = [float(v) for v in
                                        arg("arm_joint_sign").strip("[]").split(",")]
+    for key in ("pick_place_pick_topic", "pick_place_place_topic"):
+        if arg(key):
+            overrides[key] = arg(key)
     if overrides:
         params.append(overrides)
     return [Node(
@@ -72,5 +83,13 @@ def generate_launch_description():
                               description="override base_com, e.g. [0.0, 0.0, 0.0]"),
         DeclareLaunchArgument("arm_joint_sign", default_value="",
                               description="override arm_joint_sign, e.g. [-1,1,1,-1]"),
+        DeclareLaunchArgument(
+            "pick_place_pick_topic",
+            default_value=EnvironmentVariable("FSC_PICK_PLACE_PICK_TOPIC", default_value=""),
+            description="override the pick point's mocap topic (env FSC_PICK_PLACE_PICK_TOPIC)"),
+        DeclareLaunchArgument(
+            "pick_place_place_topic",
+            default_value=EnvironmentVariable("FSC_PICK_PLACE_PLACE_TOPIC", default_value=""),
+            description="override the place point's mocap topic (env FSC_PICK_PLACE_PLACE_TOPIC)"),
         OpaqueFunction(function=_launch_node),
     ])

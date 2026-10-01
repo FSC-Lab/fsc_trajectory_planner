@@ -60,6 +60,60 @@
     ee_traj_start_yaw_tol_deg: 5.0
     ee_traj_start_joint_tol_deg: 3.0
 
+    # --- pick-and-place mode (arm GS "Pick & Place" tab) ----------------
+    # Six legs, one button each: go_to_start -> execute_pick ->
+    # go_to_place_start -> execute_place -> go_to_land_start -> execute_land.
+    # Base poses [x, y, z, yaw_deg], world frame, ACTUAL yaw. PLACEHOLDERS:
+    # all four are shifted by the Adjust offset (vehicle on the start mark ->
+    # measured - nominal start), and any one can be measured from a mocap body
+    # instead (pick_place_<point>_topic + the capture_<point> service; x, y
+    # are measured, z and yaw stay these).
+    pick_place_start: [0.0, 0.0, 1.0, 0.0]
+    pick_place_place_start: [0.0, -1.0, 1.0, 0.0]
+    pick_place_land_start: [-1.0, 0.0, 1.0, 0.0]
+    # The hover over the landing spot; touchdown is SAFETY -> land. NOT lower:
+    # the body stands at 0.305 m on its gear, and in the 2026-10-01 Isaac
+    # flight a 0.4 m hover dipped to 0.318 m in the DIRECT law's +-0.1 m
+    # oscillation, brushed the floor, saturated the allocator and tumbled on
+    # the switch to SAFETY.
+    pick_place_land: [-1.0, 0.0, 0.8, 0.0]
+    # Arm poses [deg]. [0, 0, 0, 0] = upper arm straight down, forearm out
+    # along the nose, claw straight down (grasp point 0.155 m ahead of and
+    # 0.340 m below the body origin). It is the bottom of the arm's reach:
+    # from there the arm alone can raise the claw, pull it in or swing it
+    # sideways, but not lower it.
+    pick_place_pick_pose_deg: [0.0, 0.0, 0.0, 0.0]
+    pick_place_place_pose_deg: [0.0, 0.0, 0.0, 0.0]
+    pick_place_carry_pose_deg: [0.0, 40.0, 40.0, 0.0]
+    # claw target = measured mocap point + this offset, world [m]
+    pick_place_pick_ee_offset: [0.0, 0.0, 0.0]
+    pick_place_place_ee_offset: [0.0, 0.0, 0.0]
+    pick_place_face_target: true       # turn the nose to the object over the leg
+    pick_place_retreat_dz: 0.15        # before leaving a table: climb [m] ...
+    pick_place_retreat_back: 0.20      # ... then back off along -nose [m]
+    # execute_place: the arm sweeps these bands [deg] on the way (lo == hi:
+    # not swept), `cycles` whole sweeps, at most sweep_qdot_max
+    pick_place_sweep_lo_deg: [-25.0, 10.0, 0.0, 0.0]
+    pick_place_sweep_hi_deg: [25.0, 45.0, 0.0, 0.0]
+    pick_place_sweep_phase_deg: [0.0, 90.0, 0.0, 0.0]
+    pick_place_sweep_cycles: 2
+    pick_place_sweep_ramp_frac: 0.2
+    pick_place_sweep_qdot_max: 0.5     # [rad/s]
+    pick_place_sweep_t_min: 8.0        # [s]
+    pick_place_sweep_t_max: 120.0      # [s]
+    pick_place_arrival_tol: 0.05       # fine-correction gate on the claw error [m]
+    pick_place_adjust_z: false         # Adjust shifts x, y only unless these are set
+    pick_place_adjust_yaw: false
+    # mocap bodies (fsc_autopilot_ros2_msgs/Mocap, ABSOLUTE topics); "" = none
+    pick_place_pick_topic: "/obj_0/mocap"
+    pick_place_place_topic: "/drop_0/mocap"
+    pick_place_start_topic: ""
+    pick_place_place_start_topic: ""
+    pick_place_land_start_topic: ""
+    pick_place_land_topic: ""
+    pick_place_capture_window: 0.5     # a capture averages this many seconds [s]
+    pick_place_capture_max_spread: 0.02  # ... and is refused above this scatter [m]
+
     # Topic layout (relative to the vehicle namespace).
     topic_prefix: "whole_body_planner"
     mode_topic: "fsc_autopilot_ros2/whole_body_direct_actuation/mode"
