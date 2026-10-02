@@ -6,21 +6,24 @@ script).
     /usr/bin/python3 pick_place_sim_driver.py --out run.npz
 
     offboard -> arm -> SAFETY climb to hover_z -> settle -> DIRECT -> settle
-      -> Adjust, Get obj_0, Get drop_0, Plan               (Pick & Place tab)
-      -> go_to_start -> execute_pick
+      -> Adjust, type the place point, Get obj_0, Plan     (Pick & Place tab)
+      -> go_to_start -> execute_pick: to 0.10 m above obj_0, WAIT there until
+         the claw has stayed inside 50 mm for pick_place_settle_s (the
+         planner's own gate), the vertical descent
       -> wait for the 50 mm arrival gate; fine correction: engage the
          Pick & Place PS4 tab, one right-stick push up, disengage
-      -> go_to_place_start -> execute_place (arm sweep)
+      -> go_to_place_start (retreat first) -> execute_place (arm sweep to
+         above the place point, wait, descent)
       -> arrival gate; fine correction again
       -> go_to_land_start -> execute_land (the hover over the landing spot)
       -> SAFETY -> land by reference -> disarm
 
-THE TABLE OBJECTS ARE STAND-INS. The Isaac scene has no pickup or drop body:
-the OptiTrack emulator publishes obj_0 only for the gripper marker cube (off
-in the 4-D yaml) and nothing as drop_0. This driver publishes static
-/obj_0/mocap and /drop_0/mocap points itself, so every leg, the sweep, the
-gate and the fine correction fly for real, but nothing is grasped (the Isaac
-arm plant has no gripper controller either).
+THE PICK OBJECT IS A STAND-IN. The Isaac scene has no pickup body: the
+OptiTrack emulator publishes obj_0 only for the gripper marker cube (off in
+the 4-D yaml). This driver publishes a static pick point itself (--obj-topic)
+and TYPES the place point into the planner (pick_place_place_point), as the
+Pick & Place tab does, so every leg, the sweep, the gate and the fine
+correction fly for real, but nothing is grasped.
 
 Records odometry, the planner's EE reference (ee_trajectory/reference_pose,
 published for every streamed sample), the measured EE (current_ee) and the
@@ -104,11 +107,10 @@ class Driver(Node):
         self.ref_pub = self.create_publisher(PositionControllerReference,
                                              f"{ns}/fsc_autopilot_ros2/position_controller/reference", 10)
         self.joy_pub = self.create_publisher(Joy, f"{ns}/rc/input", 1)
-        self.mocap_pub = [(self.create_publisher(Mocap, a.obj_topic, 10), np.array(a.obj)),
-                          (self.create_publisher(Mocap, a.drop_topic, 10), np.array(a.drop))]
+        self.mocap_pub = [(self.create_publisher(Mocap, a.obj_topic, 10), np.array(a.obj))]
         self.cli = {n: self.create_client(Trigger, f"{ns}/rc/{n}") for n in ("offboard", "arm", "disarm")}
         self.direct = self.create_client(SetBool, f"{ns}/{DA}/set_direct_mode")
-        for n in LEGS + ["adjust", "plan", "capture_pick", "capture_place"]:
+        for n in LEGS + ["adjust", "plan", "capture_pick"]:
             self.cli[n] = self.create_client(Trigger, f"{ns}/{PP}/{n}")
         self.fine = self.create_client(SetBool, f"{gs}/pick_place_fine/set_engaged")
         self.set_params = self.create_client(SetParameters, f"{ns}/whole_body_trajectory_planner/set_parameters")
@@ -126,7 +128,10 @@ class Driver(Node):
                          1.0 if self.mode == "DIRECT" else 0.0, self.leg])
 
     def on_pp_status(self, m):
-        if m.data != self.pp_status:
+        # WAITING repeats with the live claw error: log it once per leg
+        same_wait = m.data.startswith("WAITING") and \
+            m.data.split(":")[0] == self.pp_status.split(":")[0]
+        if m.data != self.pp_status and not same_wait:
             self.ev(f"pick_place: {m.data}")
         self.pp_status = m.data
 
@@ -215,6 +220,20 @@ class Driver(Node):
         self.wait(lambda: self.status.startswith("EXECUTING"), 15, f"{name} EXECUTING")
         T = float(self.status.split("T=")[1].split("s")[0])
         self.ev(f"{name}: executing, T = {T:.1f} s")
+        if k in (1, 3):
+            # a claw leg stops ABOVE its target and waits for the claw to
+            # settle inside the tolerance; the planner then flies the descent
+            self.wait(lambda: self.pp_status.startswith("WAITING " + name), T + 30, f"{name} above")
+            t_wait = self.now()
+            self.ev(f"{name}: above the target, waiting (claw {self.arrival[2]*1e3:.0f} mm)")
+            self.wait(lambda: "(descent)" in self.pp_status or self.pp_status.startswith("INCOMPLETE"),
+                      self.a.approach_wait + 15, f"{name} descent")
+            if self.pp_status.startswith("INCOMPLETE"):
+                raise Abort(self.pp_status)
+            self.wait(lambda: self.status.startswith("EXECUTING"), 10, f"{name} descent EXECUTING")
+            Td = float(self.status.split("T=")[1].split("s")[0])
+            self.ev(f"{name}: descending after {self.now() - t_wait:.1f} s above, T = {Td:.1f} s")
+            T += Td
         self.wait(lambda: self.status == "HOLD" and self.info is not None and int(self.info[5]) == k,
                   T + 30, f"{name} complete")
         self.ev(f"{name}: complete after {self.now() - t_call:.1f} s")
@@ -270,9 +289,10 @@ class Driver(Node):
     def apply_planner_params(self):
         """--planner-param name=value: set live on the planner before Plan (the
         pick-and-place parameters are read at Plan time)."""
-        if not self.a.planner_param:
-            return
         params = []
+        # the place point is TYPED IN on the ground station, not measured
+        self.a.planner_param = list(self.a.planner_param) + [
+            "pick_place_place_point=[" + ",".join(f"{v:.4f}" for v in self.a.drop) + "]"]
         for kv in self.a.planner_param:
             name, val = kv.split("=", 1)
             v = ParameterValue()
@@ -319,7 +339,6 @@ class Driver(Node):
         self.trig("adjust")
         time.sleep(1.0)
         self.trig("capture_pick")
-        self.trig("capture_place")
         self.trig("plan")
         self.wait(lambda: self.pp_status.startswith("READY"), 30, "mission READY")
         self.ev(f"planned leg durations {np.round(self.info[8:14], 1).tolist()} s")
@@ -383,12 +402,12 @@ def main():
     ap.add_argument("--obj", type=float, nargs=3, default=[0.8, 0.6, 0.66],
                     help="stand-in pickup point published as /obj_0/mocap [m]")
     ap.add_argument("--drop", type=float, nargs=3, default=[0.6, -1.6, 0.66],
-                    help="stand-in drop point published as /drop_0/mocap [m]")
+                    help="the place point, typed into the planner (pick_place_place_point) [m]")
     ap.add_argument("--obj-topic", default="/obj_0/mocap",
                     help="where to publish the stand-in pickup point (= the planner's pick_place_pick_topic)")
-    ap.add_argument("--drop-topic", default="/drop_0/mocap",
-                    help="where to publish the stand-in drop point (= the planner's pick_place_place_topic)")
     ap.add_argument("--gate-timeout", type=float, default=45.0)
+    ap.add_argument("--approach-wait", type=float, default=60.0,
+                    help="= the planner's pick_place_approach_wait_max [s]")
     ap.add_argument("--gate-hold", type=float, default=2.0,
                     help="the arrival gate must stay open this long before the fine correction engages")
     ap.add_argument("--no-fine", dest="fine", action="store_false")

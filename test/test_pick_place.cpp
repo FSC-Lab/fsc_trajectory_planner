@@ -1,8 +1,9 @@
 // The pick-and-place mode on the T650 aerial manipulator: the six goal
 // rests (claw on the measured point, nose facing it, the calibrated base
-// poses), the retreat, the arm-sweep leg (compatible, at rest at both ends,
-// sweeping its band, every bound honoured, the shortest feasible duration)
-// and the whole mission dry run the Plan button performs.
+// poses), the retreat, the approach above a claw target and the vertical
+// descent onto it, the geofence, the arm-sweep leg (compatible, at rest at
+// both ends, sweeping its band, every bound honoured, the shortest feasible
+// duration) and the whole mission dry run the Plan button performs.
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -23,7 +24,8 @@ namespace
 constexpr double kDeg = M_PI / 180.0;
 
 // A lab-sized scene: two tables 0.7 m high, start / place-start / land-start
-// / land on the other side of the room.
+// / land on the other side of the room; the land hover at 0.8 m (above the
+// 0.6 m fence floor).
 PickPlaceTargets scene()
 {
   PickPlaceTargets t;
@@ -35,7 +37,7 @@ PickPlaceTargets scene()
   t.place << 1.6, -1.0, 0.70;
   t.land_start.p << 0.0, -1.2, 1.0;
   t.land_start.yaw = 0.0;
-  t.land.p << 0.0, -1.2, 0.4;
+  t.land.p << 0.0, -1.2, 0.8;
   t.land.yaw = 0.0;
   return t;
 }
@@ -200,6 +202,17 @@ TEST(ArmSweep, LegIsCompatibleAtRestAndSweepsItsBand)
   }
 }
 
+TEST(ArmSweep, DefaultBandIsTenDegreesEachSide)
+{
+  const ArmSweepOptions o;
+  EXPECT_NEAR(o.lo(0), -10.0 * kDeg, 1e-12);
+  EXPECT_NEAR(o.hi(0), 10.0 * kDeg, 1e-12);
+  EXPECT_NEAR(o.hi(1) - o.lo(1), 20.0 * kDeg, 1e-12);
+  EXPECT_EQ(o.lo(2), o.hi(2));
+  EXPECT_EQ(o.lo(3), o.hi(3));
+  EXPECT_EQ(o.cycles, 2);
+}
+
 TEST(ArmSweep, BandOutsideTheJointBoxIsRefused)
 {
   const auto v = makeVehicleModel("t650_aerial_manipulator");
@@ -240,6 +253,16 @@ TEST(PickPlace, MissionDryRunPlansAllSixLegsChained)
     EXPECT_LT((e.x_cd - restReference(v->params, wp.goal[k]).x_cd).norm(), 1e-6) << k;
     EXPECT_LT((e.q_d - wp.goal[k].q).cwiseAbs().maxCoeff(), 1e-6) << k;
     EXPECT_LT((e.r_ed - wp.ee[k]).norm(), 1e-6) << k;
+    if (pickPlaceLegIsClaw(k)) {
+      // approach, at rest approach_dz above the goal, then the descent
+      const auto * seq = dynamic_cast<const SequenceTrajectory *>(&L);
+      ASSERT_NE(seq, nullptr) << pickPlaceLegName(k);
+      ASSERT_EQ(seq->segmentStarts().size(), 2u);
+      const WbReference via = L.eval(seq->segmentStarts()[1]);
+      EXPECT_LT((via.x_cd - restReference(v->params, wp.approach[k]).x_cd).norm(), 1e-6);
+      EXPECT_LT((via.r_ed - wp.approach_ee[k]).norm(), 1e-6);
+      EXPECT_LT(via.x_cd_dot.norm(), 1e-6);
+    }
     if (pickPlaceLegRetreats(k)) {
       // the leg passes through the retreat point, at rest, before transiting
       const auto * seq = dynamic_cast<const SequenceTrajectory *>(&L);
@@ -252,6 +275,161 @@ TEST(PickPlace, MissionDryRunPlansAllSixLegsChained)
     from = wp.goal[k];
   }
   std::cout << "  mission total " << total << " s\n";
+}
+
+TEST(PickPlace, ClawLegsStopAboveTheTargetThenDescendVertically)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PickPlaceConfig c = config(*v);
+  ASSERT_GT(c.approach_dz, 0.0);
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+    const Vec3 up = wp.approach[k].x_b - wp.goal[k].x_b;
+    const Vec3 up_ee = wp.approach_ee[k] - wp.ee[k];
+    if (pickPlaceLegIsClaw(k)) {
+      // straight above: same heading and arm, the claw approach_dz higher
+      EXPECT_LT((up - Vec3{0.0, 0.0, c.approach_dz}).norm(), 1e-12) << pickPlaceLegName(k);
+      EXPECT_LT((up_ee - Vec3{0.0, 0.0, c.approach_dz}).norm(), 1e-9) << pickPlaceLegName(k);
+      EXPECT_EQ(wp.approach[k].phi, wp.goal[k].phi);
+      EXPECT_LT((wp.approach[k].q - wp.goal[k].q).norm(), 1e-15);
+    } else {
+      EXPECT_LT(up.norm(), 1e-15) << pickPlaceLegName(k);
+    }
+  }
+  PlanOptions opts;
+  for (int k : {kExecutePick, kExecutePlace}) {
+    // the leg (flown from the previous goal, not from a table) ends ABOVE
+    const auto leg = planPickPlaceLeg(*v, *planner, opts, c, wp, k, wp.goal[k - 1], false);
+    const WbReference e = leg->eval(leg->duration());
+    EXPECT_LT((e.r_ed - wp.approach_ee[k]).norm(), 1e-6) << pickPlaceLegName(k);
+    EXPECT_LT(e.x_cd_dot.norm(), 1e-9);
+    // the descent goes down onto the target, the claw on the vertical
+    const auto down = planPickPlaceDescent(*v, *planner, opts, c, wp, k, wp.approach[k]);
+    const WbReference a = down->eval(0.0), b = down->eval(down->duration());
+    EXPECT_LT((a.r_ed - wp.approach_ee[k]).norm(), 1e-6);
+    EXPECT_LT((b.r_ed - wp.ee[k]).norm(), 1e-6);
+    double off_axis = 0.0, z_lo = 1e9, z_hi = -1e9;
+    for (int i = 0; i <= 200; ++i) {
+      const Vec3 p = down->eval(down->duration() * i / 200.0).r_ed;
+      off_axis = std::max(off_axis, (p - wp.ee[k]).head<2>().norm());
+      z_lo = std::min(z_lo, p(2));
+      z_hi = std::max(z_hi, p(2));
+    }
+    std::cout << "  " << pickPlaceLegName(k) << " descent: T " << down->duration()
+              << " s, claw off the vertical <= " << off_axis * 1e3 << " mm\n";
+    EXPECT_LT(off_axis, 0.005) << pickPlaceLegName(k);
+    // and never below the target (the claw would push into the table)
+    EXPECT_GT(z_lo, wp.ee[k](2) - 0.005) << pickPlaceLegName(k);
+    EXPECT_LT(z_hi, wp.approach_ee[k](2) + 0.005) << pickPlaceLegName(k);
+    // the descent is only for claw legs
+    EXPECT_THROW(planPickPlaceDescent(*v, *planner, opts, c, wp, k + 1, wp.goal[k + 1]),
+      std::runtime_error);
+  }
+}
+
+TEST(PickPlace, AnyLegFlownFromATableRetreatsFirst)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PickPlaceConfig c = config(*v);
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  PlanOptions opts;
+  // execute_pick flown AGAIN with the claw on the object: retreat, then approach
+  const RestSpec at_table = wp.goal[kExecutePick];
+  const auto again = planPickPlaceLeg(*v, *planner, opts, c, wp, kExecutePick, at_table, true);
+  const auto * seq = dynamic_cast<const SequenceTrajectory *>(again.get());
+  ASSERT_NE(seq, nullptr);
+  ASSERT_EQ(seq->segmentStarts().size(), 2u);
+  EXPECT_LT((again->eval(seq->segmentStarts()[1]).x_cd -
+    restReference(v->params, retreatRest(at_table, c)).x_cd).norm(), 1e-6);
+  // not at a table: straight there
+  const auto direct = planPickPlaceLeg(*v, *planner, opts, c, wp, kGoToPlaceStart, wp.goal[0], false);
+  const auto * one = dynamic_cast<const SequenceTrajectory *>(direct.get());
+  ASSERT_NE(one, nullptr);
+  EXPECT_EQ(one->segmentStarts().size(), 1u);
+}
+
+TEST(PickPlace, ReflyingAClawLegFromItsApproachHoldIsAShortRest)
+{
+  // after a wait timeout the vehicle holds ABOVE the target; flying the leg
+  // again is then a zero-length move followed by the wait
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PickPlaceConfig c = config(*v);
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  PlanOptions opts;
+  const auto again =
+    planPickPlaceLeg(*v, *planner, opts, c, wp, kExecutePick, wp.approach[kExecutePick], false);
+  std::cout << "  zero-length leg: T " << again->duration() << " s\n";
+  double moved = 0.0;
+  const Vec3 x0 = restReference(v->params, wp.approach[kExecutePick]).x_cd;
+  for (int i = 0; i <= 50; ++i) {
+    moved = std::max(moved, (again->eval(again->duration() * i / 50.0).x_cd - x0).norm());
+  }
+  EXPECT_LT(moved, 1e-9);
+}
+
+TEST(Geofence, GoalsApproachesAndPathsOutsideAreRefused)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  Geofence f;
+  EXPECT_EQ(f.violation(Vec3{0.0, 0.0, 1.0}), "");
+  EXPECT_NE(f.violation(Vec3{0.0, 0.0, 0.5}).find("floor"), std::string::npos);
+  EXPECT_NE(f.violation(Vec3{0.0, 0.0, 1.9}).find("ceiling"), std::string::npos);
+  EXPECT_NE(f.violation(Vec3{2.6, 0.0, 1.0}).find("box"), std::string::npos);
+
+  // a land hover at 0.4 m: refused at Plan, naming the leg and the floor
+  PickPlaceConfig c = config(*v);
+  PickPlaceTargets t = scene();
+  t.land.p(2) = 0.4;
+  try {
+    pickPlaceWaypoints(*v, c, t);
+    FAIL() << "a land hover under the fence floor was accepted";
+  } catch (const std::runtime_error & e) {
+    const std::string m = e.what();
+    EXPECT_NE(m.find("execute_land goal"), std::string::npos) << m;
+    EXPECT_NE(m.find("floor"), std::string::npos) << m;
+  }
+  // a pick so high that the point above it is over the ceiling
+  t = scene();
+  c.fence.max_z = 1.10;   // the pick body is at 1.04 m, its approach at 1.14 m
+  try {
+    pickPlaceWaypoints(*v, c, t);
+    FAIL() << "an approach over the fence ceiling was accepted";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("execute_pick approach"), std::string::npos) << e.what();
+  }
+  // every rest inside, but the retreat off the pick table climbs to 1.19 m
+  c.fence.max_z = 1.16;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  PlanOptions opts;
+  try {
+    planPickPlaceLeg(*v, *planner, opts, c, wp, kGoToPlaceStart, wp.goal[kExecutePick], true);
+    FAIL() << "a retreat over the fence ceiling was accepted";
+  } catch (const std::runtime_error & e) {
+    const std::string m = e.what();
+    EXPECT_NE(m.find("go_to_place_start: the path leaves the geofence"), std::string::npos) << m;
+    EXPECT_NE(m.find("ceiling"), std::string::npos) << m;
+  }
+  // the same leg without the retreat stays inside
+  EXPECT_NO_THROW(
+    planPickPlaceLeg(*v, *planner, opts, c, wp, kGoToPlaceStart, wp.goal[kExecutePick], false));
+  // a leg may START outside (DIRECT engaged at 0.4 m) and climb back in ...
+  RestSpec low = wp.goal[kGoToStart];
+  low.x_b(2) = 0.4;
+  EXPECT_NO_THROW(planPickPlaceLeg(*v, *planner, opts, c, wp, kGoToStart, low, false));
+  // ... but not go further out on the way: a retreat climbing from over the ceiling
+  RestSpec high = wp.goal[kExecutePick];
+  high.x_b(2) = 1.20;   // over the 1.16 m ceiling; the retreat climbs 0.15 m more
+  try {
+    planPickPlaceLeg(*v, *planner, opts, c, wp, kGoToPlaceStart, high, true);
+    FAIL() << "a leg climbing further over the ceiling was accepted";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("further out than where the leg starts"), std::string::npos)
+      << e.what();
+  }
 }
 
 TEST(SequenceTrajectory, RefusesSegmentsThatDoNotMeet)

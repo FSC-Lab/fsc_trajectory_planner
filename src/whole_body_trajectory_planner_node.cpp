@@ -263,7 +263,13 @@ public:
     declare_parameter<std::vector<double>>("pick_place_place_pose_deg", std::vector<double>{0.0, 0.0, 0.0, 0.0});
     declare_parameter<std::vector<double>>(
       "pick_place_carry_pose_deg", std::vector<double>{0.0, 40.0, 40.0, 0.0});
-    // claw target = measured mocap point + offset, world [m]
+    // The PLACE point (the claw's release point), typed in [x, y, z], world
+    // [m], shifted by the Adjust offset like every other room-frame point
+    // (2026-10-02, user decision: entered on the ground station, not
+    // measured). A mocap capture still wins when pick_place_place_topic names
+    // a body and capture_place was called.
+    declare_parameter<std::vector<double>>("pick_place_place_point", std::vector<double>{0.6, -1.6, 0.66});
+    // claw target = measured / typed point + offset, world [m]
     declare_parameter<std::vector<double>>("pick_place_pick_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter<std::vector<double>>("pick_place_place_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter<bool>("pick_place_face_target", true);
@@ -271,10 +277,11 @@ public:
     declare_parameter<double>("pick_place_retreat_dz", 0.15);
     declare_parameter<double>("pick_place_retreat_back", 0.20);
     // execute_place: the arm sweeps these bands [deg] (lo == hi: not swept)
+    // +-10 deg (2026-10-02; +-25 tripped the tilt watchdog in Isaac)
     declare_parameter<std::vector<double>>(
-      "pick_place_sweep_lo_deg", std::vector<double>{-25.0, 10.0, 0.0, 0.0});
+      "pick_place_sweep_lo_deg", std::vector<double>{-10.0, 17.5, 0.0, 0.0});
     declare_parameter<std::vector<double>>(
-      "pick_place_sweep_hi_deg", std::vector<double>{25.0, 45.0, 0.0, 0.0});
+      "pick_place_sweep_hi_deg", std::vector<double>{10.0, 37.5, 0.0, 0.0});
     declare_parameter<std::vector<double>>(
       "pick_place_sweep_phase_deg", std::vector<double>{0.0, 90.0, 0.0, 0.0});
     declare_parameter<int>("pick_place_sweep_cycles", 2);
@@ -288,12 +295,36 @@ public:
     // Adjust shifts x, y; z and yaw too only when these are set
     declare_parameter<bool>("pick_place_adjust_z", false);
     declare_parameter<bool>("pick_place_adjust_yaw", false);
-    // mocap bodies (fsc_autopilot_ros2_msgs/Mocap, ABSOLUTE topics); "" = none
+    // mocap bodies (fsc_autopilot_ros2_msgs/Mocap, ABSOLUTE topics); "" = none.
+    // Only the PICK point is measured by default (obj_0); every other point
+    // is typed in. Fixed at launch: the subscriptions are made here.
     for (int k = 0; k < kNumPickPlaceLegs; ++k) {
-      const char * dflt = k == kExecutePick ? "/obj_0/mocap" : (k == kExecutePlace ? "/drop_0/mocap" : "");
+      const char * dflt = k == kExecutePick ? "/obj_0/mocap" : "";
       pp_topic_[k] = declare_parameter<std::string>(
         std::string("pick_place_") + kPpPoint[k] + "_topic", dflt);
     }
+    // 2026-10-02 audit. APPROACH: execute_pick / execute_place fly the claw to
+    // this far above the target, hold, and descend vertically once the claw
+    // has been within pick_place_arrival_tol for pick_place_settle_s; a wait
+    // longer than pick_place_approach_wait_max [s] (0 = forever) ends the leg
+    // incomplete, holding above.
+    declare_parameter<double>("pick_place_approach_dz", 0.10);
+    declare_parameter<double>("pick_place_approach_wait_max", 60.0);
+    declare_parameter<double>("pick_place_settle_s", 1.0);
+    // a leg starts only when the measured body is within this of its hold [m]
+    declare_parameter<double>("pick_place_leg_start_tol", 0.15);
+    // Adjust refuses an offset larger than this [m] (pressed off the start mark)
+    declare_parameter<double>("pick_place_adjust_max", 0.5);
+    // GEOFENCE on every goal, approach, retreat and leg path (body origin,
+    // world [m]): the body stands at 0.305 m on its gear and the law swings
+    // ~+-0.1 m, hence the 0.6 m floor; the abort climb is clipped at the ceiling
+    declare_parameter<double>("pick_place_fence_min_z", 0.6);
+    declare_parameter<double>("pick_place_fence_max_z", 1.8);
+    declare_parameter<std::vector<double>>(
+      "pick_place_fence_xy", std::vector<double>{-2.5, 2.5, -2.5, 2.5});
+    // ABORT (pick_place/abort): arm home and the vehicle this much higher [m],
+    // x, y and heading kept -- the arm GS opens the gripper on the same press
+    declare_parameter<double>("pick_place_abort_climb", 0.30);
     // a capture averages the samples of the last this-many seconds, and is
     // REFUSED when they scatter more than this: two publishers on one topic
     // (the Isaac emulator's phantom obj_0 at the origin did exactly that on
@@ -410,6 +441,7 @@ public:
     trigger(prefix + "/pick_place/adjust", [this](Trigger::Response::SharedPtr r) {onPpAdjust(r);});
     trigger(prefix + "/pick_place/plan", [this](Trigger::Response::SharedPtr r) {onPpPlan(r);});
     trigger(prefix + "/pick_place/reset", [this](Trigger::Response::SharedPtr r) {onPpReset(r);});
+    trigger(prefix + "/pick_place/abort", [this](Trigger::Response::SharedPtr r) {onPpAbort(r);});
     for (int k = 0; k < kNumPickPlaceLegs; ++k) {
       trigger(
         prefix + "/pick_place/" + pickPlaceLegName(k),
@@ -457,6 +489,12 @@ public:
     ee_timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / 15.0), [this]() {currentEeTick();});
     viz_decim_period_ = std::max(1, static_cast<int>(std::lround(stream_rate_ / 20.0)));
+
+    // Pick-and-place parameters edited live (the arm GS's typed-in points,
+    // a driver's poses): checked here, and any change to what the legs fly
+    // makes the plan STALE -- a plan from the old values must not be flown.
+    pp_param_cb_ = add_on_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter> & ps) {return onPpParams(ps);});
 
     publishStatus();
     publishWorkspace();
@@ -570,7 +608,11 @@ private:
         // the operator's bookkeeping), so a re-Plan resumes the mission
         pp_wp_.reset();
         pp_flying_.reset();
+        pp_phase_ = kPpNone;
         pp_exec_plan_.reset();
+        pp_abort_plan_.reset();
+        pp_aborting_ = false;
+        pp_aborted_ = false;
         pp_planning_ = false;
         ++pp_gen_;
         RCLCPP_INFO(get_logger(), "SAFETY -- planner silent, targets dropped.");
@@ -846,7 +888,10 @@ private:
       if (state_ == "EXECUTING") {return;}
       // any other target supersedes a pick-and-place leg still planning
       pp_flying_.reset();
+      pp_phase_ = kPpNone;
       pp_exec_plan_.reset();
+      pp_abort_plan_.reset();
+      pp_aborting_ = false;
       req.rest0 = *hold_;
       std::string err;
       VecN q_goal;
@@ -975,6 +1020,7 @@ private:
       plan_.reset();
       ++plan_gen_;
       pp_flying_.reset();
+      pp_phase_ = kPpNone;
       pp_exec_plan_.reset();
       if (mode_direct_) {state_ = "HOLD";}
     }
@@ -1013,11 +1059,36 @@ private:
         }
       }
       if (finished) {
-        if (pp_flying_.has_value() && pp_exec_plan_ && pp_exec_plan_ == plan_) {
-          pp_completed_ = *pp_flying_;
-          RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", pickPlaceLegName(pp_completed_));
+        if (pp_abort_plan_ && pp_abort_plan_ == plan_) {
+          RCLCPP_WARN(get_logger(), "pick-and-place: ABORT complete -- holding, arm home.");
+          pp_at_table_ = false;   // climbed off, arm folded
         }
-        pp_flying_.reset();
+        pp_abort_plan_.reset();
+        if (pp_flying_.has_value() && pp_exec_plan_ && pp_exec_plan_ == plan_) {
+          const int leg = *pp_flying_;
+          // the leg flew to its APPROACH rest when that differs from the goal
+          const bool above = pp_wp_.has_value() &&
+            (pp_wp_->approach[leg].x_b - pp_wp_->goal[leg].x_b).norm() > 1e-6;
+          if (pickPlaceLegIsClaw(leg) && pp_phase_ == kPpTravel && above) {
+            // above the target: hold there until the claw is within the
+            // tolerance, then descend (publishPpArrival)
+            pp_phase_ = kPpWait;
+            pp_wait_t0_ = Clock::now();
+            pp_within_since_.reset();
+            RCLCPP_INFO(
+              get_logger(), "pick-and-place: %s above its target -- descending once the claw is "
+              "within tolerance.", pickPlaceLegName(leg));
+          } else {
+            pp_completed_ = leg;
+            pp_flying_.reset();
+            pp_phase_ = kPpNone;
+            pp_at_table_ = pickPlaceLegIsClaw(leg);
+            RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", pickPlaceLegName(leg));
+          }
+        } else {
+          pp_flying_.reset();
+          pp_phase_ = kPpNone;
+        }
         pp_exec_plan_.reset();
         setHold(plan_->goalRest());
         plan_.reset();
@@ -1504,6 +1575,7 @@ private:
       }
       plan_ = ee_traj_;
       pp_flying_.reset();
+      pp_phase_ = kPpNone;
       pp_exec_plan_.reset();
       pending_base_.reset();
       ee_target_.reset();
@@ -1888,6 +1960,18 @@ private:
       return false;
     }
     c->face_target = get_parameter("pick_place_face_target").as_bool();
+    c->approach_dz = get_parameter("pick_place_approach_dz").as_double();
+    c->fence.min_z = get_parameter("pick_place_fence_min_z").as_double();
+    c->fence.max_z = get_parameter("pick_place_fence_max_z").as_double();
+    const auto xy = get_parameter("pick_place_fence_xy").as_double_array();
+    if (xy.size() != 4) {
+      *err = "pick_place_fence_xy needs [x_min, x_max, y_min, y_max]";
+      return false;
+    }
+    c->fence.x_min = xy[0];
+    c->fence.x_max = xy[1];
+    c->fence.y_min = xy[2];
+    c->fence.y_max = xy[3];
     c->retreat_dz = get_parameter("pick_place_retreat_dz").as_double();
     c->retreat_back = get_parameter("pick_place_retreat_back").as_double();
     ArmSweepOptions & o = c->sweep;
@@ -1924,6 +2008,12 @@ private:
         }
         continue;
       }
+      if (k == kExecutePlace && !pp_capture_[k].has_value()) {
+        // typed in: a room-frame point like the base poses, so it is shifted
+        if (!ppVec3("pick_place_place_point", &t->place, err)) {return false;}
+        t->place += pp_offset_;
+        continue;
+      }
       if (!pp_capture_[k].has_value()) {
         missing += (missing.empty() ? "" : " and ") + std::string(kPpPoint[k]) + " (" +
           (pp_topic_[k].empty() ? "no topic set" : pp_topic_[k]) + ")";
@@ -1936,6 +2026,65 @@ private:
       return false;
     }
     return true;
+  }
+
+  rcl_interfaces::msg::SetParametersResult onPpParams(const std::vector<rclcpp::Parameter> & ps)
+  {
+    rcl_interfaces::msg::SetParametersResult r;
+    r.successful = true;
+    bool stale = false;
+    for (const auto & p : ps) {
+      const std::string & n = p.get_name();
+      if (n.rfind("pick_place_", 0) != 0) {continue;}
+      if (n.size() > 6 && n.compare(n.size() - 6, 6, "_topic") == 0) {
+        r.successful = false;
+        r.reason = n + " is fixed at launch (the mocap subscription is made then)";
+        return r;
+      }
+      const auto want = [&](size_t len) {
+          if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+            p.as_double_array().size() != len)
+          {
+            r.successful = false;
+            r.reason = n + " needs " + std::to_string(len) + " numbers";
+          }
+        };
+      if (n == "pick_place_start" || n == "pick_place_place_start" ||
+        n == "pick_place_land_start" || n == "pick_place_land")
+      {
+        want(4);
+      } else if (n == "pick_place_fence_xy") {
+        want(4);
+      } else if (n == "pick_place_place_point" || n == "pick_place_pick_ee_offset" ||
+        n == "pick_place_place_ee_offset")
+      {
+        want(3);
+      }
+      if (!r.successful) {return r;}
+      // what only gates or reports leaves the plan valid
+      if (n != "pick_place_arrival_tol" && n != "pick_place_capture_window" &&
+        n != "pick_place_capture_max_spread" && n != "pick_place_adjust_z" &&
+        n != "pick_place_adjust_yaw" && n != "pick_place_settle_s" &&
+        n != "pick_place_approach_wait_max" && n != "pick_place_leg_start_tol" &&
+        n != "pick_place_adjust_max" && n != "pick_place_abort_climb")
+      {
+        stale = true;
+      }
+    }
+    if (stale) {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pp_flying_.has_value()) {
+        r.successful = false;
+        r.reason = "a pick-and-place leg is in flight -- edit once it holds";
+        return r;
+      }
+      if (pp_wp_.has_value() || pp_planning_) {
+        RCLCPP_INFO(get_logger(), "pick-and-place: parameters changed -- the plan is stale, press Plan");
+      }
+      ppInvalidate();
+      pp_params_dirty_ = true;   // published from the 10 Hz timer, once the values are set
+    }
+    return r;
   }
 
   void onPpMocap(int k, const Mocap & msg)
@@ -1957,6 +2106,7 @@ private:
     pp_wp_.reset();
     pp_planning_ = false;
     pp_error_.clear();
+    pp_timed_out_ = false;
     ++pp_gen_;
   }
 
@@ -2064,6 +2214,14 @@ private:
         }
         yoff = wrapPi(std::atan2((*att_R_)(1, 0), (*att_R_)(0, 0)) - nominal.yaw);
       }
+      const double max_off = get_parameter("pick_place_adjust_max").as_double();
+      if (off.norm() > max_off) {
+        m << "offset [" << off(0) << ", " << off(1) << ", " << off(2) << "] m is larger than "
+          << max_off << " m -- is the vehicle on the START mark? Not adjusted";
+        resp->success = false;
+        resp->message = m.str();
+        return;
+      }
       pp_offset_ = off;
       pp_yaw_offset_ = yoff;
       ppInvalidate();
@@ -2111,6 +2269,7 @@ private:
       ppInvalidate();
       gen = pp_gen_;
       pp_planning_ = true;
+      pp_aborted_ = false;
     }
     publishPpStatus();
     publishPpPaths(nullptr);
@@ -2167,12 +2326,31 @@ private:
         err = "not in whole-body DIRECT";
       } else if (pp_planning_) {
         err = "the mission is still planning";
+      } else if (pp_flying_.has_value()) {
+        err = std::string(pickPlaceLegName(*pp_flying_)) +
+          (pp_phase_ == kPpWait ? " is waiting above its target" : " is in flight") +
+          " -- Abort to cancel it";
       } else if (!pp_wp_.has_value()) {
         err = "not planned -- capture the pick / place points and press Plan";
       } else if (state_ == "EXECUTING" || state_ == "CALCULATING") {
         err = "planner is " + state_ + " -- wait for HOLD";
       } else if (leg > pp_completed_ + 1) {
         err = std::string("out of order -- the next leg is ") + pickPlaceLegName(pp_completed_ + 1);
+      } else if (!odom_p_.has_value() || secondsSince(odom_p_time_) > kOdomFreshS) {
+        err = "no fresh odometry -- a leg must not start blind";
+      } else {
+        // the vehicle must actually be at its hold (audit M1): a leg started
+        // while it still swings adds that error to the new reference's start
+        const double d = (*odom_p_ - hold_->x_b).norm();
+        const double tol = get_parameter("pick_place_leg_start_tol").as_double();
+        if (d > tol) {
+          std::ostringstream m;
+          m.setf(std::ios::fixed);
+          m.precision(0);
+          m << "the body is " << d * 1e3 << " mm from its hold (> " << tol * 1e3
+            << " mm) -- wait for it to settle";
+          err = m.str();
+        }
       }
       if (err.empty()) {ppConfig(&cfg, &err);}
       if (!err.empty()) {
@@ -2193,18 +2371,22 @@ private:
       home_goal_ = false;
       exec_pause_t_.reset();
       pp_flying_ = leg;
+      pp_phase_ = kPpTravel;
       pp_exec_plan_.reset();
       pp_error_.clear();
+      pp_timed_out_ = false;
+      pp_aborted_ = false;
     }
+    const bool from_table = pp_at_table_;
     publishStatus();
     publishPpStatus();
     publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen]() {
+    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen, from_table]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
-          traj = planPickPlaceLeg(*vehicle_, *planner_, opts, cfg, wp, leg, from);
+          traj = planPickPlaceLeg(*vehicle_, *planner_, opts, cfg, wp, leg, from, from_table);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -2216,6 +2398,7 @@ private:
             infeasible_reason_ = err;
             pp_error_ = err;
             pp_flying_.reset();
+            pp_phase_ = kPpNone;
             RCLCPP_WARN(get_logger(), "pick-and-place leg refused: %s", err.c_str());
           } else {
             plan_ = traj;
@@ -2239,16 +2422,135 @@ private:
     RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
   }
 
+  // ABORT: arm home and the vehicle pick_place_abort_climb higher, x, y and
+  // heading kept, planned and flown at once. From a hold it starts there; in
+  // the middle of a run it CUTS the run at the current reference point: the
+  // CoM stays continuous (x_b is taken so that x_c matches), the reference's
+  // velocity steps to zero once -- the trade the EE-trajectory pause makes --
+  // and the cut point is held for the milliseconds the plan takes. The leg
+  // that was cut is not complete: re-fly it or Reset. The gripper is the
+  // arm GS's (its Abort button opens it on the same press).
+  void onPpAbort(Trigger::Response::SharedPtr resp)
+  {
+    RestSpec from, goal;
+    PlanOptions opts;
+    unsigned gen = 0;
+    bool cut = false;
+    double climb = 0.0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !hold_.has_value()) {
+        resp->success = false;
+        resp->message = "not in whole-body DIRECT -- use the drone ground station";
+        return;
+      }
+      if (pp_abort_plan_) {
+        resp->success = false;
+        resp->message = "already aborting";
+        return;
+      }
+      from = *hold_;
+      if (state_ == "EXECUTING" && plan_ && exec_t0_.has_value()) {
+        const double t = exec_pause_t_.has_value()
+          ? *exec_pause_t_
+          : std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
+        const WbReference ref = plan_->eval(std::min(t, plan_->duration()));
+        from.phi = std::atan2(ref.b1_d(1), ref.b1_d(0));
+        from.q = ref.q_d;
+        Vec3 r0c;
+        armKinematics(ref.q_d, vehicle_->params, &r0c, nullptr, nullptr);
+        from.x_b = ref.x_cd - Rz(from.phi) * r0c;   // x_c continuous
+        cut = true;
+      }
+      // the climb is clipped at the fence ceiling (audit H3): repeated presses
+      // never take the vehicle out of the volume
+      climb = std::max(0.0, std::min(
+          get_parameter("pick_place_abort_climb").as_double(),
+          get_parameter("pick_place_fence_max_z").as_double() - from.x_b(2)));
+      goal.x_b = from.x_b + Vec3{0.0, 0.0, climb};
+      pp_abort_climb_ = climb;
+      goal.phi = from.phi;
+      goal.q = home_pose_;
+      opts = planOptions();
+      // supersede whatever was running or planning, hold the cut point
+      gen = ++plan_gen_;
+      plan_.reset();
+      goal_override_.reset();
+      auto_send_ = false;
+      pending_base_.reset();
+      ee_target_.reset();
+      home_goal_ = false;
+      exec_pause_t_.reset();
+      setHold(from);
+      state_ = "CALCULATING";
+      pp_flying_.reset();
+      pp_phase_ = kPpNone;
+      pp_exec_plan_.reset();
+      pp_error_.clear();
+      pp_timed_out_ = false;
+      pp_aborted_ = true;
+      pp_aborting_ = true;
+    }
+    publishStatus();
+    publishPpStatus();
+    publishPpInfo();
+    if (worker_.joinable()) {worker_.join();}
+    worker_ = std::thread([this, from, goal, opts, gen]() {
+        std::shared_ptr<Trajectory> traj;
+        std::string err;
+        try {
+          PlanRequest req;
+          req.rest0 = from;
+          req.rest1 = goal;
+          traj = planner_->plan(*vehicle_, req, opts);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != plan_gen_ || state_ != "CALCULATING") {return;}   // superseded
+          pp_aborting_ = false;
+          if (!traj) {
+            state_ = "INFEASIBLE";
+            infeasible_reason_ = "abort: " + err;
+            pp_error_ = "abort refused: " + err + " -- holding where it was cut";
+            RCLCPP_ERROR(get_logger(), "pick-and-place ABORT could not plan: %s", err.c_str());
+          } else {
+            plan_ = traj;
+            pp_abort_plan_ = traj;
+            exec_t0_ = Clock::now();
+            state_ = "EXECUTING";
+            RCLCPP_WARN(get_logger(), "pick-and-place ABORT: %s", traj->diag().summary.c_str());
+          }
+        }
+        publishStatus();
+        publishPpStatus();
+        publishVizPath(traj.get());
+      });
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(2);
+    m << "ABORT: arm home and up " << climb << " m from " << (cut ? "the point the run was cut at" : "the hold");
+    if (climb < get_parameter("pick_place_abort_climb").as_double() - 1e-9) {
+      m << " (clipped at the fence ceiling " << get_parameter("pick_place_fence_max_z").as_double() << " m)";
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_WARN(get_logger(), "pick-and-place: %s", resp->message.c_str());
+  }
+
   void onPpReset(Trigger::Response::SharedPtr resp)
   {
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (pp_flying_.has_value()) {
         resp->success = false;
-        resp->message = "a pick-and-place leg is in flight -- revert to SAFETY to abort it";
+        resp->message = "a pick-and-place leg is in flight or waiting above its target -- Abort it first";
         return;
       }
       pp_completed_ = -1;
+      pp_aborted_ = false;
+      pp_at_table_ = false;
       ppInvalidate();
     }
     resp->success = true;
@@ -2266,8 +2568,13 @@ private:
   // [7] within tolerance, [8] within AND holding: fine correction OK.
   void publishPpArrival()
   {
+    if (pp_params_dirty_.exchange(false)) {
+      publishPpStatus();
+      publishPpInfo();
+      publishPpPaths(nullptr);
+    }
     Float64MultiArray m;
-    bool gate_changed = false;
+    bool gate_changed = false, descend = false, timed_out = false;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !pp_wp_.has_value()) {return;}
@@ -2277,27 +2584,134 @@ private:
       Mat3 r0;
       if (!odomPair(&x_b, &r0) || odomAge() > kOdomFreshS || !q_meas_.has_value()) {return;}
       const bool claw = pickPlaceLegIsClaw(leg);
+      // before / while waiting the claw's target is the point ABOVE the object
+      const bool above = pp_flying_.has_value() && (pp_phase_ == kPpTravel || pp_phase_ == kPpWait);
       Vec3 meas = x_b, want = pp_wp_->goal[leg].x_b;
       if (claw) {
         Vec3 r0e;
         armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
         meas = x_b + r0 * (vehicle_->r_model * r0e);
-        want = pp_wp_->ee[leg];
+        want = above ? pp_wp_->approach_ee[leg] : pp_wp_->ee[leg];
       }
       const Vec3 e = want - meas;
       const double tol = get_parameter("pick_place_arrival_tol").as_double();
       const bool within = e.norm() <= tol;
-      const bool settled = within && !pp_flying_.has_value() && state_ == "HOLD";
+      // a DWELL inside the tolerance (audit L1): the claw settles THROUGH it
+      if (!within) {
+        pp_within_since_.reset();
+      } else if (!pp_within_since_.has_value()) {
+        pp_within_since_ = Clock::now();
+      }
+      const bool dwelt = within &&
+        secondsSince(pp_within_since_) >= get_parameter("pick_place_settle_s").as_double();
+      const bool settled = dwelt && !pp_flying_.has_value() && state_ == "HOLD";
+      pp_last_err_ = e.norm();
+      if (pp_phase_ == kPpWait && state_ == "HOLD") {
+        const double wait_max = get_parameter("pick_place_approach_wait_max").as_double();
+        if (dwelt) {
+          descend = true;
+        } else if (wait_max > 0.0 && secondsSince(pp_wait_t0_) > wait_max) {
+          std::ostringstream w;
+          w.setf(std::ios::fixed);
+          w.precision(0);
+          w << pickPlaceLegName(leg) << ": the claw stayed " << e.norm() * 1e3
+            << " mm from the point above the target for " << wait_max
+            << " s -- descent not started; re-fly it or Abort";
+          pp_error_ = w.str();
+          pp_timed_out_ = true;
+          pp_flying_.reset();
+          pp_phase_ = kPpNone;
+          gate_changed = true;
+          timed_out = true;
+          RCLCPP_WARN(get_logger(), "pick-and-place %s", pp_error_.c_str());
+        }
+      }
       m.data = {static_cast<double>(leg), claw ? 1.0 : 0.0, e.norm(), e(0), e(1), e(2), tol,
-        within ? 1.0 : 0.0, settled ? 1.0 : 0.0};
-      if (settled != pp_settled_ || leg != pp_err_leg_) {
+        within ? 1.0 : 0.0, settled ? 1.0 : 0.0, static_cast<double>(pp_phase_)};
+      if (settled != pp_settled_ || within != pp_within_ || leg != pp_err_leg_ ||
+        pp_phase_ == kPpWait)
+      {
         pp_settled_ = settled;
+        pp_within_ = within;
         pp_err_leg_ = leg;
         gate_changed = true;
       }
     }
     pp_arrival_pub_->publish(m);
+    if (descend) {startPpDescent();}
     if (gate_changed) {publishPpStatus();}
+    if (timed_out) {publishPpInfo();}
+  }
+
+  // The claw leg's vertical descent from the approach hold onto the target,
+  // started by publishPpArrival once the claw has dwelt within tolerance.
+  void startPpDescent()
+  {
+    RestSpec from;
+    PickPlaceWaypoints wp;
+    PickPlaceConfig cfg;
+    PlanOptions opts;
+    unsigned gen = 0;
+    int leg = -1;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pp_phase_ != kPpWait || !pp_flying_.has_value() || !pp_wp_.has_value() ||
+        state_ != "HOLD" || !hold_.has_value())
+      {
+        return;
+      }
+      std::string err;
+      if (!ppConfig(&cfg, &err)) {
+        pp_error_ = err;
+        pp_flying_.reset();
+        pp_phase_ = kPpNone;
+        return;
+      }
+      leg = *pp_flying_;
+      from = *hold_;
+      wp = *pp_wp_;
+      opts = planOptions();
+      gen = ++plan_gen_;
+      state_ = "CALCULATING";
+      plan_.reset();
+      pp_phase_ = kPpDescent;
+      pp_exec_plan_.reset();
+      RCLCPP_INFO(get_logger(), "pick-and-place %s: claw within tolerance above the target -- descending.",
+        pickPlaceLegName(leg));
+    }
+    publishStatus();
+    publishPpStatus();
+    if (worker_.joinable()) {worker_.join();}
+    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen]() {
+        std::shared_ptr<Trajectory> traj;
+        std::string err;
+        try {
+          traj = planPickPlaceDescent(*vehicle_, *planner_, opts, cfg, wp, leg, from);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != plan_gen_ || state_ != "CALCULATING") {return;}   // superseded
+          if (!traj) {
+            state_ = "INFEASIBLE";
+            infeasible_reason_ = err;
+            pp_error_ = err;
+            pp_flying_.reset();
+            pp_phase_ = kPpNone;
+            RCLCPP_WARN(get_logger(), "pick-and-place descent refused: %s", err.c_str());
+          } else {
+            plan_ = traj;
+            pp_exec_plan_ = traj;
+            exec_t0_ = Clock::now();
+            exec_pause_t_.reset();
+            state_ = "EXECUTING";
+          }
+        }
+        publishStatus();
+        publishPpStatus();
+        publishVizPath(traj.get());
+      });
   }
 
   void publishPpStatus()
@@ -2310,13 +2724,32 @@ private:
       m.precision(1);
       if (!mode_direct_) {
         m << "NOT IN DIRECT";
+      } else if (pp_aborting_ || pp_abort_plan_) {
+        m << "ABORTING -- arm home, climbing " << std::setprecision(2) << pp_abort_climb_ << " m";
       } else if (pp_planning_) {
         m << "PLANNING";
+      } else if (pp_flying_.has_value() && pp_phase_ == kPpWait) {
+        m << "WAITING " << pickPlaceLegName(*pp_flying_) << ": claw " << std::setprecision(0)
+          << pp_last_err_ * 1e3 << " mm from the point above the target (tolerance "
+          << get_parameter("pick_place_arrival_tol").as_double() * 1e3
+          << " mm) -- descends once inside";
       } else if (pp_flying_.has_value()) {
         m << "FLYING " << pickPlaceLegName(*pp_flying_);
+        if (pickPlaceLegIsClaw(*pp_flying_)) {
+          m << (pp_phase_ == kPpDescent ? " (descent)" : " (approach)");
+        }
         if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
       } else if (!pp_error_.empty()) {
-        m << "INFEASIBLE: " << pp_error_;
+        m << (pp_timed_out_ ? "INCOMPLETE: " : "INFEASIBLE: ") << pp_error_;
+      } else if (pp_aborted_) {
+        m << "ABORTED -- holding higher, arm home; ";
+        if (!pp_wp_.has_value()) {
+          m << "press Plan";
+        } else if (pp_completed_ >= kNumPickPlaceLegs - 1) {
+          m << "touch down with SAFETY -> land";
+        } else {
+          m << "re-fly " << pickPlaceLegName(pp_completed_ + 1) << " or Reset";
+        }
       } else if (!pp_wp_.has_value()) {
         PickPlaceTargets t;
         std::string err;
@@ -2330,7 +2763,8 @@ private:
           << pickPlaceLegName(pp_completed_ + 1);
         if (pickPlaceLegIsClaw(pp_completed_)) {
           m << (pp_settled_ ? " -- claw within tolerance: fine correction OK"
-                            : " -- claw outside tolerance");
+                : pp_within_ ? " -- claw inside tolerance, settling"
+                             : " -- claw outside tolerance");
         }
       }
       s = m.str();
@@ -2523,6 +2957,22 @@ private:
   int pp_err_leg_{-1};
   unsigned pp_gen_{0};
   std::thread pp_worker_;
+  std::atomic<bool> pp_params_dirty_{false};
+  // a leg's phase: travel (a claw leg: to the point above its target), the
+  // wait above it, the vertical descent
+  enum PpPhase {kPpNone = 0, kPpTravel = 1, kPpWait = 2, kPpDescent = 3};
+  PpPhase pp_phase_{kPpNone};
+  Clock::time_point pp_wait_t0_{};
+  std::optional<Clock::time_point> pp_within_since_;
+  double pp_last_err_{0.0};
+  bool pp_at_table_{false};                     // holding at a table: the next leg retreats first
+  bool pp_within_{false};                       // the claw inside the tolerance (dwell not yet done)
+  bool pp_timed_out_{false};                    // pp_error_ is a wait timeout, not a refusal
+  double pp_abort_climb_{0.0};                  // the (fence-clipped) climb of the abort in flight
+  std::shared_ptr<Trajectory> pp_abort_plan_;   // the abort transition in flight
+  bool pp_aborting_{false};                     // ... or being planned
+  bool pp_aborted_{false};                      // until the next pick-and-place action
+  OnSetParametersCallbackHandle::SharedPtr pp_param_cb_;
 
   // ---- live samples --------------------------------------------------------
   std::optional<Vec3> odom_p_;

@@ -51,13 +51,12 @@ echo "fsc_autopilot_ros2: $AUT ($(git -C "$AUT" log --oneline -1 2>/dev/null))"
 echo "controller + plant yaml: $WB_SIM_YAML"
 LOGS="$OUT/logs"
 mkdir -p "$OUT" "$LOGS"
-# The stand-in table objects get PRIVATE topics: the emulator (master, without
+# The stand-in pick object gets a PRIVATE topic: the emulator (master, without
 # the skip-until-first-pose change) publishes a phantom obj_0 at the origin
 # when no gripper marker cube is spawned. The planner's launch file reads
-# these (its pick_place_*_topic overrides); the stack's tmux server inherits
-# them from this shell.
+# it (its pick_place_pick_topic override); the stack's tmux server inherits
+# it from this shell. The place point is typed in (the driver sets it).
 export FSC_PICK_PLACE_PICK_TOPIC="${FSC_PICK_PLACE_PICK_TOPIC:-/sim_pick_place/obj_0/mocap}"
-export FSC_PICK_PLACE_PLACE_TOPIC="${FSC_PICK_PLACE_PLACE_TOPIC:-/sim_pick_place/drop_0/mocap}"
 set +u
 source "/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
 source "$WS/install/setup.bash"
@@ -71,7 +70,6 @@ echo "=== [$TAG] 1. controller stack (4-D L1, EKF2-fused) ==="
 # a tmux server that is already up does not hand new sessions this shell's
 # environment: push the two variables into its global environment as well
 tmux setenv -g FSC_PICK_PLACE_PICK_TOPIC "$FSC_PICK_PLACE_PICK_TOPIC" 2>/dev/null || true
-tmux setenv -g FSC_PICK_PLACE_PLACE_TOPIC "$FSC_PICK_PLACE_PLACE_TOPIC" 2>/dev/null || true
 setsid nohup "$STACK" "$CFG" uav_0 > "$LOGS/stack_$TAG.log" 2>&1 < /dev/null &
 for _ in $(seq 60); do pgrep -x MicroXRCEAgent >/dev/null && break; sleep 2; done
 pgrep -x MicroXRCEAgent >/dev/null || { echo "FAILED: agent never came up"; exit 1; }
@@ -112,7 +110,7 @@ ros2 service type /uav_0/fsc_open_manipulator/pick_place_fine/set_engaged >/dev/
 sleep 10
 echo "=== [$TAG] 4. flying the pick-and-place mission ==="
 /usr/bin/python3 "$HERE/pick_place_sim_driver.py" --out "$OUT/pick_place_$TAG.npz" \
-    --obj-topic "$FSC_PICK_PLACE_PICK_TOPIC" --drop-topic "$FSC_PICK_PLACE_PLACE_TOPIC" "$@" \
+    --obj-topic "$FSC_PICK_PLACE_PICK_TOPIC" "$@" \
     > "$LOGS/driver_$TAG.log" 2>&1
 rc=$?
 echo "=== [$TAG] done (driver rc=$rc) ==="
