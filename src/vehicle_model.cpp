@@ -22,6 +22,7 @@ VehicleModel makeT650AerialManipulator(const VehicleOptions & o)
   v.name = "t650_aerial_manipulator";
   v.params = WholeBodyParams::t650Defaults();
   v.params.base_com = o.base_com;
+  if (o.armature_joint_diag) {v.params.useJointDiagonalArmature(o.armature);}
   v.rotor = RotorModel::t650();
   for (int j = 0; j < kNumJoints; ++j) {
     v.q_min(j) = kArmQMin[j];

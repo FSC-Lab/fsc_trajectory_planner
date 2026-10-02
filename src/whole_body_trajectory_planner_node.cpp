@@ -34,6 +34,15 @@
 //                 targets measured from mocap (obj_0 / drop_0). `plan` dry-
 //                 runs the whole mission; each leg's service re-plans it from
 //                 the CURRENT hold and executes it at once (pick_place.hpp).
+//     TELEOP (2026-09-27): the PS4 pad drives the reference in real time --
+//                 D-pad + action buttons the CoM and heading, the sticks the
+//                 grasp point relative to the airframe and the wrist roll --
+//                 integrated to setpoints and streamed as compatible
+//                 WholeBodyReference samples (teleop_reference.hpp). Entered
+//                 from HOLD through whole_body_planner/teleop/engage; on
+//                 disengage (TELEOP_STOP) the smoothers settle and the final
+//                 rest becomes the new HOLD. Every other target is refused
+//                 while it runs.
 //   Mode leaves DIRECT at ANY point -> streaming stops instantly.
 //
 // FRAMES: the ROS boundary is the ACTUAL world/FLU convention (odometry, GS
@@ -65,9 +74,11 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/set_bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
@@ -80,6 +91,7 @@
 #include "fsc_trajectory_planner/ee_trajectory_planner.hpp"
 #include "fsc_trajectory_planner/kinematics.hpp"
 #include "fsc_trajectory_planner/pick_place.hpp"
+#include "fsc_trajectory_planner/teleop_reference.hpp"
 #include "fsc_trajectory_planner/trajectory.hpp"
 #include "fsc_trajectory_planner/vehicle_model.hpp"
 #include "fsc_trajectory_planner/workspace.hpp"
@@ -93,9 +105,11 @@ namespace
 using geometry_msgs::msg::PoseStamped;
 using nav_msgs::msg::Odometry;
 using sensor_msgs::msg::JointState;
+using sensor_msgs::msg::Joy;
 using std_msgs::msg::Float64;
 using std_msgs::msg::Float64MultiArray;
 using std_msgs::msg::String;
+using std_srvs::srv::SetBool;
 using std_srvs::srv::Trigger;
 using trajectory_msgs::msg::JointTrajectory;
 using trajectory_msgs::msg::JointTrajectoryPoint;
@@ -187,6 +201,11 @@ public:
     // equal the flight node's wb_base_com_x/y/z.
     const auto base_com = declare_parameter<std::vector<double>>(
       "base_com", std::vector<double>{0.0, 0.0, 0.0});
+    // Servo armature structure. MUST equal the flight node's
+    // wb_armature_joint_diag / wb_armature_j1..j4 (false = the flown link model).
+    const bool armature_joint_diag = declare_parameter<bool>("armature_joint_diag", false);
+    const auto armature = declare_parameter<std::vector<double>>(
+      "armature", std::vector<double>{0.010, 0.0194, 0.0097, 0.0097});
     // World-EE-anchored HOLD: re-solve the arm IK against the CURRENT base
     // pose so the EE holds its inertial position. OFF by default (2026-08-31):
     // the re-solve moves x_cd with base drift and leaves the position loop
@@ -239,7 +258,7 @@ public:
     declare_parameter<double>("ee_traj_time_scale", 1.0);
     declare_parameter<double>("ee_traj_start_pos_tol", 0.05);
     declare_parameter<double>("ee_traj_start_yaw_tol_deg", 5.0);
-    declare_parameter<double>("ee_traj_start_joint_tol_deg", 3.0);
+    declare_parameter<double>("ee_traj_start_joint_tol_deg", 5.0);
     ee_time_scale_req_ = get_parameter("ee_traj_time_scale").as_double();
 
     // --- pick-and-place mode (pick_place.hpp) ------------------------------
@@ -302,8 +321,54 @@ public:
     declare_parameter<double>("pick_place_capture_window", 0.5);
     declare_parameter<double>("pick_place_capture_max_spread", 0.02);
 
-    if (home.size() != kNumJoints || base_com.size() != 3 || sign.size() != kNumJoints) {
-      throw std::runtime_error("home_pose/arm_joint_sign need 4 values, base_com 3");
+    // --- PS4 teleoperation (2026-09-27) -----------------------------------
+    // Rates are at FULL deflection and PHYSICAL; teleop_time_scale converts
+    // them to this node's (wall) clock -- 1.0 on hardware, the sim's real-
+    // time factor in Isaac (the same rule as ee_traj_time_scale).
+    declare_parameter<std::string>("teleop_joy_topic", "rc/input");
+    declare_parameter<double>("teleop_joy_timeout_s", 0.3);
+    declare_parameter<double>("teleop_time_scale", 1.0);
+    declare_parameter<double>("teleop_com_speed_xy", 0.20);
+    declare_parameter<double>("teleop_com_speed_z", 0.15);
+    declare_parameter<double>("teleop_yaw_rate_deg", 20.0);
+    declare_parameter<double>("teleop_ee_speed", 0.04);
+    declare_parameter<double>("teleop_roll_rate_deg", 20.0);
+    declare_parameter<double>("teleop_home_rate_deg", 10.0);
+    declare_parameter<double>("teleop_com_bandwidth", 6.0);
+    declare_parameter<double>("teleop_yaw_bandwidth", 4.0);
+    declare_parameter<double>("teleop_arm_bandwidth", 6.0);
+    declare_parameter<double>("teleop_box_half_xy", 1.5);
+    declare_parameter<double>("teleop_com_z_min", 0.70);
+    declare_parameter<double>("teleop_com_z_max", 2.20);
+    declare_parameter<double>("teleop_ee_z_min", 0.25);
+    declare_parameter<double>("teleop_leash_m", 0.50);
+    // each joint's range shrunk about its centre to this fraction (0.8 = 20 %
+    // reserve) -- the pad can never drive the arm onto a hardware stop
+    declare_parameter<double>("teleop_joint_range_frac", 0.8);
+    // where PS folds the arm: the PAD'S home, inside that box [deg]
+    declare_parameter<std::vector<double>>(
+      "teleop_home_pose_deg", std::vector<double>{0.0, 30.0, 30.0, 0.0});
+    declare_parameter<double>("teleop_q3_min_deg", 0.0);
+    declare_parameter<double>("teleop_stick_deadzone", 0.08);
+    // Joy AXES: [ee forward, ee left, ee up, wrist roll, D-pad x, D-pad y]
+    // (DualShock 4 over joy_node: left stick 0/1, right stick 3/4, D-pad
+    // 6/7; LEFT and UP read +1 on all of them). Signs multiply each.
+    teleop_axes_ = declare_parameter<std::vector<int64_t>>(
+      "teleop_axes", std::vector<int64_t>{1, 0, 4, 3, 6, 7});
+    teleop_axis_signs_ = declare_parameter<std::vector<double>>(
+      "teleop_axis_signs", std::vector<double>{1.0, 1.0, 1.0, 1.0, 1.0, 1.0});
+    // Joy BUTTONS: [up, down, yaw left, yaw right, arm home] =
+    // triangle, cross, square, circle, PS.
+    teleop_buttons_ = declare_parameter<std::vector<int64_t>>(
+      "teleop_buttons", std::vector<int64_t>{2, 0, 3, 1, 10});
+    if (teleop_axes_.size() != 6 || teleop_axis_signs_.size() != 6 || teleop_buttons_.size() != 5) {
+      throw std::runtime_error("teleop_axes/teleop_axis_signs need 6 values, teleop_buttons 5");
+    }
+
+    if (home.size() != kNumJoints || base_com.size() != 3 || sign.size() != kNumJoints ||
+      armature.size() != kNumJoints)
+    {
+      throw std::runtime_error("home_pose/arm_joint_sign/armature need 4 values, base_com 3");
     }
     for (int j = 0; j < kNumJoints; ++j) {
       home_pose_(j) = home[j];
@@ -314,6 +379,11 @@ public:
     }
     VehicleOptions vo;
     vo.base_com = Vec3{base_com[0], base_com[1], base_com[2]};
+    vo.armature_joint_diag = armature_joint_diag;
+    for (int j = 0; j < kNumJoints; ++j) {
+      if (!(armature[j] >= 0.0)) {throw std::runtime_error("armature must be >= 0");}
+      vo.armature(j) = armature[j];
+    }
     vehicle_ = makeVehicleModel(vehicle_name_, vo);
     planner_ = makePlanner(planner_name_);
     RCLCPP_INFO(
@@ -321,6 +391,13 @@ public:
       "[%+.5f %+.5f %+.5f] m model frame -- must match the node's wb_base_com_*)",
       vehicle_->name.c_str(), vehicle_->params.totalMass(), vo.base_com(0),
       vo.base_com(1), vo.base_com(2));
+    if (armature_joint_diag) {
+      RCLCPP_INFO(
+        get_logger(), "armature: joint-diagonal [%.4f %.4f %.4f %.4f] kg m^2 -- must match "
+        "the node's wb_armature_j1..j4", armature[0], armature[1], armature[2], armature[3]);
+    } else {
+      RCLCPP_INFO(get_logger(), "armature: link structure (the flown model)");
+    }
     RCLCPP_INFO(
       get_logger(), "transition planner: %s (%s)", planner_->name().c_str(),
       planner_->description().c_str());
@@ -347,10 +424,14 @@ public:
     cur_ee_pub_ = create_publisher<PoseStamped>(prefix + "/current_ee", 10);
     cur_ee_body_pub_ = create_publisher<PoseStamped>(prefix + "/current_ee_body", 10);
     // ... and its HEADING in the ee_target convention (ACTUAL yaw, rad): the
-    // yaw an ee_target must carry to leave the wrist where it is. current_ee
-    // carries no orientation, and a station seeding a target without this
-    // asks for a wrist swing nobody commanded (the PS4 Remote tab did).
+    // yaw an ee_target must carry to leave the wrist where it is. current_ee's
+    // orientation is the EE frame, not this convention, and a station seeding a
+    // target without this asks for a wrist swing nobody commanded (the PS4
+    // Remote tab did).
     cur_ee_heading_pub_ = create_publisher<Float64>(prefix + "/current_ee_heading", 10);
+    // ...and the MEASURED airframe that current_ee was computed from (same
+    // sample, same gate), so a station draws the two as one state.
+    cur_base_pub_ = create_publisher<PoseStamped>(prefix + "/current_base", 10);
     // THE ARM REFERENCE IN DIRECT: this node is the arm's only reference
     // source while it streams (the arm planner owns it in SAFETY).
     arm_ref_pub_ = create_publisher<JointTrajectory>(arm_ref_topic, 10);
@@ -381,12 +462,6 @@ public:
     ee_start_srv_ = create_service<Trigger>(
       prefix + "/ee_trajectory/start",
       [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeStart(r);});
-    ee_pause_srv_ = create_service<Trigger>(
-      prefix + "/ee_trajectory/pause",
-      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEePause(r);});
-    ee_resume_srv_ = create_service<Trigger>(
-      prefix + "/ee_trajectory/resume",
-      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeResume(r);});
     ee_origin_srv_ = create_service<Trigger>(
       prefix + "/ee_trajectory/back_to_origin",
       [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onEeBackToOrigin(r);});
@@ -451,6 +526,29 @@ public:
     home_srv_ = create_service<Trigger>(
       prefix + "/go_home",
       [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onGoHome(r);});
+
+    // --- PS4 teleoperation ----------------------------------------------------
+    // The pad feed is taken at depth 1: a stick sample is worth nothing a
+    // tick later, and a stall must not hand over a backlog of deflections.
+    joy_sub_ = create_subscription<Joy>(
+      get_parameter("teleop_joy_topic").as_string(), rclcpp::QoS(1),
+      [this](const Joy & m) {onJoy(m);});
+    teleop_engage_srv_ = create_service<SetBool>(
+      prefix + "/teleop/engage",
+      [this](const SetBool::Request::SharedPtr q, SetBool::Response::SharedPtr r) {
+        onTeleopEngage(q->data, r);
+      });
+    teleop_home_srv_ = create_service<Trigger>(
+      prefix + "/teleop/arm_home",
+      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {onTeleopHome(r);});
+    // [see publishTeleopState] targets, walls and rates, ~20 Hz while engaged
+    teleop_state_pub_ = create_publisher<Float64MultiArray>(prefix + "/teleop/state", 10);
+    // the last wall that refused a step, latched; "" once motion is free again
+    teleop_note_pub_ = create_publisher<String>(prefix + "/teleop/note", latched);
+    // The MEASURED arm as points (world): base origin, joints 2..4, grasp
+    // point -- the planner's own chain, so a station draws the arm the law
+    // sees. Same sample and gate as current_ee.
+    skeleton_pub_ = create_publisher<Float64MultiArray>(prefix + "/current_skeleton", 10);
 
     stream_timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / stream_rate_), [this]() {streamTick();});
@@ -558,7 +656,6 @@ private:
         home_goal_ = false;
         plan_.reset();
         exec_t0_.reset();
-        exec_pause_t_.reset();
         ++plan_gen_;
         goal_override_.reset();
         auto_send_ = false;
@@ -573,6 +670,10 @@ private:
         pp_exec_plan_.reset();
         pp_planning_ = false;
         ++pp_gen_;
+        if (teleop_) {
+          RCLCPP_WARN(get_logger(), "SAFETY -- PS4 teleoperation dropped.");
+        }
+        teleop_.reset();
         RCLCPP_INFO(get_logger(), "SAFETY -- planner silent, targets dropped.");
       }
     }
@@ -619,6 +720,12 @@ private:
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_) {return;}
+      if (teleopActive()) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "drone-GS target ignored -- PS4 teleoperation owns the reference.");
+        return;
+      }
       double yaw = msg.yaw;
       if (msg.yaw_unit == PositionControllerReference::DEGREES) {yaw *= M_PI / 180.0;}
       const double phi = yaw - 0.5 * M_PI;  // actual yaw -> model heading
@@ -655,6 +762,10 @@ private:
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_) {
         RCLCPP_WARN(get_logger(), "EE target ignored -- not in whole-body DIRECT mode.");
+        return;
+      }
+      if (teleopActive()) {
+        RCLCPP_WARN(get_logger(), "EE target ignored -- PS4 teleoperation owns the reference.");
         return;
       }
       const Vec3 p{msg.pose.position.x, msg.pose.position.y, msg.pose.position.z};
@@ -728,7 +839,8 @@ private:
     qdot_meas_ = joint_sign_.cwiseProduct(qd);
   }
 
-  // Grasp-point EE at the MEASURED joints, 15 Hz (a display feed).
+  // Grasp-point EE at the MEASURED joints, and the measured airframe it hangs
+  // from, 15 Hz (a display feed).
   void currentEeTick()
   {
     std::optional<VecN> q;
@@ -742,11 +854,29 @@ private:
       have_odom = odomPair(&x_b, &r0);
       age = odomAge();
     }
+    const bool odom_fresh = have_odom && age <= kOdomFreshS;
+    const auto stamp = now();
+    // The MEASURED airframe: body origin and ACTUAL attitude (x = nose), the
+    // very pair the world current_ee below is built from. Needs no arm.
+    if (odom_fresh) {
+      PoseStamped base;
+      base.header.stamp = stamp;
+      base.header.frame_id = "world";
+      base.pose.position.x = x_b(0);
+      base.pose.position.y = x_b(1);
+      base.pose.position.z = x_b(2);
+      const Eigen::Quaterniond qb(r0);
+      base.pose.orientation.x = qb.x();
+      base.pose.orientation.y = qb.y();
+      base.pose.orientation.z = qb.z();
+      base.pose.orientation.w = qb.w();
+      cur_base_pub_->publish(base);
+    }
     if (!q.has_value()) {return;}
     Vec3 r0e;
-    armKinematics(*q, vehicle_->params, nullptr, &r0e, nullptr);
+    Mat3 re;
+    armKinematics(*q, vehicle_->params, nullptr, &r0e, &re);
     const Vec3 v = vehicle_->r_model * r0e;
-    const auto stamp = now();
     PoseStamped body;
     body.header.stamp = stamp;
     body.header.frame_id = "drone_body";
@@ -755,7 +885,7 @@ private:
     body.pose.position.z = v(2);
     body.pose.orientation.w = 1.0;
     cur_ee_body_pub_->publish(body);
-    if (!have_odom || age > kOdomFreshS) {
+    if (!odom_fresh) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
         "current_ee (world) withheld -- odometry absent or stale; current_ee_body still streams.");
@@ -775,8 +905,27 @@ private:
     world.pose.position.x = p(0);
     world.pose.position.y = p(1);
     world.pose.position.z = p(2);
-    world.pose.orientation.w = 1.0;
+    // The MEASURED end-effector frame, in the same convention as the
+    // reference_pose (x = claw axis, z = gripper up), so the arm ground
+    // station can draw "EE (FK)" beside the mocap marker's "EE (Meas)" and
+    // the offset between them reads as the constant it is.
+    eeFrameQuat(r0 * vehicle_->r_model, re, &world.pose.orientation);
     cur_ee_pub_->publish(world);
+
+    // The measured arm as world points [base origin, joint 2, joint 3,
+    // joint 4, grasp point] (15 doubles), on the same sample.
+    std::array<Vec3, 5> pts;
+    armChainPoints(*q, vehicle_->params, &pts);
+    const Mat3 r0m = r0 * vehicle_->r_model;
+    Float64MultiArray sk;
+    sk.data.reserve(15);
+    for (const Vec3 & pt : pts) {
+      const Vec3 w = x_b + r0m * pt;
+      sk.data.push_back(w(0));
+      sk.data.push_back(w(1));
+      sk.data.push_back(w(2));
+    }
+    skeleton_pub_->publish(sk);
   }
 
   // -------------------------------------------------------------- planning
@@ -843,7 +992,7 @@ private:
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !hold_.has_value()) {return;}
-      if (state_ == "EXECUTING") {return;}
+      if (state_ == "EXECUTING" || teleopActive()) {return;}
       // any other target supersedes a pick-and-place leg still planning
       pp_flying_.reset();
       pp_exec_plan_.reset();
@@ -894,8 +1043,7 @@ private:
               auto_send_ = false;
               goal_override_.reset();
               exec_t0_ = Clock::now();
-              exec_pause_t_.reset();
-              state_ = "EXECUTING";
+                    state_ = "EXECUTING";
               RCLCPP_INFO(
                 get_logger(), "planned: %s -- executing now (go to start).",
                 traj->diag().summary.c_str());
@@ -921,7 +1069,6 @@ private:
         return;
       }
       exec_t0_ = Clock::now();
-      exec_pause_t_.reset();
       state_ = "EXECUTING";
       T = plan_->duration();
     }
@@ -949,6 +1096,11 @@ private:
         resp->message = "executing -- wait for the transition to finish";
         return;
       }
+      if (teleopActive()) {
+        resp->success = false;
+        resp->message = "PS4 teleoperation engaged -- use PS/Home (teleop/arm_home)";
+        return;
+      }
       home_goal_ = true;
       ee_target_.reset();
     }
@@ -969,6 +1121,11 @@ private:
         resp->message = "executing -- cannot clear mid-transition (revert to SAFETY to abort)";
         return;
       }
+      if (teleopActive()) {
+        resp->success = false;
+        resp->message = "PS4 teleoperation engaged -- disengage it first";
+        return;
+      }
       pending_base_.reset();
       ee_target_.reset();
       home_goal_ = false;
@@ -986,11 +1143,331 @@ private:
     resp->message = "targets cleared, holding";
   }
 
+  // ===================================================== PS4 teleoperation
+  bool teleopActive() const {return state_ == "TELEOP" || state_ == "TELEOP_STOP";}
+
+  TeleopOptions teleopOptions() const
+  {
+    const double d2r = M_PI / 180.0;
+    TeleopOptions o;
+    // Rates are live (the arm station edits them in flight): never negative.
+    auto rate = [this](const char * n) {return std::max(0.0, get_parameter(n).as_double());};
+    o.com_speed_xy = rate("teleop_com_speed_xy");
+    o.com_speed_z = rate("teleop_com_speed_z");
+    o.yaw_rate = rate("teleop_yaw_rate_deg") * d2r;
+    o.ee_speed = rate("teleop_ee_speed");
+    o.roll_rate = rate("teleop_roll_rate_deg") * d2r;
+    o.home_rate = std::max(0.01, rate("teleop_home_rate_deg")) * d2r;
+    o.com_bandwidth = get_parameter("teleop_com_bandwidth").as_double();
+    o.yaw_bandwidth = get_parameter("teleop_yaw_bandwidth").as_double();
+    o.arm_bandwidth = get_parameter("teleop_arm_bandwidth").as_double();
+    o.box_half_xy = get_parameter("teleop_box_half_xy").as_double();
+    o.com_z_min = get_parameter("teleop_com_z_min").as_double();
+    o.com_z_max = get_parameter("teleop_com_z_max").as_double();
+    o.ee_z_min = get_parameter("teleop_ee_z_min").as_double();
+    o.leash = get_parameter("teleop_leash_m").as_double();
+    o.joint_range_frac = get_parameter("teleop_joint_range_frac").as_double();
+    const auto hp = get_parameter("teleop_home_pose_deg").as_double_array();
+    if (hp.size() == static_cast<size_t>(kNumJoints)) {
+      for (int j = 0; j < kNumJoints; ++j) {o.home(j) = hp[static_cast<size_t>(j)] * d2r;}
+    }
+    o.q3_min = get_parameter("teleop_q3_min_deg").as_double() * d2r;
+    return o;
+  }
+
+  void onJoy(const Joy & m)
+  {
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    joy_ = m;
+    joy_time_ = Clock::now();
+  }
+
+  bool joyFresh() const
+  {
+    return joy_.has_value() &&
+           secondsSince(joy_time_) <= get_parameter("teleop_joy_timeout_s").as_double();
+  }
+
+  // The pad as operator input (under the lock). A stale feed reads all zero:
+  // a velocity must never be latched the way a position setpoint is.
+  TeleopInput joyInput(bool * neutral)
+  {
+    TeleopInput in;
+    // Only a FRESH pad reading all-centred counts as neutral: a silent feed
+    // reads zero input but must never arm the inputs.
+    *neutral = false;
+    if (!joyFresh()) {
+      home_prev_ = false;
+      return in;
+    }
+    const Joy & m = *joy_;
+    const double dz = get_parameter("teleop_stick_deadzone").as_double();
+    auto axis = [&](int i) {
+        const int64_t idx = teleop_axes_[static_cast<size_t>(i)];
+        double v = (idx >= 0 && static_cast<size_t>(idx) < m.axes.size())
+          ? static_cast<double>(m.axes[static_cast<size_t>(idx)]) : 0.0;
+        v *= teleop_axis_signs_[static_cast<size_t>(i)];
+        if (std::abs(v) < dz) {return 0.0;}
+        return std::copysign(std::min(1.0, (std::abs(v) - dz) / (1.0 - dz)), v);
+      };
+    auto button = [&](int i) {
+        const int64_t idx = teleop_buttons_[static_cast<size_t>(i)];
+        return idx >= 0 && static_cast<size_t>(idx) < m.buttons.size() &&
+               m.buttons[static_cast<size_t>(idx)] != 0;
+      };
+    // Sticks: the grasp point relative to the airframe + the wrist roll.
+    in.ee = Vec3{axis(0), axis(1), axis(2)};
+    in.roll = axis(3);
+    // D-pad (a hat: exactly -1/0/+1): UP = forward, LEFT = left. A diagonal
+    // is normalised so it is not sqrt(2) faster than a straight press.
+    in.com(0) = axis(5);
+    in.com(1) = axis(4);
+    const double n = std::hypot(in.com(0), in.com(1));
+    if (n > 1.0) {in.com(0) /= n; in.com(1) /= n;}
+    // Action buttons: triangle up / cross down, square yaw left / circle right.
+    in.com(2) = (button(0) ? 1.0 : 0.0) - (button(1) ? 1.0 : 0.0);
+    in.yaw = (button(2) ? 1.0 : 0.0) - (button(3) ? 1.0 : 0.0);
+    const bool home_now = button(4);
+    in.home = home_now && !home_prev_;
+    home_prev_ = home_now;
+    *neutral = in.ee.cwiseAbs().maxCoeff() == 0.0 && in.roll == 0.0 &&
+      in.com.cwiseAbs().maxCoeff() == 0.0 && in.yaw == 0.0 && !home_now;
+    return in;
+  }
+
+  // Measured SYSTEM CoM (fresh odometry + attitude + encoders), for the leash.
+  std::optional<Vec3> measuredCom()
+  {
+    Vec3 x_b;
+    Mat3 r0;
+    if (!odomPair(&x_b, &r0) || odomAge() > kOdomFreshS || !q_meas_.has_value()) {
+      return std::nullopt;
+    }
+    Vec3 r0c;
+    armKinematics(*q_meas_, vehicle_->params, &r0c, nullptr, nullptr);
+    return x_b + r0 * vehicle_->r_model * r0c;
+  }
+
+  // One teleop sample (under the lock). Sets *done when a stop has settled
+  // and the final rest became the HOLD.
+  WbReference teleopTick(bool * done)
+  {
+    const auto now = Clock::now();
+    double dt = teleop_last_tick_.has_value()
+      ? std::chrono::duration<double>(now - *teleop_last_tick_).count() : 1.0 / stream_rate_;
+    teleop_last_tick_ = now;
+    dt = std::min(std::max(dt, 0.0), 0.05);
+    const double s = std::min(1.0, std::max(0.05, get_parameter("teleop_time_scale").as_double()));
+
+    bool neutral = false;
+    TeleopInput in = joyInput(&neutral);
+    if (teleop_armed_ && !joyFresh()) {
+      // The pad went quiet: inputs already read zero; disarm too, so a button
+      // still held when the feed returns cannot resume a motion by itself.
+      teleop_armed_ = false;
+      RCLCPP_WARN(get_logger(), "PS4 teleoperation: pad feed lost -- holding; centre the pad to resume.");
+    }
+    if (state_ == "TELEOP") {
+      // Sticks count only after they have been seen at NEUTRAL since the
+      // engage: a pad held deflected at that moment must not move anything.
+      if (!teleop_armed_) {
+        if (neutral) {
+          teleop_armed_ = true;
+          RCLCPP_INFO(get_logger(), "PS4 teleoperation: pad at neutral -- inputs live.");
+        }
+        in = TeleopInput{};
+      }
+      if (teleop_home_request_) {
+        in.home = true;
+        teleop_home_request_ = false;
+      }
+    } else {
+      in = TeleopInput{};     // stopping: the smoothers settle on the targets
+    }
+    teleop_->setOptions(teleopOptions());
+    teleop_->step(dt * s, in, measuredCom());
+    WbReference ref;
+    try {
+      ref = teleop_->reference(s);
+      teleop_last_ref_ = ref;
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(get_logger(), "PS4 teleoperation stopped: reference failed (%s).", e.what());
+      ref = teleop_last_ref_.value_or(*hold_ref_);
+      setHold(teleop_->targetRest());
+      teleop_.reset();
+      state_ = "HOLD";
+      *done = true;
+      return ref;
+    }
+    const std::string wall = teleop_->status().wall;
+    if (wall != teleop_note_) {
+      teleop_note_ = wall;
+      publishTeleopNote(wall);
+    }
+    if (state_ == "TELEOP_STOP" && teleop_->settled()) {
+      setHold(teleop_->targetRest());
+      teleop_.reset();
+      state_ = "HOLD";
+      logHold("PS4 teleoperation ended");
+      *done = true;
+    }
+    return ref;
+  }
+
+  void onTeleopEngage(bool on, SetBool::Response::SharedPtr resp)
+  {
+    bool engaged_now = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (on) {
+        if (!mode_direct_ || !hold_.has_value() || !hold_ref_.has_value()) {
+          resp->success = false;
+          resp->message = "not in whole-body DIRECT";
+          return;
+        }
+        if (state_ == "TELEOP") {
+          resp->success = true;
+          resp->message = "already engaged";
+          return;
+        }
+        if (state_ == "EXECUTING" || state_ == "CALCULATING") {
+          resp->success = false;
+          resp->message = "planner is " + state_ + " -- wait for HOLD";
+          return;
+        }
+        if (state_ == "TELEOP_STOP" && teleop_) {
+          // re-engaged while settling: carry on from the same targets
+          state_ = "TELEOP";
+        } else {
+          teleop_ = std::make_unique<TeleopReference>(vehicle_, teleopOptions());
+          // Seeded on the HOLD being streamed, so the first sample IS it.
+          teleop_->seed(hold_ref_->x_cd, hold_->phi, hold_->q);
+          pending_base_.reset();
+          ee_target_.reset();
+          home_goal_ = false;
+          plan_.reset();
+          ++plan_gen_;
+          goal_override_.reset();
+          auto_send_ = false;
+          teleop_last_tick_.reset();
+          teleop_last_ref_.reset();
+          state_ = "TELEOP";
+        }
+        teleop_armed_ = false;
+        teleop_home_request_ = false;
+        home_prev_ = true;           // a PS button held at engage does not fire
+        engaged_now = true;
+        std::ostringstream m;
+        m.setf(std::ios::fixed);
+        m.precision(2);
+        m << "PS4 teleoperation engaged (time scale "
+          << get_parameter("teleop_time_scale").as_double()
+          << ") -- centre the pad to make it live";
+        resp->success = true;
+        resp->message = m.str();
+      } else {
+        if (state_ == "TELEOP") {
+          state_ = "TELEOP_STOP";
+          resp->message = "stopping: settling on the last targets, then HOLD";
+        } else if (state_ == "TELEOP_STOP") {
+          resp->message = "already stopping";
+        } else {
+          resp->message = "not engaged";
+        }
+        resp->success = true;
+      }
+    }
+    RCLCPP_INFO(get_logger(), "teleop/engage(%s): %s", on ? "true" : "false", resp->message.c_str());
+    publishStatus();
+    if (engaged_now) {
+      publishBaseAnchor();
+      publishVizPath(nullptr);
+    }
+  }
+
+  void onTeleopHome(Trigger::Response::SharedPtr resp)
+  {
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    if (state_ != "TELEOP") {
+      resp->success = false;
+      resp->message = "PS4 teleoperation is not engaged";
+      return;
+    }
+    teleop_home_request_ = true;
+    resp->success = true;
+    resp->message = "arm folding home (platform held)";
+  }
+
+  void publishTeleopNote(const std::string & s)
+  {
+    String m;
+    m.data = s;
+    teleop_note_pub_->publish(m);
+  }
+
+  // [0] 1 engaged / 2 stopping   [1..3] CoM target   [4] base yaw target
+  // (ACTUAL)   [5..7] base target position   [8..10] grasp-point target
+  // [11..14] its quaternion (x = claw axis, same convention as current_ee)
+  // [15..18] joint targets (model, rad)   [19..21] grasp point vs airframe,
+  // ACTUAL body frame (fwd, left, up)   [22] CoM steps refused (bits x/y/z)
+  // [23] arm steps refused (bits fwd/left/up/roll)   [24] leash   [25] homing
+  // [26] sigma_nd   [27..31] rates: CoM xy, CoM z [m/s], yaw [deg/s], EE
+  // [m/s], roll [deg/s]   [32] time scale   [33] pad fresh   [34] inputs live
+  // Empty = not engaged.
+  void publishTeleopState()
+  {
+    Float64MultiArray m;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!teleop_) {
+        if (teleop_state_cleared_) {return;}
+        teleop_state_cleared_ = true;
+      } else {
+        teleop_state_cleared_ = false;
+        const TeleopStatus & st = teleop_->status();
+        const TeleopOptions & o = teleop_->options();
+        const RestSpec r = teleop_->targetRest();
+        Vec3 pe;
+        Mat3 R0, Re;
+        teleop_->targetEe(&pe, &R0, &Re);
+        geometry_msgs::msg::Quaternion qe;
+        eeFrameQuat(R0, Re, &qe);
+        const Vec3 & c = teleop_->comTarget();
+        const VecN & q = teleop_->qTarget();
+        const Vec3 s_act = vehicle_->r_model * teleop_->sTarget();
+        m.data = {
+          state_ == "TELEOP" ? 1.0 : 2.0,
+          c(0), c(1), c(2), wrapPi(r.phi + 0.5 * M_PI),
+          r.x_b(0), r.x_b(1), r.x_b(2),
+          pe(0), pe(1), pe(2), qe.x, qe.y, qe.z, qe.w,
+          q(0), q(1), q(2), q(3),
+          s_act(0), s_act(1), s_act(2),
+          static_cast<double>(st.com_blocked), static_cast<double>(st.arm_blocked),
+          st.leash_active ? 1.0 : 0.0, st.homing ? 1.0 : 0.0,
+          st.sigma_nd,
+          o.com_speed_xy, o.com_speed_z, o.yaw_rate * 180.0 / M_PI, o.ee_speed,
+          o.roll_rate * 180.0 / M_PI,
+          get_parameter("teleop_time_scale").as_double(),
+          joyFresh() ? 1.0 : 0.0, teleop_armed_ ? 1.0 : 0.0};
+        // [35..38] / [39..42]: the pad's inner joint box, lower / upper [rad]
+        for (int k = 0; k < 2; ++k) {
+          for (int j = 0; j < kNumJoints; ++j) {
+            double lo, hi;
+            teleop_->jointBox(j, &lo, &hi);
+            m.data.push_back(k == 0 ? lo : hi);
+          }
+        }
+      }
+    }
+    teleop_state_pub_->publish(m);
+  }
+
   // ------------------------------------------------------------- streaming
   void streamTick()
   {
     WbReference ref;
     bool finished = false;
+    bool teleop_done = false;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_) {return;}
@@ -1002,9 +1479,7 @@ private:
       }
       bool have_ref = false;
       if (state_ == "EXECUTING" && plan_) {
-        const double t = exec_pause_t_.has_value()
-          ? *exec_pause_t_
-          : std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
+        const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
         if (t >= plan_->duration()) {
           finished = true;
         } else {
@@ -1024,9 +1499,12 @@ private:
         pending_base_.reset();
         ee_target_.reset();
         home_goal_ = false;
-        exec_pause_t_.reset();
         state_ = "HOLD";
         logHold("transition complete");
+      }
+      if (!have_ref && teleopActive() && teleop_) {
+        ref = teleopTick(&teleop_done);
+        have_ref = true;
       }
       if (!have_ref) {
         if (hold_ee_world_ && state_ == "HOLD" && hold_anchor_.has_value()) {
@@ -1042,6 +1520,11 @@ private:
       publishPpStatus();
       publishPpInfo();
     }
+    if (teleop_done) {
+      publishStatus();
+      publishBaseAnchor();
+      publishTeleopNote("");
+    }
     publishRef(ref);
     // The arm reference, from the SAME sample the law gets, at the same rate.
     publishArmSync(ref.q_d, ref.qdot_d);
@@ -1050,6 +1533,7 @@ private:
       publishVizPose(&ref);
       publishEeRefPose(ref);
       publishEeDroneRefPose(ref);
+      publishTeleopState();
     }
     if (finished) {refreshEeAfterHold();}
   }
@@ -1435,6 +1919,11 @@ private:
         resp->message = "executing -- wait for the transition to finish";
         return;
       }
+      if (teleopActive()) {
+        resp->success = false;
+        resp->message = "PS4 teleoperation engaged -- disengage it first";
+        return;
+      }
       goal_override_ = ee_traj_->goalRest();
       auto_send_ = true;
       pending_base_.reset();
@@ -1512,7 +2001,6 @@ private:
       auto_send_ = false;
       ++plan_gen_;
       exec_t0_ = Clock::now();
-      exec_pause_t_.reset();
       state_ = "EXECUTING";
       T = plan_->duration();
     }
@@ -1527,66 +2015,6 @@ private:
     RCLCPP_INFO(get_logger(), "%s", resp->message.c_str());
   }
 
-  // PAUSE / RESUME. The run's clock stops; the reference stays on the point
-  // of the planned run it had reached. Its velocity therefore STEPS to zero
-  // (and back on resume) -- the reference is no longer dynamically
-  // compatible across that instant, and the law absorbs the step. Sized for
-  // an operator stopping a slow EE run to look at something, not for an
-  // abort: to abort, revert to SAFETY.
-  void onEePause(Trigger::Response::SharedPtr resp)
-  {
-    double t = 0.0, T = 0.0;
-    {
-      std::lock_guard<std::recursive_mutex> lk(lock_);
-      if (state_ != "EXECUTING" || !plan_ || !exec_t0_.has_value()) {
-        resp->success = false;
-        resp->message = "nothing is executing";
-        return;
-      }
-      if (exec_pause_t_.has_value()) {
-        resp->success = false;
-        resp->message = "already paused";
-        return;
-      }
-      t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
-      T = plan_->duration();
-      exec_pause_t_ = std::min(std::max(t, 0.0), T);
-    }
-    publishStatus();
-    std::ostringstream m;
-    m.setf(std::ios::fixed);
-    m.precision(1);
-    m << "paused at t = " << t << " / " << T << " s -- the reference is held on the run";
-    resp->success = true;
-    resp->message = m.str();
-    RCLCPP_INFO(get_logger(), "EE trajectory: %s", resp->message.c_str());
-  }
-
-  void onEeResume(Trigger::Response::SharedPtr resp)
-  {
-    double t = 0.0;
-    {
-      std::lock_guard<std::recursive_mutex> lk(lock_);
-      if (!exec_pause_t_.has_value()) {
-        resp->success = false;
-        resp->message = "not paused";
-        return;
-      }
-      t = *exec_pause_t_;
-      // rewind the clock's origin so the run continues from where it froze
-      exec_t0_ = Clock::now() - std::chrono::duration_cast<Clock::duration>(
-        std::chrono::duration<double>(t));
-      exec_pause_t_.reset();
-    }
-    publishStatus();
-    std::ostringstream m;
-    m.setf(std::ios::fixed);
-    m.precision(1);
-    m << "resumed from t = " << t << " s";
-    resp->success = true;
-    resp->message = m.str();
-    RCLCPP_INFO(get_logger(), "EE trajectory: %s", resp->message.c_str());
-  }
 
   // BACK TO ORIGIN: the hover point [0, 0, z] with the arm folded home, z
   // being the drone GS's own commanded altitude (its last reference; the
@@ -1606,7 +2034,12 @@ private:
       }
       if (state_ == "EXECUTING") {
         resp->success = false;
-        resp->message = "executing -- wait for the run to finish (or pause it) first";
+        resp->message = "executing -- wait for the run to finish, or revert to SAFETY to abort";
+        return;
+      }
+      if (teleopActive()) {
+        resp->success = false;
+        resp->message = "PS4 teleoperation engaged -- disengage it first";
         return;
       }
       z = gs_ref_z_.value_or(hold_->x_b(2));
@@ -1685,7 +2118,10 @@ private:
       // [14] the drone GS's commanded altitude -- the height this run
       // inherits, and where Back To Origin returns to. NaN until the GS has
       // sent a setpoint in DIRECT.
-      gs_ref_z_.value_or(std::numeric_limits<double>::quiet_NaN())};
+      gs_ref_z_.value_or(std::numeric_limits<double>::quiet_NaN()),
+      // [15] run time at which the first lap ends: where a display cuts
+      // drone_path to draw one airframe loop (see EeTrajectoryDiag).
+      d.t_lap_end};
     ee_info_pub_->publish(m);
   }
 
@@ -2093,6 +2529,11 @@ private:
         resp->message = "not in whole-body DIRECT (the first leg is planned from the hold)";
         return;
       }
+      if (teleopActive()) {
+        resp->success = false;
+        resp->message = "PS4 teleoperation engaged -- disengage it first";
+        return;
+      }
       if (pp_flying_.has_value() || state_ == "EXECUTING") {
         // the first leg is dry-run from the hold, which an execution is
         // about to replace
@@ -2169,6 +2610,8 @@ private:
         err = "the mission is still planning";
       } else if (!pp_wp_.has_value()) {
         err = "not planned -- capture the pick / place points and press Plan";
+      } else if (teleopActive()) {
+        err = "PS4 teleoperation engaged -- disengage it first";
       } else if (state_ == "EXECUTING" || state_ == "CALCULATING") {
         err = "planner is " + state_ + " -- wait for HOLD";
       } else if (leg > pp_completed_ + 1) {
@@ -2191,7 +2634,6 @@ private:
       pending_base_.reset();
       ee_target_.reset();
       home_goal_ = false;
-      exec_pause_t_.reset();
       pp_flying_ = leg;
       pp_exec_plan_.reset();
       pp_error_.clear();
@@ -2221,7 +2663,6 @@ private:
             plan_ = traj;
             pp_exec_plan_ = traj;
             exec_t0_ = Clock::now();
-            exec_pause_t_.reset();
             state_ = "EXECUTING";
             RCLCPP_INFO(
               get_logger(), "pick-and-place %s: executing -- %s", pickPlaceLegName(leg),
@@ -2409,10 +2850,7 @@ private:
       } else if (state_ == "INFEASIBLE") {
         s = "INFEASIBLE: " + infeasible_reason_;
       } else if (state_ == "EXECUTING" && plan_) {
-        // A SUFFIX, never a new state word: every consumer of this topic
-        // tests the first token, and a pause is still an execution.
         m << "EXECUTING T=" << plan_->duration() << "s";
-        if (exec_pause_t_.has_value()) {m << " PAUSED t=" << *exec_pause_t_ << "s";}
         s = m.str();
       }
     }
@@ -2469,7 +2907,8 @@ private:
   // locked sections (the infeasible branch publishes under the lock).
   std::recursive_mutex lock_;
   bool mode_direct_{false};
-  std::string state_{"IDLE"};  // IDLE HOLD PENDING CALCULATING PLANNED INFEASIBLE EXECUTING
+  // IDLE HOLD PENDING CALCULATING PLANNED INFEASIBLE EXECUTING TELEOP TELEOP_STOP
+  std::string state_{"IDLE"};
   std::optional<RestSpec> hold_;
   std::optional<WbReference> hold_ref_;
   std::optional<std::pair<Vec3, double>> hold_anchor_;  // (p_e_world, model az)
@@ -2482,12 +2921,6 @@ private:
   bool home_goal_{false};
   std::shared_ptr<Trajectory> plan_;
   std::optional<Clock::time_point> exec_t0_;
-  // EE-trajectory PAUSE: the elapsed time the run is frozen at. While it is
-  // set the stream keeps publishing plan_->eval(*exec_pause_t_), so the law
-  // holds a reference that is STILL a point of the planned run rather than a
-  // new hold -- resume is exact, at the cost of a step to zero in the
-  // reference's velocity at the instant it is pressed.
-  std::optional<double> exec_pause_t_;
   unsigned plan_gen_{0};
   std::string infeasible_reason_;
   std::optional<Clock::time_point> last_base_resolve_;
@@ -2523,6 +2956,19 @@ private:
   int pp_err_leg_{-1};
   unsigned pp_gen_{0};
   std::thread pp_worker_;
+  // PS4 teleoperation
+  std::unique_ptr<TeleopReference> teleop_;
+  std::optional<Clock::time_point> teleop_last_tick_;
+  std::optional<WbReference> teleop_last_ref_;
+  bool teleop_armed_{false};
+  bool teleop_home_request_{false};
+  bool home_prev_{false};
+  std::string teleop_note_;
+  bool teleop_state_cleared_{false};
+  std::optional<Joy> joy_;
+  std::optional<Clock::time_point> joy_time_;
+  std::vector<int64_t> teleop_axes_, teleop_buttons_;
+  std::vector<double> teleop_axis_signs_;
 
   // ---- live samples --------------------------------------------------------
   std::optional<Vec3> odom_p_;
@@ -2538,7 +2984,8 @@ private:
   // ---- ROS ------------------------------------------------------------------
   rclcpp::Publisher<WholeBodyReference>::SharedPtr ref_pub_;
   rclcpp::Publisher<String>::SharedPtr status_pub_;
-  rclcpp::Publisher<PoseStamped>::SharedPtr base_pub_, cur_ee_pub_, cur_ee_body_pub_;
+  rclcpp::Publisher<PoseStamped>::SharedPtr base_pub_, cur_ee_pub_, cur_ee_body_pub_,
+    cur_base_pub_;
   rclcpp::Publisher<Float64>::SharedPtr cur_ee_heading_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr joints_pub_, ws_pub_, viz_path_pub_, viz_pose_pub_;
   rclcpp::Publisher<JointTrajectory>::SharedPtr arm_ref_pub_;
@@ -2558,7 +3005,7 @@ private:
   rclcpp::Subscription<String>::SharedPtr ee_select_sub_;
   rclcpp::Subscription<Float64>::SharedPtr ee_scale_sub_;
   rclcpp::Service<Trigger>::SharedPtr ee_go_srv_, ee_start_srv_;
-  rclcpp::Service<Trigger>::SharedPtr ee_pause_srv_, ee_resume_srv_, ee_origin_srv_;
+  rclcpp::Service<Trigger>::SharedPtr ee_origin_srv_;
   rclcpp::TimerBase::SharedPtr ee_err_timer_;
   rclcpp::Publisher<String>::SharedPtr pp_status_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr pp_info_pub_, pp_path_pub_, pp_drone_path_pub_;
@@ -2566,6 +3013,11 @@ private:
   std::vector<rclcpp::Service<Trigger>::SharedPtr> pp_srvs_;
   std::vector<rclcpp::Subscription<Mocap>::SharedPtr> pp_mocap_subs_;
   rclcpp::TimerBase::SharedPtr pp_timer_;
+  rclcpp::Subscription<Joy>::SharedPtr joy_sub_;
+  rclcpp::Service<SetBool>::SharedPtr teleop_engage_srv_;
+  rclcpp::Service<Trigger>::SharedPtr teleop_home_srv_;
+  rclcpp::Publisher<Float64MultiArray>::SharedPtr teleop_state_pub_, skeleton_pub_;
+  rclcpp::Publisher<String>::SharedPtr teleop_note_pub_;
 };
 
 }  // namespace fsc_trajectory_planner

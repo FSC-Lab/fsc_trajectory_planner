@@ -58,7 +58,7 @@
     ee_traj_time_scale: 1.0         # the default request; the GS slider overrides
     ee_traj_start_pos_tol: 0.05     # Start button gate: [m], [deg], [deg]
     ee_traj_start_yaw_tol_deg: 5.0
-    ee_traj_start_joint_tol_deg: 3.0
+    ee_traj_start_joint_tol_deg: 5.0
 
     # --- pick-and-place mode (arm GS "Pick & Place" tab) ----------------
     # Six legs, one button each: go_to_start -> execute_pick ->

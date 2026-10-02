@@ -21,6 +21,19 @@ FSC_PICK_PLACE_PLACE_TOPIC, so a stack script that launches this file without
 knowing about them can still be redirected -- the Isaac pick-and-place cycle
 does that, because the emulator publishes a phantom obj_0 at the origin when
 no gripper marker cube is spawned.
+
+`mode_topic:=` and `arm_reference_topic:=` (2026-09-26) override the two
+topics that differ between the WHOLE-BODY and the DECOUPLED flight stacks --
+which flight node's /mode this planner follows, and which arm controller's
+reference_joint_trajectory receives the joint half of the plan -- so ONE yaml
+section (the whole-body flight yaml's) serves both rigs from this launch file:
+    mode_topic:=fsc_autopilot_ros2/geometric_l1_direct_actuation/mode \
+    arm_reference_topic:=fsc_open_manipulator/position_controller/reference_joint_trajectory
+Empty (the default) leaves the yaml's whole-body wiring alone.
+
+`ee_traj_start_pos_tol:=` (2026-09-29) overrides the Start gate's position
+tolerance [m] the same way: the decoupled stack passes 0.30 (its airframe
+tracking is looser), the whole-body stack keeps the yaml's 0.05.
 """
 import os
 
@@ -52,6 +65,12 @@ def _launch_node(context):
     for key in ("pick_place_pick_topic", "pick_place_place_topic"):
         if arg(key):
             overrides[key] = arg(key)
+    if arg("mode_topic"):
+        overrides["mode_topic"] = arg("mode_topic")
+    if arg("arm_reference_topic"):
+        overrides["arm_reference_topic"] = arg("arm_reference_topic")
+    if arg("ee_traj_start_pos_tol"):
+        overrides["ee_traj_start_pos_tol"] = float(arg("ee_traj_start_pos_tol"))
     if overrides:
         params.append(overrides)
     return [Node(
@@ -91,5 +110,18 @@ def generate_launch_description():
             "pick_place_place_topic",
             default_value=EnvironmentVariable("FSC_PICK_PLACE_PLACE_TOPIC", default_value=""),
             description="override the place point's mocap topic (env FSC_PICK_PLACE_PLACE_TOPIC)"),
+        DeclareLaunchArgument("mode_topic", default_value="",
+                              description="override mode_topic (the flight node's /mode "
+                                          "this planner follows; the decoupled stack passes "
+                                          "fsc_autopilot_ros2/geometric_l1_direct_actuation/mode)"),
+        DeclareLaunchArgument("arm_reference_topic", default_value="",
+                              description="override arm_reference_topic (the arm controller's "
+                                          "reference_joint_trajectory; the decoupled stack passes "
+                                          "fsc_open_manipulator/position_controller/"
+                                          "reference_joint_trajectory)"),
+        DeclareLaunchArgument("ee_traj_start_pos_tol", default_value="",
+                              description="override the EE-trajectory Start gate's "
+                                          "position tolerance [m] (the decoupled stack "
+                                          "passes 0.30; empty keeps the yaml's)"),
         OpaqueFunction(function=_launch_node),
     ])

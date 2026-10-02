@@ -149,7 +149,7 @@ ros2 launch fsc_trajectory_planner whole_body_trajectory_planner_launch.py uav_p
 | | name (under `/<uav_prefix>/`) |
 |---|---|
 | subscribes | `fsc_autopilot_ros2/whole_body_direct_actuation/mode` (String, latched), `fsc_autopilot_ros2/position_controller/reference` (drone GS), `fmu/out/vehicle_attitude` (PX4, best-effort), `state_estimator/local_position/odom` (position ONLY), `fsc_open_manipulator/joint_states`, `whole_body_planner/ee_target` (arm GS) |
-| publishes | `fsc_autopilot_ros2/whole_body_direct_actuation/reference` (WholeBodyReference, 100 Hz in DIRECT), `whole_body_planner/{status,pending_base,target_joints,workspace_rz,viz_path}` (latched), `whole_body_planner/{viz_pose,current_ee,current_ee_body}`, `whole_body_planner/current_ee_heading` (Float64, the measured claw heading in the ee_target yaw convention, 2026-10-01), `fsc_open_manipulator/external_torque_controller/reference_joint_trajectory` (the arm reference, same sample as the law's) |
+| publishes | `fsc_autopilot_ros2/whole_body_direct_actuation/reference` (WholeBodyReference, 100 Hz in DIRECT), `whole_body_planner/{status,pending_base,target_joints,workspace_rz,viz_path}` (latched), `whole_body_planner/{viz_pose,current_ee,current_ee_body,current_base}` (current_base = the MEASURED airframe current_ee is built from, same tick and gate — the arm GS's Drone triad), `whole_body_planner/current_ee_heading` (Float64, the measured claw heading in the ee_target yaw convention, 2026-10-01), `fsc_open_manipulator/external_torque_controller/reference_joint_trajectory` (the arm reference, same sample as the law's) |
 | services | `whole_body_planner/{send,clear,go_home}` (std_srvs/Trigger) |
 
 The `whole_body_planner/` prefix is the `topic_prefix` parameter; it is kept
