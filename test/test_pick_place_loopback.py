@@ -14,7 +14,8 @@ stops 0.10 m ABOVE its target and WAITS; the rig teleports onto that approach
 rest, and once the claw has been inside 50 mm for pick_place_settle_s the
 planner flies the vertical descent. Checked on the way: an Adjust larger than
 pick_place_adjust_max is refused, the base goals carry the offset, the claw
-ends ON the captured points with the arm in the pick pose, the wait does not
+ends ON the captured pick point and ON the typed place point (neither
+shifted by the offset) with the arm in the pick pose, the wait does not
 descend 80 mm off nor before the dwell, a wait that times out leaves the leg
 INCOMPLETE, a leg is refused while the body is off its hold, the arrival
 error gates "fine correction OK" at 50 mm, the retreat climbs before the
@@ -71,9 +72,11 @@ NOMINAL_LAND = np.array([-1.0, 0.0, 0.8])
 OBJ = np.array([1.0, 0.6, 0.70])
 DROP = np.array([0.6, -1.6, 0.70])
 LAND_MARK = np.array([-1.2, 0.3, 0.0])
-# the place point is TYPED IN (pick_place_place_point) and, like every other
-# room-frame point, shifted by the Adjust offset
-PLACE_GOAL = DROP + np.array([0.10, -0.05, 0.0])
+# the place point is TYPED IN (pick_place_place_point) and, unlike the base
+# poses, NOT shifted by the Adjust offset (2026-10-03: it is the place mark read
+# off mocap before the flight, already in the mocap frame). OFFSET is nonzero,
+# so the claw-on-PLACE_GOAL checks below fail if the shift ever comes back.
+PLACE_GOAL = DROP.copy()
 OFFSET = np.array([0.10, -0.05])
 
 

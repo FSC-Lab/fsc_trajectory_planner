@@ -454,8 +454,15 @@ nominal pose is shifted by -- the mocap centring changes between sessions.
 **Typed points (2026-10-02, user decision).** Only the PICK point is measured;
 start, place_start, land_start, land (`[x, y, z, yaw_deg]`) and the place
 point `pick_place_place_point` (`[x, y, z]`) are typed in -- the arm GS's
-Pick & Place tab writes these parameters live -- and are shifted by the Adjust
-offset like every room-frame point. An `add_on_set_parameters_callback` checks
+Pick & Place tab writes these parameters live. The four BASE poses are shifted
+by the Adjust offset; **the place point is NOT** (2026-10-03, user decision,
+same on hardware and in Isaac): it is the place mark read off mocap BEFORE the
+flight -- the cap that carries the payload then covers the mark -- so it is
+already in the mocap frame, like the captured pick point, and Adjust (where the
+vehicle stands against the typed Start) says nothing about the table. Until
+then the typed place point WAS shifted, which in Isaac's deliberately
+off-mark spawn put the release 0.17 m off the 50 mm-radius pillar. An
+`add_on_set_parameters_callback` checks
 their sizes, refuses edits while a leg is in flight and any `*_topic` change
 (fixed at launch), and makes the plan STALE on every waypoint edit (status
 `NOT PLANNED: press Plan`). **Captures** (`pick_place/capture_<point>`, point =
@@ -527,7 +534,32 @@ current reference (phi from b1_d, q = q_d, x_b chosen so x_c is continuous:
 1.7 mm max CoM step in the loopback), a waiting leg cancelled; the cut leg
 does not count as done. The climb is clipped at the fence ceiling, so repeated
 presses never leave the volume (audit H3). A second press while aborting is
-refused.
+refused. **During PS4 teleop** (the Pick & Place PS4 fine correction
+included) the cut is taken at the reference teleop is streaming, not at the
+hold -- the hold is still the pose teleop started from, so cutting there
+stepped the reference back by however far the pad had moved the vehicle
+(2026-10-03, found merging this mode with main's teleop).
+
+**Teleop vs a waiting leg (2026-10-03).** `teleop/engage` is REFUSED while a
+claw leg waits above its target (the planner is in HOLD then): a teleop
+session would leave the vehicle elsewhere and the descent would then be
+planned from there. Let it descend (the fine correction comes after), or Abort.
+
+**Phase-dependent EE anchor** (`pick_place_world_anchor_pick` /
+`_place`, default false; `pick_place_anchor_service`, fixed at launch;
+2026-10-02 Isaac tuning, `fsc_PegasusSimulator/docs/docs_aerial_manipulator/
+archive/pick_place_tune_20261001`). From the moment a claw leg enters its WAIT
+above the target, the planner asks the whole-body node
+(`.../whole_body_direct_actuation/set_ee_anchor_com`, a SetBool, blended over
+the node's `wb_ee_anchor_blend_s`) to hold the claw in the WORLD through the
+wait, the descent and the grasp; the next request -- any leg, Abort, Reset, a
+wait timeout or refused descent, teleop, any other motion -- returns it to the
+law's CoM anchor, and a mode change clears it (the node restores its yaml
+anchor itself). Pick only in the Isaac config: the open jaws have millimetres
+around the handle and nothing is touched until they close; a world-held claw
+in CONTACT (a set-down box, a clamped payload still on its pillar) or in
+transit drives q1 to its stop. Once clamped, LIFT PROMPTLY: under either
+anchor the vehicle-payload-pillar chain drifts within ~1-3 s.
 
 **Gates (2026-10-02 audit).** H1 `Geofence` (`pick_place_fence_min_z` 0.6,
 `_max_z` 1.8, `_xy` [-2.5, 2.5, -2.5, 2.5], on the BODY origin): every goal and

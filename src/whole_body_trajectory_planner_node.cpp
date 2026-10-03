@@ -282,11 +282,14 @@ public:
     declare_parameter<std::vector<double>>("pick_place_place_pose_deg", std::vector<double>{0.0, 0.0, 0.0, 0.0});
     declare_parameter<std::vector<double>>(
       "pick_place_carry_pose_deg", std::vector<double>{0.0, 40.0, 40.0, 0.0});
-    // The PLACE point (the claw's release point), typed in [x, y, z], world
-    // [m], shifted by the Adjust offset like every other room-frame point
-    // (2026-10-02, user decision: entered on the ground station, not
-    // measured). A mocap capture still wins when pick_place_place_topic names
-    // a body and capture_place was called.
+    // The PLACE point (the place mark; the claw releases at it +
+    // pick_place_place_ee_offset), typed in [x, y, z], world [m] (2026-10-02,
+    // user decision: entered on the ground station, not measured live). NOT
+    // shifted by the Adjust offset (2026-10-03, user decision): it is read off
+    // mocap before the flight -- the cap that carries the payload then covers
+    // the mark -- so it is already in the mocap frame, like the captured pick
+    // point. A mocap capture still wins when pick_place_place_topic names a
+    // body and capture_place was called.
     declare_parameter<std::vector<double>>("pick_place_place_point", std::vector<double>{0.6, -1.6, 0.66});
     // claw target = measured / typed point + offset, world [m]
     declare_parameter<std::vector<double>>("pick_place_pick_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
@@ -330,6 +333,23 @@ public:
     declare_parameter<double>("pick_place_approach_dz", 0.10);
     declare_parameter<double>("pick_place_approach_wait_max", 60.0);
     declare_parameter<double>("pick_place_settle_s", 1.0);
+    // PHASE-DEPENDENT EE ANCHOR (2026-10-02, Isaac pick_place_tune_20261001):
+    // hold the claw in the WORLD from the moment a claw leg reaches the point
+    // above its target -- the wait, the descent and the grasp that follows --
+    // and return to the law's own (CoM) anchor on the next request (any leg,
+    // Abort, Reset, a wait timeout, teleop, any other motion). Per leg: the
+    // PICK needs it (the open jaws have millimetres to spare around the
+    // handle, and nothing touches until they close); the PLACE should not
+    // (setting a payload down is a rigid contact a world-held claw fights).
+    // Between the clamp and the next request the vehicle is coupled to a
+    // payload resting on its table: LIFT PROMPTLY -- under either anchor that
+    // closed chain drifts within ~1 s. Calls the whole-body node's
+    // set_ee_anchor_com service; false = never call it. Needs
+    // pick_place_approach_dz > 0 (the wait is where it switches).
+    declare_parameter<bool>("pick_place_world_anchor_pick", false);
+    declare_parameter<bool>("pick_place_world_anchor_place", false);
+    declare_parameter<std::string>(
+      "pick_place_anchor_service", "fsc_autopilot_ros2/whole_body_direct_actuation/set_ee_anchor_com");
     // a leg starts only when the measured body is within this of its hold [m]
     declare_parameter<double>("pick_place_leg_start_tol", 0.15);
     // Adjust refuses an offset larger than this [m] (pressed off the start mark)
@@ -517,6 +537,7 @@ public:
     trigger(prefix + "/pick_place/plan", [this](Trigger::Response::SharedPtr r) {onPpPlan(r);});
     trigger(prefix + "/pick_place/reset", [this](Trigger::Response::SharedPtr r) {onPpReset(r);});
     trigger(prefix + "/pick_place/abort", [this](Trigger::Response::SharedPtr r) {onPpAbort(r);});
+    anchor_cli_ = create_client<SetBool>(get_parameter("pick_place_anchor_service").as_string());
     for (int k = 0; k < kNumPickPlaceLegs; ++k) {
       trigger(
         prefix + "/pick_place/" + pickPlaceLegName(k),
@@ -672,6 +693,7 @@ private:
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (direct == mode_direct_) {return;}
       mode_direct_ = direct;
+      pp_anchor_world_ = false;          // the whole-body node restores its yaml anchor itself
       if (direct) {
         const auto rest = restFromMeasurements();
         if (!rest.has_value()) {
@@ -1087,6 +1109,7 @@ private:
             if (auto_send_) {
               auto_send_ = false;
               goal_override_.reset();
+              restoreAnchor();                  // a non-claw motion: back to the CoM anchor
               exec_t0_ = Clock::now();
                     state_ = "EXECUTING";
               RCLCPP_INFO(
@@ -1113,6 +1136,7 @@ private:
         resp->message = "nothing to send (state " + state_ + "); assign a target and wait for PLANNED";
         return;
       }
+      restoreAnchor();                  // a non-claw motion: back to the CoM anchor
       exec_t0_ = Clock::now();
       state_ = "EXECUTING";
       T = plan_->duration();
@@ -1381,6 +1405,16 @@ private:
           resp->message = "planner is " + state_ + " -- wait for HOLD";
           return;
         }
+        if (pp_flying_.has_value()) {
+          // a claw leg WAITING above its target holds in HOLD: a teleop
+          // session now would leave the vehicle elsewhere and the descent
+          // would then be planned from there (the fine correction is after it)
+          resp->success = false;
+          resp->message = std::string(pickPlaceLegName(*pp_flying_)) +
+            " is waiting above its target -- let it descend, or Abort it";
+          return;
+        }
+        restoreAnchor();
         if (state_ == "TELEOP_STOP" && teleop_) {
           // re-engaged while settling: carry on from the same targets
           state_ = "TELEOP";
@@ -1553,6 +1587,13 @@ private:
             RCLCPP_INFO(
               get_logger(), "pick-and-place: %s above its target -- descending once the claw is "
               "within tolerance.", pickPlaceLegName(leg));
+            // from here through the descent and the grasp the claw is world-held
+            // (pick_place_world_anchor_*); the next request restores the CoM anchor
+            if ((leg == kExecutePick && get_parameter("pick_place_world_anchor_pick").as_bool()) ||
+              (leg == kExecutePlace && get_parameter("pick_place_world_anchor_place").as_bool()))
+            {
+              requestAnchor(false);
+            }
           } else {
             pp_completed_ = leg;
             pp_flying_.reset();
@@ -2072,6 +2113,7 @@ private:
       goal_override_.reset();
       auto_send_ = false;
       ++plan_gen_;
+      restoreAnchor();                  // a non-claw motion: back to the CoM anchor
       exec_t0_ = Clock::now();
       state_ = "EXECUTING";
       T = plan_->duration();
@@ -2341,7 +2383,7 @@ private:
   // ================================================= pick-and-place mode
   // Six legs (pick_place.hpp), each its own button. The goals come from the
   // nominal base poses (shifted by the Adjust offset) and the claw points
-  // captured from mocap; `plan` dry-runs the whole mission from the hold, and
+  // (pick captured, place typed; both mocap readings, not shifted); `plan` dry-runs the whole mission from the hold, and
   // each leg's service re-plans that leg from the CURRENT hold -- the vehicle
   // may have been nudged since (the PS4 fine correction) -- and executes it
   // as soon as it is planned. Legs are flown in order; any earlier leg may be
@@ -2427,8 +2469,9 @@ private:
   }
 
   // The goals' inputs: the nominal base poses + the Adjust offset (x, y from
-  // a mocap capture instead when one was taken) and the captured claw
-  // points. Called under the lock.
+  // a mocap capture instead when one was taken), the captured pick point and
+  // the typed (or captured) place point -- the two claw points are mocap
+  // readings and are never shifted. Called under the lock.
   bool ppTargets(PickPlaceTargets * t, std::string * err) const
   {
     BasePose * base[kNumPickPlaceLegs] = {
@@ -2445,9 +2488,13 @@ private:
         continue;
       }
       if (k == kExecutePlace && !pp_capture_[k].has_value()) {
-        // typed in: a room-frame point like the base poses, so it is shifted
+        // typed in, but NOT shifted (2026-10-03, user decision): the value is the
+        // place mark read off mocap in THIS session -- before the flight, since
+        // the cap that carries the payload then covers it -- so it is already in
+        // the mocap frame, exactly like the captured pick point. The Adjust
+        // offset is where the vehicle stands relative to the typed Start; it
+        // says nothing about where the table is.
         if (!ppVec3("pick_place_place_point", &t->place, err)) {return false;}
-        t->place += pp_offset_;
         continue;
       }
       if (!pp_capture_[k].has_value()) {
@@ -2477,6 +2524,11 @@ private:
         r.reason = n + " is fixed at launch (the mocap subscription is made then)";
         return r;
       }
+      if (n == "pick_place_anchor_service") {
+        r.successful = false;
+        r.reason = n + " is fixed at launch (the service client is made then)";
+        return r;
+      }
       const auto want = [&](size_t len) {
           if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
             p.as_double_array().size() != len)
@@ -2502,7 +2554,8 @@ private:
         n != "pick_place_capture_max_spread" && n != "pick_place_adjust_z" &&
         n != "pick_place_adjust_yaw" && n != "pick_place_settle_s" &&
         n != "pick_place_approach_wait_max" && n != "pick_place_leg_start_tol" &&
-        n != "pick_place_adjust_max" && n != "pick_place_abort_climb")
+        n != "pick_place_adjust_max" && n != "pick_place_abort_climb" &&
+        n != "pick_place_world_anchor_pick" && n != "pick_place_world_anchor_place")
       {
         stale = true;
       }
@@ -2663,7 +2716,7 @@ private:
       ppInvalidate();
       m << "offset [" << off(0) << ", " << off(1) << ", " << off(2) << "] m, yaw "
         << std::setprecision(1) << yoff * 180.0 / M_PI
-        << " deg -- every nominal point is shifted by it; press Plan";
+        << " deg -- the four drone points are shifted by it (not Place); press Plan";
     }
     resp->success = true;
     resp->message = m.str();
@@ -2818,6 +2871,7 @@ private:
       pp_error_.clear();
       pp_timed_out_ = false;
       pp_aborted_ = false;
+      restoreAnchor();
     }
     const bool from_table = pp_at_table_;
     publishStatus();
@@ -2891,9 +2945,21 @@ private:
         return;
       }
       from = *hold_;
+      std::optional<WbReference> cut_ref;
       if (state_ == "EXECUTING" && plan_ && exec_t0_.has_value()) {
         const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
-        const WbReference ref = plan_->eval(std::min(t, plan_->duration()));
+        cut_ref = plan_->eval(std::min(t, plan_->duration()));
+      } else if (teleopActive() && teleop_last_ref_.has_value()) {
+        // PS4 teleop (the Pick & Place PS4 fine correction included): hold_
+        // is still the pose teleop started from, so cut at the reference
+        // teleop is streaming, exactly as for a run -- else the reference
+        // would step back by however far the pad has moved the vehicle
+        cut_ref = *teleop_last_ref_;
+        teleop_.reset();
+        teleop_last_ref_.reset();
+      }
+      if (cut_ref.has_value()) {
+        const WbReference & ref = *cut_ref;
         from.phi = std::atan2(ref.b1_d(1), ref.b1_d(0));
         from.q = ref.q_d;
         Vec3 r0c;
@@ -2928,6 +2994,7 @@ private:
       pp_timed_out_ = false;
       pp_aborted_ = true;
       pp_aborting_ = true;
+      restoreAnchor();                  // the climb is a flight motion: CoM anchor
     }
     publishStatus();
     publishPpStatus();
@@ -2977,6 +3044,30 @@ private:
     RCLCPP_WARN(get_logger(), "pick-and-place: %s", resp->message.c_str());
   }
 
+  // Ask the whole-body node for the CoM (com = true) or world anchor. Fire and
+  // forget: the node blends over its own wb_ee_anchor_blend_s, refuses outside
+  // DIRECT, and restores its yaml anchor on every mode change by itself.
+  void requestAnchor(bool com)
+  {
+    pp_anchor_world_ = !com;
+    if (!anchor_cli_ || !anchor_cli_->service_is_ready()) {
+      RCLCPP_WARN(get_logger(), "EE-anchor service %s not available -- anchor unchanged",
+        anchor_cli_ ? anchor_cli_->get_service_name() : "?");
+      return;
+    }
+    auto req = std::make_shared<SetBool::Request>();
+    req->data = com;
+    anchor_cli_->async_send_request(req);
+    RCLCPP_INFO(get_logger(), "pick-and-place: EE anchor -> %s", com ? "CoM" : "WORLD");
+  }
+
+  // Any new motion that is not a claw leg's own wait / descent / grasp
+  // returns to the CoM anchor.
+  void restoreAnchor()
+  {
+    if (pp_anchor_world_) {requestAnchor(true);}
+  }
+
   void onPpReset(Trigger::Response::SharedPtr resp)
   {
     {
@@ -2990,6 +3081,7 @@ private:
       pp_aborted_ = false;
       pp_at_table_ = false;
       ppInvalidate();
+      restoreAnchor();
     }
     resp->success = true;
     resp->message = "pick-and-place progress and plan cleared (captures and the Adjust offset kept)";
@@ -3061,6 +3153,7 @@ private:
           pp_phase_ = kPpNone;
           gate_changed = true;
           timed_out = true;
+          restoreAnchor();              // hovering above the target, nothing touched
           RCLCPP_WARN(get_logger(), "pick-and-place %s", pp_error_.c_str());
         }
       }
@@ -3103,6 +3196,7 @@ private:
         pp_error_ = err;
         pp_flying_.reset();
         pp_phase_ = kPpNone;
+        restoreAnchor();
         return;
       }
       leg = *pp_flying_;
@@ -3137,6 +3231,7 @@ private:
             pp_error_ = err;
             pp_flying_.reset();
             pp_phase_ = kPpNone;
+            restoreAnchor();            // hovering above the target, nothing touched
             RCLCPP_WARN(get_logger(), "pick-and-place descent refused: %s", err.c_str());
           } else {
             plan_ = traj;
@@ -3414,6 +3509,9 @@ private:
   std::shared_ptr<Trajectory> pp_abort_plan_;   // the abort transition in flight
   bool pp_aborting_{false};                     // ... or being planned
   bool pp_aborted_{false};                      // until the next pick-and-place action
+  // phase-dependent EE anchor (pick_place_world_anchor_*)
+  rclcpp::Client<SetBool>::SharedPtr anchor_cli_;
+  bool pp_anchor_world_{false};                 // the whole-body node was asked for WORLD
   OnSetParametersCallbackHandle::SharedPtr pp_param_cb_;
 
   // ---- live samples --------------------------------------------------------

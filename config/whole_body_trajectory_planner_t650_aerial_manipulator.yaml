@@ -65,9 +65,11 @@
     # go_to_place_start -> execute_place -> go_to_land_start -> execute_land.
     # Base poses [x, y, z, yaw_deg], world frame, ACTUAL yaw, and the place
     # point: TYPED IN (the arm GS's Pick & Place tab writes them live; an edit
-    # makes the plan stale). All are shifted by the Adjust offset (vehicle on
-    # the start mark -> measured - nominal start). Only the PICK point is
-    # measured (mocap obj_0, the Get button).
+    # makes the plan stale). The four BASE poses are shifted by the Adjust
+    # offset (vehicle on the start mark -> measured - nominal start); the
+    # place point is NOT (2026-10-03): it is the place mark read off mocap
+    # before the flight, already in the mocap frame. Only the PICK point is
+    # measured live (mocap obj_0, the Get button); it is not shifted either.
     pick_place_start: [0.0, 0.0, 1.0, 0.0]
     pick_place_place_start: [0.0, -1.0, 1.0, 0.0]
     pick_place_land_start: [-1.0, 0.0, 1.0, 0.0]
@@ -77,7 +79,7 @@
     # oscillation, brushed the floor, saturated the allocator and tumbled on
     # the switch to SAFETY.
     pick_place_land: [-1.0, 0.0, 0.8, 0.0]
-    pick_place_place_point: [0.6, -1.6, 0.66]    # the claw's release point [x, y, z]
+    pick_place_place_point: [0.6, -1.6, 0.66]    # the place mark [x, y, z]; claw releases at + place_ee_offset
     # Arm poses [deg]. [0, 0, 0, 0] = upper arm straight down, forearm out
     # along the nose, claw straight down (grasp point 0.155 m ahead of and
     # 0.340 m below the body origin). It is the bottom of the arm's reach:
