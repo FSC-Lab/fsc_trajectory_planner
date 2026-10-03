@@ -63,11 +63,11 @@
     # --- pick-and-place mode (arm GS "Pick & Place" tab) ----------------
     # Six legs, one button each: go_to_start -> execute_pick ->
     # go_to_place_start -> execute_place -> go_to_land_start -> execute_land.
-    # Base poses [x, y, z, yaw_deg], world frame, ACTUAL yaw. PLACEHOLDERS:
-    # all four are shifted by the Adjust offset (vehicle on the start mark ->
-    # measured - nominal start), and any one can be measured from a mocap body
-    # instead (pick_place_<point>_topic + the capture_<point> service; x, y
-    # are measured, z and yaw stay these).
+    # Base poses [x, y, z, yaw_deg], world frame, ACTUAL yaw, and the place
+    # point: TYPED IN (the arm GS's Pick & Place tab writes them live; an edit
+    # makes the plan stale). All are shifted by the Adjust offset (vehicle on
+    # the start mark -> measured - nominal start). Only the PICK point is
+    # measured (mocap obj_0, the Get button).
     pick_place_start: [0.0, 0.0, 1.0, 0.0]
     pick_place_place_start: [0.0, -1.0, 1.0, 0.0]
     pick_place_land_start: [-1.0, 0.0, 1.0, 0.0]
@@ -77,6 +77,7 @@
     # oscillation, brushed the floor, saturated the allocator and tumbled on
     # the switch to SAFETY.
     pick_place_land: [-1.0, 0.0, 0.8, 0.0]
+    pick_place_place_point: [0.6, -1.6, 0.66]    # the claw's release point [x, y, z]
     # Arm poses [deg]. [0, 0, 0, 0] = upper arm straight down, forearm out
     # along the nose, claw straight down (grasp point 0.155 m ahead of and
     # 0.340 m below the body origin). It is the bottom of the arm's reach:
@@ -91,22 +92,42 @@
     pick_place_face_target: true       # turn the nose to the object over the leg
     pick_place_retreat_dz: 0.15        # before leaving a table: climb [m] ...
     pick_place_retreat_back: 0.20      # ... then back off along -nose [m]
+    # (a leg retreats whenever it starts from a table: after execute_pick /
+    # execute_place, whichever leg is flown next)
+    # execute_pick / execute_place fly to the point approach_dz ABOVE the
+    # target first, hold there until the claw has been inside arrival_tol for
+    # settle_s, then descend vertically onto it. 0 = straight onto the target.
+    pick_place_approach_dz: 0.10       # [m]
+    pick_place_approach_wait_max: 60.0 # no descent after this long: leg ends incomplete [s]
     # execute_place: the arm sweeps these bands [deg] on the way (lo == hi:
-    # not swept), `cycles` whole sweeps, at most sweep_qdot_max
-    pick_place_sweep_lo_deg: [-25.0, 10.0, 0.0, 0.0]
-    pick_place_sweep_hi_deg: [25.0, 45.0, 0.0, 0.0]
+    # not swept), `cycles` whole sweeps, at most sweep_qdot_max. +-10 deg
+    # (2026-10-02): +-25 deg tripped the 20 deg tilt watchdog in Isaac.
+    pick_place_sweep_lo_deg: [-10.0, 17.5, 0.0, 0.0]
+    pick_place_sweep_hi_deg: [10.0, 37.5, 0.0, 0.0]
     pick_place_sweep_phase_deg: [0.0, 90.0, 0.0, 0.0]
     pick_place_sweep_cycles: 2
     pick_place_sweep_ramp_frac: 0.2
     pick_place_sweep_qdot_max: 0.5     # [rad/s]
     pick_place_sweep_t_min: 8.0        # [s]
     pick_place_sweep_t_max: 120.0      # [s]
-    pick_place_arrival_tol: 0.05       # fine-correction gate on the claw error [m]
+    pick_place_arrival_tol: 0.05       # claw error gate: descent + fine correction [m]
+    pick_place_settle_s: 1.0           # ... held inside it this long first [s]
+    pick_place_leg_start_tol: 0.15     # a leg starts only with the body this close to its hold [m]
+    pick_place_abort_climb: 0.30       # ABORT: arm home, the vehicle this much higher [m]
+                                       # (clipped at fence_max_z)
+    pick_place_adjust_max: 0.5         # Adjust refuses a larger offset [m]
+    # Geofence on the BODY ORIGIN along every leg (goals, approach points and
+    # each planned path; world frame [m]). 0.6 m floor: the body stands at
+    # 0.305 m on its gear and the law swings +-0.1 m.
+    pick_place_fence_min_z: 0.6
+    pick_place_fence_max_z: 1.8
+    pick_place_fence_xy: [-2.5, 2.5, -2.5, 2.5]   # [x_min, x_max, y_min, y_max]
     pick_place_adjust_z: false         # Adjust shifts x, y only unless these are set
     pick_place_adjust_yaw: false
-    # mocap bodies (fsc_autopilot_ros2_msgs/Mocap, ABSOLUTE topics); "" = none
+    # mocap bodies (fsc_autopilot_ros2_msgs/Mocap, ABSOLUTE topics); "" = none.
+    # Fixed at launch. A place topic + capture_place overrides the typed point.
     pick_place_pick_topic: "/obj_0/mocap"
-    pick_place_place_topic: "/drop_0/mocap"
+    pick_place_place_topic: ""
     pick_place_start_topic: ""
     pick_place_place_start_topic: ""
     pick_place_land_start_topic: ""

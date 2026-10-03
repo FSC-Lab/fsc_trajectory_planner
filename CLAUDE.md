@@ -61,8 +61,9 @@ include/fsc_trajectory_planner/
   bspline_fit.hpp         clamped uniform B-spline with sparse least-squares fitting and pinned ends
   arm_sweep_planner.hpp   ArmSweepOptions / ArmSweepDiag / ArmSweepPlanner + nonicPhase: a rest-to-rest
                           leg with joints sweeping between limits (pick-and-place execute_place)
-  pick_place.hpp          PickPlaceLeg / PickPlaceConfig / PickPlaceTargets / PickPlaceWaypoints,
-                          pickPlaceWaypoints, retreatRest, planPickPlaceLeg, planPickPlaceMission
+  pick_place.hpp          PickPlaceLeg / Geofence / PickPlaceConfig / PickPlaceTargets / PickPlaceWaypoints,
+                          pickPlaceWaypoints, retreatRest, planPickPlaceLeg, planPickPlaceDescent,
+                          checkPathInFence, planPickPlaceMission
                           (the PICK-AND-PLACE mode, see its section)
   workspace.hpp           WorkspaceGrid / usableWorkspace: the (r, z) envelope published on workspace_rz
 src/
@@ -432,14 +433,16 @@ watch when the circle is moved away from the vehicle: §7.15.5 measures
 
 A third planning mode beside the transitions and the EE trajectories: SIX
 operator-triggered legs, each a compatible whole-body move that ends AT REST,
-one service (one GS button) per leg, flown in order:
+one service (one GS button) per leg, flown in order (any leg flown while the
+vehicle holds at a table -- after execute_pick / execute_place, whichever leg
+is next, a re-fly included -- retreats first):
 
 | # | service (`whole_body_planner/pick_place/...`) | goal |
 |---|---|---|
 | 0 | `go_to_start` | `pick_place_start` + Adjust offset, arm home |
-| 1 | `execute_pick` | claw ON the captured `obj_0` point (+ `pick_place_pick_ee_offset`), arm in `pick_place_pick_pose_deg`, nose turned to face it |
+| 1 | `execute_pick` | claw `approach_dz` ABOVE the captured `obj_0` point (+ `pick_place_pick_ee_offset`), arm in `pick_place_pick_pose_deg`, nose turned to face it; WAIT; then the vertical DESCENT onto the point |
 | 2 | `go_to_place_start` | RETREAT (climb `retreat_dz`, back off `retreat_back` along -nose), then `pick_place_place_start` + offset, arm in the carry pose |
-| 3 | `execute_place` | claw on the captured `drop_0` point, **the arm sweeping its bands on the way** (`ArmSweepPlanner`) |
+| 3 | `execute_place` | claw above the TYPED place point (`pick_place_place_point` + offset), **the arm sweeping its bands on the way** (`ArmSweepPlanner`); WAIT; DESCENT onto the point |
 | 4 | `go_to_land_start` | retreat, then `pick_place_land_start` + offset, arm home |
 | 5 | `execute_land` | `pick_place_land` + offset: the hover over the landing spot (0.8 m by default -- NOT lower, see the Isaac record below). The node never lands / arms / changes PX4 mode -- touchdown is the operator's SAFETY -> land |
 
@@ -448,12 +451,21 @@ PLACEHOLDERS in the yaml. **Adjust** (`pick_place/adjust`, works in SAFETY too):
 with the vehicle on the physical start mark, `measured - nominal start` (x, y;
 z / yaw only with `pick_place_adjust_z` / `_yaw`) becomes the offset every
 nominal pose is shifted by -- the mocap centring changes between sessions.
-**Captures** (`pick_place/capture_<point>`, point = start | pick | place_start |
-place | land_start | land): average the point's mocap body
+**Typed points (2026-10-02, user decision).** Only the PICK point is measured;
+start, place_start, land_start, land (`[x, y, z, yaw_deg]`) and the place
+point `pick_place_place_point` (`[x, y, z]`) are typed in -- the arm GS's
+Pick & Place tab writes these parameters live -- and are shifted by the Adjust
+offset like every room-frame point. An `add_on_set_parameters_callback` checks
+their sizes, refuses edits while a leg is in flight and any `*_topic` change
+(fixed at launch), and makes the plan STALE on every waypoint edit (status
+`NOT PLANNED: press Plan`). **Captures** (`pick_place/capture_<point>`, point =
+start | pick | place_start | place | land_start | land): average the point's mocap body
 (`pick_place_<point>_topic`, `fsc_autopilot_ros2_msgs/Mocap`, ABSOLUTE topic,
 SensorData QoS) over `pick_place_capture_window` (0.5 s). pick = `/obj_0/mocap`
-and place = `/drop_0/mocap` by default and are REQUIRED; the four base points
-have no topic yet (refused, the nominal pose is used) -- set one to measure
+is the only topic set by default (place too can be measured if
+`pick_place_place_topic` is set at launch and `capture_place` called; a capture
+wins over the typed point); the base points have no topic (refused, the typed
+pose is used) -- set one to measure
 that pose's x, y from a marker (z and yaw stay nominal, no offset applied).
 Mocap and odometry share the ENU world frame (the indoor bridge passes mocap
 through); an EKF2-fused stack must keep its local origin on the mocap origin.
@@ -485,26 +497,70 @@ closed form -- x_c and psi on a NONIC phase (rest through snap: a septic one
 steps snap, i.e. the body-torque reference, at the joins), q = (1 - w) q_lin +
 w (c + a sin(omega (t - r) + phase)) for swept joints with w a nonic plateau
 window -- mapped through `flatState()`; no fixed point (nothing is prescribed in
-task space). Defaults q1 +-25 deg, q2 [10, 45] deg, 90 deg apart, 2 cycles.
-T = the shortest duration (bracket + bisection to 2 %) passing joint box,
-sigma_nd, v/a/yaw rate, `pick_place_sweep_qdot_max`, joint torque and rotor
-force on a 401-point grid; on the test scene 19.2 s, bound by the joint rate,
-48 ms to plan.
+task space). Defaults **q1 [-10, 10] deg, q2 [17.5, 37.5] deg** (2026-10-02,
+user decision after +-25 deg tripped the Isaac tilt watchdog; was q1 +-25, q2
+[10, 45]), 90 deg apart, 2 cycles. T = the shortest duration (bracket +
+bisection to 2 %) passing joint box, sigma_nd, v/a/yaw rate,
+`pick_place_sweep_qdot_max`, joint torque and rotor force on a 401-point grid;
+on the test scene 15.0 s, bound by the joint rate, 40 ms to plan.
+
+**Approach, wait, descent (2026-10-02, audit M2; user wording "approach above
+the target, then when the error is within the 50 mm threshold start the
+descent").** A claw leg's service flies to the APPROACH rest -- the goal
+rest raised by `pick_place_approach_dz` (0.10 m), same heading and arm, so the
+claw is 0.10 m straight above the target -- and the node then WAITS there
+(`HOLD`, the leg still in flight). `publishPpArrival` measures the claw
+against the point above the target; once it has stayed inside
+`pick_place_arrival_tol` for `pick_place_settle_s` (1 s: the claw settles
+THROUGH the tolerance in the law's oscillation, it must dwell, audit L1),
+`startPpDescent` plans the approach -> goal transition from the hold
+(`planPickPlaceDescent`; the claw stays on the vertical to 1e-10 m, 3 s) and
+flies it; only its end completes the leg. No descent within
+`pick_place_approach_wait_max` (60 s, 0 = forever) ends the leg INCOMPLETE,
+holding above the target (re-fly it or Abort). `approach_dz` 0 flies straight
+onto the target as before. Plan's dry run chains approach + descent.
+
+**Abort** (`pick_place/abort`, the GS's red button, which also opens the
+gripper): arm home and the vehicle `pick_place_abort_climb` (0.30 m) higher,
+x, y and heading kept, planned and flown at once. A running leg is CUT at the
+current reference (phi from b1_d, q = q_d, x_b chosen so x_c is continuous:
+1.7 mm max CoM step in the loopback), a waiting leg cancelled; the cut leg
+does not count as done. The climb is clipped at the fence ceiling, so repeated
+presses never leave the volume (audit H3). A second press while aborting is
+refused.
+
+**Gates (2026-10-02 audit).** H1 `Geofence` (`pick_place_fence_min_z` 0.6,
+`_max_z` 1.8, `_xy` [-2.5, 2.5, -2.5, 2.5], on the BODY origin): every goal and
+approach rest at Plan, and every planned leg's path (200 samples, level
+attitude) -- a leg may START outside (DIRECT engaged low) but no sample may lie
+further outside than its start, per bound. H2 Adjust refuses an offset larger
+than `pick_place_adjust_max` (0.5 m: not on the start mark). M1 a leg starts
+only with fresh odometry and the body within `pick_place_leg_start_tol`
+(0.15 m) of its hold. M3 the retreat follows the vehicle being AT a table
+(`pp_at_table_`, set when a claw leg completes, cleared by an abort or Reset),
+not the leg index, so re-flying execute_pick from the object retreats too. M4
+the sweep band +-10 deg (above).
 
 Outputs: `pick_place/status` (latched; `NOT IN DIRECT` / `NOT PLANNED: <what
-is missing>` / `PLANNING` / `READY next=<leg>` / `FLYING <leg> T=..s` /
-`DONE <leg> next=<leg> [-- claw within tolerance: fine correction OK]` /
-`INFEASIBLE: <leg>: <reason>` / `COMPLETE -- touch down with SAFETY -> land`),
+is missing>` / `PLANNING` / `READY next=<leg>` / `FLYING <leg> [(approach) |
+(descent)] T=..s` / `WAITING <leg>: claw N mm from the point above the target
+(tolerance 50 mm) -- descends once inside` / `DONE <leg> next=<leg> [-- claw
+within tolerance: fine correction OK | inside tolerance, settling | outside
+tolerance]` / `INFEASIBLE: <leg>: <reason>` / `INCOMPLETE: <leg>: ...` (wait
+timeout) / `ABORTING -- ...` / `ABORTED -- holding higher, arm home; ...` /
+`COMPLETE -- touch down with SAFETY -> land`),
 `pick_place/info` (latched, 80 doubles: [0..2] offset, [3] yaw offset deg,
 [4] planned, [5] last leg completed, [6] leg in flight, [7] tolerance,
 [8..13] leg durations, [14..55] per leg [goal base x y z, actual yaw deg, claw
 x y z], [56..79] per point [captured x y z, valid]), `pick_place/path` and
 `pick_place/drone_path` (latched, the planned mission at the claw / airframe,
 600 x the ee_trajectory/path 9-double stride), `pick_place/arrival_error`
-(10 Hz: [leg, claw?, |e|, e_xyz, tol, within, within AND holding] -- the claw
+(10 Hz: [leg, claw?, |e|, e_xyz, tol, within, settled, phase] -- the claw
 by FK on the measured state for the execute legs, the body otherwise; the
-50 mm `pick_place_arrival_tol` gate is when the arm GS's separate "Pick &
-Place PS4" tab may engage the gamepad fine correction).
+target is the point ABOVE the object while phase is 1 (approach) / 2 (wait),
+the object itself in 3 (descent) / 0; settled = inside for settle_s AND the
+leg done AND HOLD: the gate on which the arm GS's separate "Pick & Place PS4"
+tab may engage the gamepad fine correction).
 
 Two node changes made for that fine correction (2026-10-01):
 - **`pick_place/workspace_rz`** (latched, the workspace_rz layout). The
@@ -523,7 +579,11 @@ Two node changes made for that fine correction (2026-10-01):
   seeded without it asks for a wrist swing; ikWorld with this heading returns
   the current joints (gtest).
 
-Tests: `test_pick_place.cpp` (9 gtests: the workspace floor admits the
+Tests: `test_pick_place.cpp` (14 gtests, 2026-10-02: the approach rest straight
+above with the descent on the vertical and never under the target, any leg
+from a table retreats, a zero-length re-fly from the approach hold, the fence
+-- goal / approach / path refused, a leg starting outside may come back but
+not go further out --, the +-10 deg sweep default; and from 2026-10-01: the workspace floor admits the
 claw-down pose -- up / in / sideways yes, down / out no -- and loses no
 original cell (the node publishes it on pick_place/workspace_rz); ikWorld with clawAzimuth returns the current joints, claw-down
 included; goals put the claw on the target
@@ -533,17 +593,23 @@ visits its band / every bound / shortest T, a band outside the box refused,
 the six-leg mission dry run chained through the retreat points,
 SequenceTrajectory refuses a gap) and `test/test_pick_place_loopback.py` (the
 whole ROS flow against the built node with rig-private mocap topics: Adjust in
-SAFETY -> captures -> Plan -> out-of-order refused -> six legs with the
-perfect-plant teleport -> fine-correction gate at 50 mm both ways -> retreat
-climb 0.150 m -> sweep q1 +-25 / q2 45 deg -> COMPLETE -> reset -> SAFETY
-silence, plus current_ee_heading and the claw-down point inside
-pick_place/workspace_rz but still outside the unchanged workspace_rz;
-~90 s). The arm GS (fsc_om_ws, utils_custom_ground_station) has the **Pick &
-Place** tab (the buttons) and the separate **Pick & Place PS4** tab (the fine
-correction); its `test/test_pick_place_fine_integration.py` drives both
-against this node (14 checks). Not yet flown in sim or on hardware -- in sim
-`obj_0` is the EE marker cube welded into the gripper, so a sim run needs a
-separate pickup body first.
+SAFETY (an 0.8 m offset refused) -> captures -> Plan -> a 0.4 m land refused
+by the fence -> out-of-order refused -> six legs with the perfect-plant
+teleport, each claw leg WAITING above its target until the rig teleports onto
+the approach rest (no descent at 80 mm; at 30 mm it begins after the 1 s
+dwell), a 2 s wait timeout -> INCOMPLETE, the leg-start gate -> fine-correction
+gate at 50 mm both ways -> retreat climb 0.150 m -> abort mid-sweep -> sweep q1
++-10 deg -> COMPLETE -> abort from the hold, then clipped at a 1.20 m ceiling
+-> reset -> SAFETY silence, plus current_ee_heading and the claw-down point
+inside pick_place/workspace_rz but still outside the unchanged workspace_rz;
+PASS 2026-10-02). The arm GS (fsc_om_ws, utils_custom_ground_station) has the
+**Pick & Place** tab (the buttons, typed points, ABORT) and the separate **Pick
+& Place PS4** tab (the fine correction); its
+`test/test_pick_place_fine_integration.py` drives both against this node
+(17 checks, 15 pass 2026-10-02; the 2 PS4 Remote ones need the planner's
+`teleop/engage`, not on this branch). Flown once in Isaac with the approach /
+wait / descent (pp7, 2026-10-02, record below): it did what it is meant to,
+and the vehicle crashed at the pick anyway.
 
 ### Isaac Sim record (2026-10-01, `test/pick_place_sim_cycle.sh`)
 
@@ -586,10 +652,29 @@ publishes stand-in pick / drop points on private topics
   66.9 N in the retreat -> "DIRECT WATCHDOG TRIPPED: excess tilt 20.4/20.0
   deg". The same pose at the pick was stable in the same flight. pp4
   (stressed): the same trip 8 s into the sweep (F_hat 12 N); pp1/pp2 swept
-  through. The watchdog reverted to SAFETY and the vehicle landed each time.
+  through. The watchdog reverted to SAFETY, and PX4's attitude control
+  caught the vehicle in pp4 but NOT in pp3 nor the 2026-10-02 live run on the
+  stressed plant (same trip, 20.4 deg at 279 deg/s, F_hat to 24.6 N in the
+  claw-down hold at the place): both fell from 1 m and ended on their side.
+  The SAFETY fallback does not always recover that tilt rate.
   A flight-law question (wb_l1_*), not a plan one; the planner can only
   excite it less (slower / narrower sweep, a better-conditioned pick pose).
 - **The 0.4 m land hover crashed.** The body stands at 0.305 m on its gear;
   the hover dipped to 0.318 m, brushed the floor, saturated the allocator, and
   the vehicle tumbled on the switch to SAFETY. `pick_place_land` defaults to
   0.8 m since -- not yet flown (pp3 / pp4 tripped before execute_land).
+- **pp7 (2026-10-02), the first flight with approach / wait / descent**,
+  matched plant, pick / place pose [0, -10, 20, 0], sweep +-10 deg at 0.3
+  rad/s (same as pp6 apart from the new logic). execute_pick flew to 0.10 m
+  above obj_0, WAITED, and the planner started the 3 s descent itself 7.2 s
+  later (claw inside 50 mm for 1 s); the leg completed and the gate opened.
+  5 s later the tilt watchdog tripped (20.2 deg, 87 deg/s), SAFETY did not
+  recover, and the vehicle fell onto its side. The body's vertical swing
+  (~0.4 Hz) had grown: 50 mm peak to peak holding above, 144 mm in the
+  descent, 124 -> 169 mm after it -- where pp6 held the SAME pose at the same
+  spot at a steady 18 mm. Reading: the 3 s descent's energy sits near that
+  0.3-0.4 Hz mode (the L1 bandwidth), the 1 s dwell is shorter than one
+  ~2.5 s swing so the descent started mid-swing, and the law's swing grows
+  once it is large (as in pp3). Proposed, not yet done: a dwell longer than
+  one swing (`pick_place_settle_s` 3 s) and a slower descent (>= 8 s, a new
+  `pick_place_descent_t_min`). Data: `log/pick_place_sim/*pp7_matched_approach*`.

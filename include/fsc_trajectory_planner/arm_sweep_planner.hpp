@@ -49,10 +49,12 @@ struct ArmSweepOptions
 {
   // Sweep band per joint [rad, MODEL convention]. A joint whose lo == hi is
   // not swept: it moves straight from its start angle to its goal angle.
-  // Default: the arm yaw q1 +-25 deg (the payload swings sideways) and the
-  // shoulder q2 between 10 and 45 deg (out and up), a quarter cycle apart.
-  VecN lo{(VecN() << -25.0, 10.0, 0.0, 0.0).finished() * (M_PI / 180.0)};
-  VecN hi{(VecN() << 25.0, 45.0, 0.0, 0.0).finished() * (M_PI / 180.0)};
+  // Default (2026-10-02, user decision after the Isaac tilt-watchdog trips at
+  // +-25 deg): +-10 deg on each swept joint -- the arm yaw q1 [-10, 10] (the
+  // payload sideways) and the shoulder q2 [17.5, 37.5] (the old band's centre
+  // +-10: out and up), a quarter cycle apart.
+  VecN lo{(VecN() << -10.0, 17.5, 0.0, 0.0).finished() * (M_PI / 180.0)};
+  VecN hi{(VecN() << 10.0, 37.5, 0.0, 0.0).finished() * (M_PI / 180.0)};
   VecN phase{(VecN() << 0.0, 90.0, 0.0, 0.0).finished() * (M_PI / 180.0)};
   int cycles{2};
   double ramp_frac{0.2};       // window ramp-in and ramp-out, each, as a fraction of T
