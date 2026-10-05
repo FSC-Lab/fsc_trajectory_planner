@@ -248,6 +248,11 @@ public:
     declare_parameter<double>("ee_traj_circle_radius", 0.5);
     declare_parameter<double>("ee_traj_fig8_a", 0.5);
     declare_parameter<double>("ee_traj_fig8_b", 0.25);
+    // figure-8 long axis on a WORLD azimuth (2026-10-05): true -> ee_traj_fig8_axis_deg
+    // (0 = world x); false -> the legacy anchor, start tangent along the nose (long axis
+    // ~45 deg off it for B = A/2).
+    declare_parameter<bool>("ee_traj_fig8_world_axis", false);
+    declare_parameter<double>("ee_traj_fig8_axis_deg", 0.0);
     declare_parameter<double>("ee_traj_lap_time", 24.0);
     declare_parameter<int>("ee_traj_laps", 2);
     declare_parameter<bool>("ee_traj_ccw", true);
@@ -2171,6 +2176,8 @@ private:
     sh.radius = get_parameter("ee_traj_circle_radius").as_double();
     sh.fig8_a = get_parameter("ee_traj_fig8_a").as_double();
     sh.fig8_b = get_parameter("ee_traj_fig8_b").as_double();
+    sh.fig8_world_axis = get_parameter("ee_traj_fig8_world_axis").as_bool();
+    sh.fig8_axis = get_parameter("ee_traj_fig8_axis_deg").as_double() * M_PI / 180.0;
     sh.lap_time = get_parameter("ee_traj_lap_time").as_double();
     sh.laps = static_cast<int>(get_parameter("ee_traj_laps").as_int());
     sh.ccw = get_parameter("ee_traj_ccw").as_bool();

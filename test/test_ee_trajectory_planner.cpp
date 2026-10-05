@@ -118,3 +118,51 @@ TEST(EeTrajectory, LevelEndEffectorIsRefusedAsSingular)
   EXPECT_THROW(EeTrajectoryPlanner::plan(*v, homeHold(*v), shape, o, &d), std::runtime_error);
   std::cout << "  level EE: " << d.violation << "\n";
 }
+
+// 2026-10-05: ee_traj_fig8_world_axis -- the long axis lies on the requested WORLD azimuth
+// whatever the hover yaw, the lobes cross at the hold's EE point, and go-to-start turns the
+// drone by at most alpha = atan2(2B, A) (45 deg for B = A/2).
+TEST(EeTrajectoryWorldAxis, Figure8LongAxisOnWorldAzimuth)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  EeShape shape;
+  shape.type = "figure8";
+  shape.fig8_a = 0.70;
+  shape.fig8_b = 0.35;
+  shape.lap_time = 42.6806;
+  shape.laps = 1;
+  shape.fig8_world_axis = true;
+  EeTrajectoryOptions o;
+  o.time_scale = 1.0;
+  o.ee_fold_deg = 55.0;
+  o.q2_center_deg = 25.0;
+  o.q2_amp_deg = 15.0;
+  o.q2_period_s = shape.lap_time / 4.0;
+  o.a_max = 0.40;
+  o.w_max = 1.0;
+  for (const double axis_deg : {0.0, 90.0}) {
+    shape.fig8_axis = axis_deg * M_PI / 180.0;
+    const double c = std::cos(shape.fig8_axis), s = std::sin(shape.fig8_axis);
+    for (const double yaw_deg : {0.0, 30.0, 90.0, 170.0, -100.0}) {
+      RestSpec hold = homeHold(*v);
+      hold.phi = yaw_deg * M_PI / 180.0 - 0.5 * M_PI;
+      EeTrajectoryDiag d;
+      const auto traj = EeTrajectoryPlanner::plan(*v, hold, shape, o, &d);
+      ASSERT_TRUE(d.feasible) << d.violation;
+      // extent along and across the requested axis
+      double lo_a = 1e9, hi_a = -1e9, lo_c = 1e9, hi_c = -1e9;
+      for (double t = 0.0; t <= traj->duration(); t += 0.05) {
+        const Vec3 p = traj->eval(t).r_ed;
+        const double ua = c * p(0) + s * p(1), uc = -s * p(0) + c * p(1);
+        lo_a = std::min(lo_a, ua); hi_a = std::max(hi_a, ua);
+        lo_c = std::min(lo_c, uc); hi_c = std::max(hi_c, uc);
+      }
+      EXPECT_NEAR(hi_a - lo_a, 2.0 * shape.fig8_a, 0.01) << "axis " << axis_deg << " yaw " << yaw_deg;
+      EXPECT_NEAR(hi_c - lo_c, 2.0 * shape.fig8_b, 0.01) << "axis " << axis_deg << " yaw " << yaw_deg;
+      // go-to-start turn <= alpha (45 deg here)
+      const RestSpec r0 = EeTrajectoryPlanner::startRest(*v, hold, shape, o);
+      const double turn = std::abs(std::remainder(r0.phi - hold.phi, 2.0 * M_PI));
+      EXPECT_LE(turn, std::atan2(2.0 * shape.fig8_b, shape.fig8_a) + 1e-9) << "yaw " << yaw_deg;
+    }
+  }
+}

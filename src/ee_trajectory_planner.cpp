@@ -45,10 +45,11 @@ struct ShapeFrame
 {
   Vec3 p0{Vec3::Zero()};        // EE position at tau = 0 (world)
   double theta{0.0};            // rotation of the local shape into the world
+  bool mirror{false};           // figure-8: B -> -B (the lobes swapped across the long axis)
 };
 
 // local shape: tau -> (p, dp/dtau); the tau = 0 tangent is rotated onto +x
-void localShape(const EeShape & s, double tau, Vec3 * p, Vec3 * dp)
+void localShape(const EeShape & s, double tau, Vec3 * p, Vec3 * dp, bool mirror = false)
 {
   const double w = 2.0 * M_PI / s.lap_time;
   if (s.type == "circle") {
@@ -58,11 +59,12 @@ void localShape(const EeShape & s, double tau, Vec3 * p, Vec3 * dp)
   } else if (s.type == "figure8") {
     // p = [A sin(w tau), B sin(2 w tau)], rotated so the tau = 0 tangent
     // (A w, 2 B w) lies along +x
-    const double th = -std::atan2(2.0 * s.fig8_b, s.fig8_a);
+    const double b = mirror ? -s.fig8_b : s.fig8_b;
+    const double th = -std::atan2(2.0 * b, s.fig8_a);
     const Mat3 R = Rz(th);
-    *p = R * Vec3{s.fig8_a * std::sin(w * tau), s.fig8_b * std::sin(2.0 * w * tau), 0.0};
+    *p = R * Vec3{s.fig8_a * std::sin(w * tau), b * std::sin(2.0 * w * tau), 0.0};
     *dp = R * Vec3{s.fig8_a * w * std::cos(w * tau),
-      2.0 * s.fig8_b * w * std::cos(2.0 * w * tau), 0.0};
+      2.0 * b * w * std::cos(2.0 * w * tau), 0.0};
   } else {
     throw std::runtime_error("unknown EE shape '" + s.type + "' (circle | figure8)");
   }
@@ -86,6 +88,23 @@ ShapeFrame anchorFrame(const EeShape & s, const VehicleModel & v, const RestSpec
     if (std::hypot(p_e0(0), p_e0(1)) < 1e-6) {th0 = hold.phi + 0.5 * M_PI - 0.5 * M_PI;}  // on the axis: bearing = nose
     f.p0 = Vec3{s.radius * std::cos(th0), s.radius * std::sin(th0), p_e0(2)};
     f.theta = th0 + (s.ccw ? 0.5 * M_PI : -0.5 * M_PI);
+  } else if (s.type == "figure8" && s.fig8_world_axis) {
+    // Long axis on the world azimuth fig8_axis. The local long axis sits at -alpha from
+    // the start tangent (alpha = atan2(2B, A)), or at +alpha with the lobes mirrored, and
+    // a half turn traces the same 8 backwards: four start tangents, one 8. Fly the one
+    // closest to the current nose so go-to-start yaws as little as possible (ties keep
+    // the first: unmirrored, forward).
+    f.p0 = p_e0;
+    const double nose = hold.phi + 0.5 * M_PI;
+    const double alpha = std::atan2(2.0 * s.fig8_b, s.fig8_a);
+    double best = 1e9;
+    for (int k = 0; k < 2; ++k) {
+      for (int m = 0; m < 2; ++m) {
+        const double cand = s.fig8_axis + (m ? -alpha : alpha) + k * M_PI;
+        const double d = std::abs(std::remainder(cand - nose, 2.0 * M_PI));
+        if (d < best - 1e-9) {best = d; f.theta = cand; f.mirror = (m == 1);}
+      }
+    }
   } else {
     f.p0 = p_e0;
     f.theta = hold.phi + 0.5 * M_PI;   // actual nose azimuth
@@ -105,7 +124,7 @@ struct EeSample
 EeSample eeAt(const EeShape & s, const ShapeFrame & f, double beta_e, double tau)
 {
   Vec3 pl, dpl;
-  localShape(s, tau, &pl, &dpl);
+  localShape(s, tau, &pl, &dpl, f.mirror);
   const Mat3 R = Rz(f.theta);
   EeSample e;
   e.p_e = f.p0 + R * pl;

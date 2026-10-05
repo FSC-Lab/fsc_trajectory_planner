@@ -49,6 +49,12 @@ struct EeShape
   double radius{0.5};           // circle radius [m]
   double fig8_a{0.5};           // figure-8 half-length along the heading [m]
   double fig8_b{0.25};          // figure-8 half-width across it [m]
+  // figure-8 only (2026-10-05): true puts the LONG axis on the ACTUAL world azimuth
+  // fig8_axis [rad] (0 = world x) instead of 45 deg-ish off the nose (atan2(2B, A)). The
+  // crossing stays at the current EE point; of the four start directions that trace the
+  // same 8 the one closest to the current nose is flown (go-to-start yaws <= ~45 deg).
+  bool fig8_world_axis{false};
+  double fig8_axis{0.0};
   double lap_time{24.0};        // period of one lap at time scale 1 [s]
   int laps{2};
   bool ccw{true};               // circle turns counter-clockwise (seen from above)
