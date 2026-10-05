@@ -6,6 +6,10 @@
 // duration) and the whole mission dry run the Plan button performs.
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <thread>
 #include <cmath>
 #include <iostream>
 #include <memory>
@@ -13,6 +17,7 @@
 #include <string>
 
 #include "fsc_trajectory_planner/arm_sweep_planner.hpp"
+#include "fsc_trajectory_planner/kinematics.hpp"
 #include "fsc_trajectory_planner/pick_place.hpp"
 #include "fsc_trajectory_planner/vehicle_model.hpp"
 #include "fsc_trajectory_planner/workspace.hpp"
@@ -58,7 +63,8 @@ TEST(PickPlace, WaypointsPutTheClawOnTheTargetFacingIt)
   const auto v = makeVehicleModel("t650_aerial_manipulator");
   const PickPlaceTargets t = scene();
   PickPlaceConfig c = config(*v);
-  c.pick_ee_offset << 0.0, 0.0, 0.03;
+  c.align_yaw = false;   // this test is the face-the-target mode
+  c.ee_offset << 0.0, 0.0, 0.03;
   const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
 
   // base legs: exactly the given pose, ACTUAL yaw -> model heading
@@ -68,9 +74,10 @@ TEST(PickPlace, WaypointsPutTheClawOnTheTargetFacingIt)
   EXPECT_LT((wp.goal[kExecuteLand].x_b - t.land.p).norm(), 1e-12);
   EXPECT_LT((wp.goal[kGoToPlaceStart].q - c.carry).norm(), 1e-12);
 
-  // claw legs: the grasp point ON the measured point + offset, arm in its pose
-  EXPECT_LT((wp.ee[kExecutePick] - (t.pick + c.pick_ee_offset)).norm(), 1e-9);
-  EXPECT_LT((wp.ee[kExecutePlace] - t.place).norm(), 1e-9);
+  // claw legs: the grasp point ON the measured / typed point + the ONE offset
+  // (vertical, equal pick / place poses: the same shift at both), arm in its pose
+  EXPECT_LT((wp.ee[kExecutePick] - (t.pick + c.ee_offset)).norm(), 1e-9);
+  EXPECT_LT((wp.ee[kExecutePlace] - (t.place + c.ee_offset)).norm(), 1e-9);
   EXPECT_LT((wp.goal[kExecutePick].q - c.pick_pose).norm(), 1e-12);
   // the pick pose: claw straight down, 0.34 m under the body origin
   EXPECT_NEAR(wp.goal[kExecutePick].x_b(2) - wp.ee[kExecutePick](2), 0.340, 2e-3);
@@ -88,6 +95,257 @@ TEST(PickPlace, WaypointsPutTheClawOnTheTargetFacingIt)
     EXPECT_GT(b.head<2>().dot(d.head<2>()), 0.0);
     EXPECT_LT(b.head<2>().norm(), d.head<2>().norm());
   }
+}
+
+TEST(PickPlace, PickEeOffsetIsInTheCapturedObjectFrame)
+{
+  // obj_0 is the payload's bottom box (its CG and yaw): the EE offset turns
+  // with the object, so the claw target is p_obj + Rz(yaw_obj) * offset.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  PickPlaceConfig c = config(*v);
+  c.ee_offset << 0.03, -0.01, 0.22;
+  PickPlaceTargets t = scene();
+  for (double yaw_deg : {0.0, 90.0, 135.0, -60.0}) {
+    t.pick_yaw = yaw_deg * M_PI / 180.0;
+    const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+    const Vec3 want = t.pick + Rz(t.pick_yaw) * c.ee_offset;
+    EXPECT_LT((wp.ee[kExecutePick] - want).norm(), 1e-9) << "yaw " << yaw_deg;
+  }
+  // yaw 0 = the offset in world axes
+  t.pick_yaw = 0.0;
+  EXPECT_LT((pickPlaceWaypoints(*v, c, t).ee[kExecutePick] - (t.pick + c.ee_offset)).norm(), 1e-9);
+}
+
+TEST(PickPlace, OneEeOffsetIsAppliedInEachTargetPosesFrame)
+{
+  // One offset for both claw legs (2026-10-03): pick = obj_0 + Rz(pick_yaw) *
+  // offset, place = the place pose + Rz(place_yaw) * offset.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  PickPlaceConfig c = config(*v);
+  c.ee_offset << 0.03, -0.01, 0.22;
+  PickPlaceTargets t = scene();
+  for (double yaw_deg : {0.0, 135.0, -60.0}) {
+    t.pick_yaw = yaw_deg * kDeg;
+    t.place_yaw = (yaw_deg - 30.0) * kDeg;
+    const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+    EXPECT_LT((wp.ee[kExecutePick] - (t.pick + Rz(t.pick_yaw) * c.ee_offset)).norm(), 1e-9);
+    EXPECT_LT((wp.ee[kExecutePlace] - (t.place + Rz(t.place_yaw) * c.ee_offset)).norm(), 1e-9)
+      << "yaw " << yaw_deg;
+  }
+  // a vertical offset: exactly the same shift at pick and place, any yaws
+  c.ee_offset << 0.0, 0.0, 0.22;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  EXPECT_LT((wp.ee[kExecutePick] - (t.pick + c.ee_offset)).norm(), 1e-9);
+  EXPECT_LT((wp.ee[kExecutePlace] - (t.place + c.ee_offset)).norm(), 1e-9);
+}
+
+TEST(PickPlace, ClawYawFollowsTheTargetAndTypedTurnsKeepTheirDirection)
+{
+  // The user's mission (2026-10-03): the drone at the pick aligned with the
+  // payload (yaw 0), carried round to 180 at place start, held at 180 to the
+  // place, on round to 360 at land start -- turning the SAME way both times,
+  // never back, the heading rate never reversing over the whole mission.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  ASSERT_TRUE(c.align_yaw);   // the default
+  c.carry << 0.0, -40.0 * kDeg, 40.0 * kDeg, 0.0;
+  PickPlaceTargets t = scene();
+  t.pick_yaw = 0.3 * kDeg;               // a measured yaw, a hair off zero
+  t.place_start.yaw = M_PI;
+  t.place_yaw = M_PI;
+  t.land_start.yaw = 2.0 * M_PI;
+  t.land.yaw = 2.0 * M_PI;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  // the claw legs' yaw is the target pose's (model heading = yaw - 90 deg)
+  EXPECT_NEAR(wp.goal[kExecutePick].phi + 0.5 * M_PI, t.pick_yaw, 1e-12);
+  EXPECT_NEAR(wp.goal[kExecutePlace].phi + 0.5 * M_PI, M_PI, 1e-12);
+  RestSpec hold;
+  hold.x_b = t.start.p;
+  hold.phi = -0.5 * M_PI;
+  hold.q = v->home;
+  PlanOptions opts;
+  const auto legs = planPickPlaceMission(*v, *planner, opts, c, wp, hold);
+  double total = 0.0, min_rate = 1e9;
+  std::array<double, kNumPickPlaceLegs> turn{};
+  for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+    const Trajectory & L = *legs[k];
+    const int n = 400;
+    for (int i = 0; i < n; ++i) {
+      const double dt = L.duration() / n;
+      const WbReference r = L.eval((i + 0.5) * dt);
+      const double rate = r.b1_d(0) * r.b1_d_dot(1) - r.b1_d(1) * r.b1_d_dot(0);   // heading rate
+      min_rate = std::min(min_rate, rate);
+      turn[k] += rate * dt;
+    }
+    total += turn[k];
+  }
+  std::cout << "  turns [deg]:";
+  for (double d : turn) {std::cout << " " << d / kDeg;}
+  std::cout << "  total " << total / kDeg << ", min heading rate " << min_rate << " rad/s\n";
+  EXPECT_NEAR(turn[kGoToPlaceStart], M_PI - t.pick_yaw, 1.0 * kDeg);   // +180, not -180
+  EXPECT_NEAR(turn[kExecutePlace], 0.0, 1.0 * kDeg);
+  EXPECT_NEAR(turn[kGoToLandStart], M_PI, 1.0 * kDeg);                 // on round to 360
+  EXPECT_NEAR(total, 2.0 * M_PI, 2.0 * kDeg);
+  EXPECT_GT(min_rate, -1e-3);   // never turns back: the heading is monotonic
+  // the carry pose is flown between the two claw poses
+  EXPECT_LT((wp.goal[kGoToPlaceStart].q - c.carry).cwiseAbs().maxCoeff(), 1e-12);
+}
+
+TEST(PickPlace, EveryLegStartsWhereTheHoldIs)
+{
+  // geo_8 (2026-10-03): the streamed reference carried the go_to_place_start
+  // GOAL for ~20 ms right at the leg's start. Plan each leg from the hold the
+  // node would be at (the exit's top for the leg after a claw leg) with the
+  // turn-as-typed headings, and require the first 100 ms to start ON the hold
+  // and stay continuous.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.carry << 0.0, -30.0 * kDeg, 40.0 * kDeg, 0.0;
+  c.pick_pose << 0.0, -20.0 * kDeg, 30.0 * kDeg, 0.0;
+  c.place_pose = c.pick_pose;
+  c.ee_offset << 0.0, 0.0, 0.22;
+  PickPlaceTargets t = scene();
+  t.start.yaw = 0.0;
+  t.pick << 1.0, 1.0, 1.0325;
+  t.pick_yaw = 0.0;
+  t.place_start.p << 0.1, -1.07, 1.0;
+  t.place_start.yaw = -M_PI;
+  t.place << -1.0, -1.0, 1.04;
+  t.place_yaw = -M_PI;
+  t.land_start.p << -0.9, -0.07, 1.0;
+  t.land_start.yaw = -2.0 * M_PI;
+  t.land.p << -0.9, -0.07, 0.8;
+  t.land.yaw = -2.0 * M_PI;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  PlanOptions opts;
+  RestSpec hold;
+  hold.x_b << 0.1, -0.07, 1.0;
+  hold.phi = -0.5 * M_PI;
+  hold.q = v->home;
+  for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+    // the node's hold: atan2-wrapped heading, like a measured one
+    RestSpec from = hold;
+    from.phi = std::atan2(std::sin(from.phi), std::cos(from.phi));
+    const auto L = planPickPlaceLeg(*v, *planner, opts, c, wp, k, from, false);
+    const Vec3 x0 = restReference(v->params, from).x_cd;
+    double worst = 0.0;
+    Vec3 prev = L->eval(0.0).x_cd;
+    EXPECT_LT((prev - x0).norm(), 1e-6) << pickPlaceLegName(k) << " starts off the hold";
+    for (int i = 1; i <= 100; ++i) {
+      const Vec3 x = L->eval(i * 1e-3).x_cd;
+      worst = std::max(worst, (x - prev).norm());
+      prev = x;
+    }
+    // and at the sub-millisecond times a 100 Hz tick can land on
+    for (double tt = 1e-9; tt < 2e-3; tt *= 1.7) {
+      EXPECT_LT((L->eval(tt).x_cd - x0).norm(), 1e-3)
+        << pickPlaceLegName(k) << " jumps at t = " << tt << " s to " << L->eval(tt).x_cd.transpose();
+    }
+    EXPECT_LT(worst, 1e-3) << pickPlaceLegName(k) << ": a step in the first 100 ms";
+    // the next leg starts where this one ends (a claw leg: after its exit)
+    hold = L->goalRest();
+    if (pickPlaceLegIsClaw(k)) {
+      hold = wp.goal[k];
+      hold.x_b(2) += c.approach_dz;
+    }
+  }
+}
+
+TEST(PickPlace, AnExitTimeMakesTheExitThatFastAndStillStraightUp)
+{
+  // pick_place_exit_time_s (2026-10-03): lift a payload that still rests on its
+  // pillar off FAST. Default (0): the leg bounds, ~3.2 s for 0.20 m.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  const PlanOptions opts;
+  const auto slow = planPickPlaceExit(*v, *planner, opts, c, kExecutePick, wp.goal[kExecutePick]);
+  c.exit_t = 1.6;
+  const auto fast = planPickPlaceExit(*v, *planner, opts, c, kExecutePick, wp.goal[kExecutePick]);
+  EXPECT_GT(slow->duration(), 3.0);
+  EXPECT_NEAR(fast->duration(), 1.6, 0.05);
+  const WbReference a = fast->eval(0.0), b = fast->eval(fast->duration());
+  EXPECT_LT((b.r_ed - a.r_ed - Vec3(0.0, 0.0, 0.20)).norm(), 1e-6);
+  // the point: the climb is well under way early -- at 0.4 s the reference
+  // rises at >= 0.1 m/s, where the decoupled law's kv_z alone carries the box
+  const double dt = 1e-3;
+  const double vz = (fast->eval(0.4 + dt).r_ed(2) - fast->eval(0.4 - dt).r_ed(2)) / (2 * dt);
+  const double vz_slow = (slow->eval(0.4 + dt).r_ed(2) - slow->eval(0.4 - dt).r_ed(2)) / (2 * dt);
+  EXPECT_GT(vz, 0.1);
+  EXPECT_LT(vz_slow, 0.03);
+}
+
+TEST(PickPlace, ALargeDescentTrimIsFlownSidewaysFirstThenStraightDown)
+{
+  // trim first (2026-10-03): the decoupled law's ~5 cm trim, flown inside the
+  // descent, overshot ~10 mm at the bottom -- next to the handle
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.trim_settle_s = 2.0;
+  PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  const int k = kExecutePick;
+  const RestSpec above = wp.approach[k];
+  wp.goal[k].x_b += Vec3(-0.035, 0.035, 0.002);          // a decoupled-size trim
+  const auto D = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, k, above);
+  const auto * seq = dynamic_cast<const SequenceTrajectory *>(D.get());
+  ASSERT_NE(seq, nullptr);
+  ASSERT_EQ(seq->segmentStarts().size(), 3u);
+  const double t1 = seq->segmentStarts()[1], t2 = seq->segmentStarts()[2];
+  EXPECT_NEAR(t2 - t1, 2.0, 1e-9);                         // the settle
+  const WbReference r0 = D->eval(0.0), rT = D->eval(D->duration());
+  for (int i = 0; i <= 40; ++i) {
+    const WbReference a = D->eval(t1 * i / 40.0);          // sideways: height held
+    EXPECT_NEAR(a.x_cd(2), r0.x_cd(2), 1e-6);
+    const WbReference b = D->eval(t2 + (D->duration() - t2) * i / 40.0);   // then straight down
+    EXPECT_LT((b.r_ed - rT.r_ed).head<2>().norm(), 1e-6);
+  }
+  EXPECT_LT((rT.x_cd - restReference(v->params, wp.goal[k]).x_cd).norm(), 1e-6);
+  // a small trim (the whole-body law's) stays one segment; off = one segment
+  PickPlaceWaypoints small = pickPlaceWaypoints(*v, c, scene());
+  small.goal[k].x_b += Vec3(0.003, 0.0, 0.0);
+  const auto S = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, small, k, above);
+  const auto * s1 = dynamic_cast<const SequenceTrajectory *>(S.get());
+  EXPECT_TRUE(s1 == nullptr || s1->segmentStarts().size() == 1u);
+  c.trim_settle_s = 0.0;
+  const auto O = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, k, above);
+  const auto * s0 = dynamic_cast<const SequenceTrajectory *>(O.get());
+  EXPECT_TRUE(s0 == nullptr || s0->segmentStarts().size() == 1u);
+}
+
+TEST(PickPlace, APlanCanBeEvaluatedFromTwoThreadsAtOnce)
+{
+  // The node's stream tick evaluates the plan near t = 0 while its worker
+  // draws the path out to t = T. FlatPlan::eval once shared mutable scratch,
+  // and the stream then read the path thread's GOAL (geo_8, 2026-10-03).
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PickPlaceConfig c = config(*v);
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  const auto L = planPickPlaceLeg(*v, *planner, PlanOptions{}, c, wp, kGoToPlaceStart,
+      wp.goal[kExecutePick], false);
+  const Vec3 x0 = L->eval(0.0).x_cd;
+  const Vec3 xT = L->eval(L->duration()).x_cd;
+  ASSERT_GT((xT - x0).norm(), 0.5);
+  std::atomic<bool> stop{false};
+  std::thread path([&]() {
+      while (!stop) {
+        for (int i = 0; i <= 200; ++i) {L->eval(L->duration() * i / 200.0);}
+      }
+    });
+  double worst = 0.0;
+  for (int i = 0; i < 200000; ++i) {
+    worst = std::max(worst, (L->eval(1e-4).x_cd - x0).norm());
+  }
+  stop = true;
+  path.join();
+  EXPECT_LT(worst, 1e-3) << "a concurrent eval leaked another thread's sample";
 }
 
 TEST(PickPlace, AnImpossibleArmPoseIsRefusedNamingTheLeg)
@@ -275,6 +533,52 @@ TEST(PickPlace, MissionDryRunPlansAllSixLegsChained)
     from = wp.goal[k];
   }
   std::cout << "  mission total " << total << " s\n";
+}
+
+TEST(PickPlace, ExitsClimbTheSafetyMarginAndTheNextLegNeedsNoRetreat)
+{
+  // Ready -> gripper -> Exit (2026-10-03, user design): each claw leg's exit
+  // climbs straight up the safety margin from its target, and the leg after
+  // it starts at that clearance point -- one segment, no retreat.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  RestSpec hold;
+  hold.x_b << 0.3, 0.2, 1.0;
+  hold.phi = 0.4;
+  hold.q = v->home;
+  PlanOptions opts;
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> exits;
+  const auto legs = planPickPlaceMission(*v, *planner, opts, c, wp, hold, &exits);
+  for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+    if (!pickPlaceLegIsClaw(k)) {
+      EXPECT_FALSE(exits[k]) << pickPlaceLegName(k);
+      continue;
+    }
+    ASSERT_TRUE(exits[k]) << pickPlaceLegName(k);
+    const Trajectory & X = *exits[k];
+    const WbReference a = X.eval(0.0), b = X.eval(X.duration());
+    EXPECT_LT((a.r_ed - wp.ee[k]).norm(), 1e-6);                            // from the target
+    EXPECT_LT((b.r_ed - (wp.ee[k] + Vec3(0.0, 0.0, 0.20))).norm(), 1e-6);   // straight up
+    for (int i = 0; i <= 50; ++i) {   // vertical all the way, arm unchanged
+      const WbReference r = X.eval(X.duration() * i / 50.0);
+      EXPECT_LT((r.r_ed - wp.ee[k]).head<2>().norm(), 1e-6);
+      EXPECT_LT((r.q_d - wp.goal[k].q).cwiseAbs().maxCoeff(), 1e-9);
+    }
+    // the leg after it: one transit from the clearance point, no retreat
+    const Trajectory & N = *legs[k + 1];
+    const auto * seq = dynamic_cast<const SequenceTrajectory *>(&N);
+    ASSERT_NE(seq, nullptr);
+    EXPECT_EQ(seq->segmentStarts().size(), 1u) << pickPlaceLegName(k + 1);
+    EXPECT_LT((N.eval(0.0).r_ed - b.r_ed).norm(), 1e-6);
+  }
+  // an exit out of the geofence is refused, naming it
+  PickPlaceConfig low = c;
+  low.fence.max_z = wp.goal[kExecutePick].x_b(2) + 0.05;
+  EXPECT_THROW(planPickPlaceExit(*v, *planner, opts, low, kExecutePick, wp.goal[kExecutePick]),
+    std::runtime_error);
 }
 
 TEST(PickPlace, ClawLegsStopAboveTheTargetThenDescendVertically)

@@ -65,8 +65,9 @@
     # go_to_place_start -> execute_place -> go_to_land_start -> execute_land.
     # Base poses [x, y, z, yaw_deg], world frame, ACTUAL yaw, and the place
     # point: TYPED IN (the arm GS's Pick & Place tab writes them live; an edit
-    # makes the plan stale). The four BASE poses are shifted by the Adjust
-    # offset (vehicle on the start mark -> measured - nominal start); the
+    # makes the plan stale). Adjust (vehicle on the start mark -> measured -
+    # typed Start) WRITES its shift into the four BASE poses, so these then
+    # read what the legs fly to (2026-10-03); the
     # place point is NOT (2026-10-03): it is the place mark read off mocap
     # before the flight, already in the mocap frame. Only the PICK point is
     # measured live (mocap obj_0, the Get button); it is not shifted either.
@@ -79,7 +80,10 @@
     # oscillation, brushed the floor, saturated the allocator and tumbled on
     # the switch to SAFETY.
     pick_place_land: [-1.0, 0.0, 0.8, 0.0]
-    pick_place_place_point: [0.6, -1.6, 0.66]    # the place mark [x, y, z]; claw releases at + place_ee_offset
+    # the PLACE pose [x, y, z, yaw_deg]: where the box CG is to be released and
+    # its yaw -- the SAME reference as the captured obj_0 pose (the box CG on its
+    # pick pillar), since one EE offset serves both
+    pick_place_place_point: [0.6, -1.6, 0.66, 0.0]
     # Arm poses [deg]. [0, 0, 0, 0] = upper arm straight down, forearm out
     # along the nose, claw straight down (grasp point 0.155 m ahead of and
     # 0.340 m below the body origin). It is the bottom of the arm's reach:
@@ -88,10 +92,19 @@
     pick_place_pick_pose_deg: [0.0, 0.0, 0.0, 0.0]
     pick_place_place_pose_deg: [0.0, 0.0, 0.0, 0.0]
     pick_place_carry_pose_deg: [0.0, 40.0, 40.0, 0.0]
-    # claw target = measured mocap point + this offset, world [m]
-    pick_place_pick_ee_offset: [0.0, 0.0, 0.0]
-    pick_place_place_ee_offset: [0.0, 0.0, 0.0]
-    pick_place_face_target: true       # turn the nose to the object over the leg
+    # THE EE offset [m], one for the pick AND the place (2026-10-03): box CG ->
+    # grasp point in the box's frame. Pick: claw = obj_0 + Rz(its captured yaw)
+    # * offset; place: claw = the place pose + Rz(its yaw) * offset.
+    # obj_0 = the payload's bottom box, its CG: set this to the grasp point,
+    # e.g. ~[0, 0, 0.22] for the sim's 65 mm box + 200 mm handle. (Replaces
+    # pick_place_pick_ee_offset / _place_ee_offset; the node refuses those.)
+    pick_place_ee_offset: [0.0, 0.0, 0.0]
+    # the claw legs' drone yaw = the target pose's yaw: the captured obj_0's at
+    # the pick (define its rigid body so yaw 0 = the handle across the jaws of a
+    # yaw-0 drone), the typed place pose's at the place (2026-10-03). Typed
+    # yaws are flown as typed: 0 -> 180 -> 360 turns the same way round twice.
+    pick_place_align_yaw: true
+    pick_place_face_target: true       # align_yaw false: turn the nose to the object
     pick_place_retreat_dz: 0.15        # before leaving a table: climb [m] ...
     pick_place_retreat_back: 0.20      # ... then back off along -nose [m]
     # (a leg retreats whenever it starts from a table: after execute_pick /
@@ -99,7 +112,9 @@
     # execute_pick / execute_place fly to the point approach_dz ABOVE the
     # target first, hold there until the claw has been inside arrival_tol for
     # settle_s, then descend vertically onto it. 0 = straight onto the target.
-    pick_place_approach_dz: 0.10       # [m]
+    # THE SAFETY MARGIN (the arm GS's "Safety Margin" box, 2026-10-03): also
+    # how far exit_pick / exit_place climb back up from the target.
+    pick_place_approach_dz: 0.20       # [m]
     pick_place_approach_wait_max: 60.0 # no descent after this long: leg ends incomplete [s]
     # execute_place: the arm sweeps these bands [deg] on the way (lo == hi:
     # not swept), `cycles` whole sweeps, at most sweep_qdot_max. +-10 deg

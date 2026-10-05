@@ -46,7 +46,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, Float64MultiArray, String
 from std_srvs.srv import Trigger
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.srv import GetParameters, SetParameters
 from fsc_autopilot_ros2_msgs.msg import Mocap, WholeBodyReference
 from ament_index_python.packages import get_package_share_directory
 
@@ -58,14 +58,21 @@ YAML = os.path.join(get_package_share_directory("fsc_trajectory_planner"), "conf
 GOV_CMD = ["ros2", "run", "fsc_trajectory_planner", "whole_body_trajectory_planner",
            "--ros-args", "-r", f"__ns:={NS}", "--params-file", YAML,
            "-p", f"pick_place_pick_topic:={OBJ_TOPIC}",
-           "-p", f"pick_place_land_topic:={LAND_TOPIC}"]
+           "-p", f"pick_place_land_topic:={LAND_TOPIC}",
+           # the 2026-10-02 automatic descent for most of the run; [9b]
+           # switches to the descent ON REQUEST (the node default since 2026-10-03)
+           "-p", "pick_place_descent_on_request:=false",
+           # the rig is a PERFECT plant (no steady offset): the gates are
+           # tested with deliberate offsets, which the descent trim would
+           # cancel -- off here, on (the default) in [9b]
+           "-p", "pick_place_descent_trim:=false"]
 HOME = np.array([0.0, 0.698132, 0.698132, 0.0])
 LATCHED = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
 LEGS = ["go_to_start", "execute_pick", "go_to_place_start", "execute_place",
         "go_to_land_start", "execute_land"]
 CLAW_LEGS = (1, 3)
-APPROACH_DZ = 0.10      # pick_place_approach_dz in the package yaml
+APPROACH_DZ = 0.20      # pick_place_approach_dz in the package yaml (the safety margin)
 SETTLE_S = 1.0          # pick_place_settle_s
 NOMINAL_START = np.array([0.0, 0.0, 1.0])       # the package yaml's placeholders
 NOMINAL_LAND = np.array([-1.0, 0.0, 0.8])
@@ -126,11 +133,14 @@ class Rig(Node):
             lambda m: self.refs.append((time.monotonic(), m)), 50)
         self.cli = {}
         for name in LEGS + ["adjust", "plan", "reset", "capture_pick", "capture_place",
-                            "capture_land", "capture_start", "abort"]:
+                            "capture_land", "capture_start", "abort", "exit_pick", "exit_place",
+                            "descend_pick", "descend_place"]:
             self.cli[name] = self.create_client(Trigger, f"whole_body_planner/pick_place/{name}")
         self.params = self.create_client(SetParameters, "whole_body_trajectory_planner/set_parameters")
+        self.getp = self.create_client(GetParameters, "whole_body_trajectory_planner/get_parameters")
         self.odom_xyz = np.array([OFFSET[0], OFFSET[1], 0.0])   # on the start mark, on the ground
         self.yaw = 0.0          # actual yaw the rig reports
+        self.roll = 0.0         # body roll the rig reports [rad] (the safety guard's tilt)
         self.q = HOME.copy()
         self.rng = np.random.default_rng(0)
         self.create_timer(0.02, self.feed)
@@ -142,7 +152,9 @@ class Rig(Node):
         self.odom.publish(o)
         a = VehicleAttitude()
         ned = 0.5 * math.pi - self.yaw          # ENU yaw = 90 deg - NED yaw
-        a.q = [math.cos(0.5 * ned), 0.0, 0.0, math.sin(0.5 * ned)]
+        cz, sz = math.cos(0.5 * ned), math.sin(0.5 * ned)
+        cx, sx = math.cos(0.5 * self.roll), math.sin(0.5 * self.roll)
+        a.q = [cz * cx, cz * sx, sz * sx, sz * cx]   # yaw, then roll about the body x
         self.att.publish(a)
         j = JointState()
         j.name = ["joint1", "joint2", "joint3", "joint4"]
@@ -185,7 +197,9 @@ def ws_contains(ws, r, z):
 def set_param(rig, name, value):
     """What the Pick & Place tab does when a field is edited."""
     v = ParameterValue()
-    if isinstance(value, str):
+    if isinstance(value, bool):
+        v.type, v.bool_value = ParameterType.PARAMETER_BOOL, value
+    elif isinstance(value, str):
         v.type, v.string_value = ParameterType.PARAMETER_STRING, value
     elif isinstance(value, float):
         v.type, v.double_value = ParameterType.PARAMETER_DOUBLE, value
@@ -198,6 +212,17 @@ def set_param(rig, name, value):
         time.sleep(0.05)
         assert time.monotonic() - t0 < 10, name
     return fut.result().results[0]
+
+
+def get_param(rig, name):
+    """A double-array parameter of the planner, as the Pick & Place tab reads it."""
+    assert rig.getp.wait_for_service(timeout_sec=10)
+    fut = rig.getp.call_async(GetParameters.Request(names=[name]))
+    t0 = time.monotonic()
+    while not fut.done():
+        time.sleep(0.05)
+        assert time.monotonic() - t0 < 10, name
+    return np.array(fut.result().values[0].double_array_value)
 
 
 def call(rig, name):
@@ -238,7 +263,7 @@ def wait_above(rig, leg_index, T):
          "arrival phase = wait")
 
 
-def fly(rig, leg_index, above=None):
+def fly(rig, leg_index, above=None, on_request=False, hover_off=(0.0, 0.0, 0.0)):
     """Fly one leg through its service and wait for the hold at its goal. A
     claw leg stops ABOVE its target and waits: `above(rig)` may check things
     there, then the rig teleports onto the approach rest and the descent
@@ -251,7 +276,17 @@ def fly(rig, leg_index, above=None):
         wait_above(rig, leg_index, T)
         if above is not None:
             above(rig)
-        rig.teleport(leg_index, dz=APPROACH_DZ)
+        rig.teleport(leg_index, dz=APPROACH_DZ, off=hover_off)
+        if on_request:
+            # holding above, no descent by itself; the Pick / Place button
+            word = "Pick" if leg_index == 1 else "Place"
+            wait(lambda: f"press {word} to descend" in rig.pp_status, 5, "holding above")
+            time.sleep(SETTLE_S + 0.5)
+            assert rig.status == "HOLD" and rig.pp_status.startswith("WAITING"), rig.pp_status
+            time.sleep(1.2)       # a full descent-trim window of the hover error
+            r = call(rig, "descend_pick" if leg_index == 1 else "descend_place")
+            assert r.success, r.message
+            rig.descend_msg = r.message
         wait(lambda: rig.status.startswith("EXECUTING") and "(descent)" in rig.pp_status, 10,
              f"{name} descent")
         Td = float(rig.status.split("T=")[1].rstrip("s"))
@@ -292,6 +327,21 @@ def main():
         wait(lambda: abs(rig.info[0] - OFFSET[0]) < 1e-6, 5, "offset published")
         assert abs(rig.info[1] - OFFSET[1]) < 1e-6 and rig.info[2] == 0.0, rig.info[:3]
         print(f"[1] adjust: {r.message}")
+        # Adjust WRITES the shift into the four drone-point parameters (what the
+        # GS's fields show), never into Place; a second press with the vehicle
+        # unmoved measures ~0 against the moved Start and moves nothing
+        shift = np.array([OFFSET[0], OFFSET[1], 0.0, 0.0])
+        for name, nominal in (("pick_place_start", [*NOMINAL_START, 0.0]),
+                              ("pick_place_land", [*NOMINAL_LAND, 0.0])):
+            got = get_param(rig, name)
+            assert np.allclose(got, np.array(nominal) + shift, atol=1e-9), (name, got)
+        place_before = get_param(rig, "pick_place_place_point")
+        r = call(rig, "adjust")
+        assert r.success, r.message
+        assert np.allclose(get_param(rig, "pick_place_start"), np.array([*NOMINAL_START, 0.0]) + shift,
+                           atol=1e-9), "a second Adjust moved Start again"
+        assert np.allclose(get_param(rig, "pick_place_place_point"), place_before, atol=1e-12)
+        print("[1] the four drone points carry the shift; Place untouched; a second Adjust is a no-op")
         r = call(rig, "go_to_start")
         assert not r.success and "DIRECT" in r.message, r.message
 
@@ -327,10 +377,10 @@ def main():
         r = call(rig, "capture_place")
         assert not r.success and "pick_place_place_topic" in r.message, r.message
         r = set_param(rig, "pick_place_place_point", [1.0, 2.0])
-        assert not r.successful and "needs 3" in r.reason, r.reason
+        assert not r.successful and "needs [x, y, z, yaw_deg]" in r.reason, r.reason
         r = set_param(rig, "pick_place_pick_topic", "/elsewhere")
         assert not r.successful and "fixed at launch" in r.reason, r.reason
-        r = set_param(rig, "pick_place_place_point", DROP.tolist())
+        r = set_param(rig, "pick_place_place_point", DROP.tolist() + [0.0])   # [x, y, z, yaw_deg]
         assert r.successful, r.reason
         wait(lambda: rig.info[56 + 4 * 1 + 3] == 1.0, 5, "pick captured")
         assert np.linalg.norm(rig.info[60:63] - OBJ) < 1e-3, rig.info[60:63]
@@ -424,10 +474,12 @@ def main():
         assert np.allclose(np.array(last.q_d), 0.0, atol=1e-9), last.q_d     # the pick pose
         r_ed = np.array([last.r_ed.x, last.r_ed.y, last.r_ed.z])
         assert np.linalg.norm(r_ed - OBJ) < 1e-3, r_ed                   # claw on obj_0
-        # nose turned to face the object: final heading vs the bearing start -> object
+        # the drone's yaw = the captured object's (pick_place_align_yaw, the
+        # default since 2026-10-03): the rig's obj_0 has yaw 0 -- NOT the
+        # bearing start -> object, which is ~36 deg here
         b = math.atan2(OBJ[1] - start_base[1], OBJ[0] - start_base[0])
         _, pick_yaw, _ = rig.goal(1)
-        assert abs(math.remainder(pick_yaw - b, 2 * math.pi)) < math.radians(1.0), (pick_yaw, b)
+        assert abs(math.remainder(pick_yaw, 2 * math.pi)) < math.radians(1.0), (pick_yaw, b)
         wait(lambda: rig.arrival is not None and rig.arrival[0] == 1 and rig.arrival[8] == 1.0, 5,
              "fine-correction gate")
         wait(lambda: "fine correction OK" in rig.pp_status, 5, "status gate")
@@ -457,10 +509,36 @@ def main():
         print(f"    8 cm off: |err| {rig.arrival[2]*1e3:.0f} mm -> {rig.pp_status}")
         rig.teleport(1)
 
+        # [7c] EXIT (2026-10-03: Ready -> gripper -> Exit): exit_place is refused
+        # here, exit_pick climbs straight up the safety margin, arm unchanged
+        r = call(rig, "exit_place")
+        assert not r.success and "not holding on the place target" in r.message, r.message
+        assert rig.info[85] == 1.0 and rig.info[83] == 0.0, rig.info[81:]
+        assert "next=exit_pick (close the gripper first)" in rig.pp_status, rig.pp_status
+        rig.refs.clear()
+        r = call(rig, "exit_pick")
+        assert r.success, r.message
+        wait(lambda: rig.status.startswith("EXECUTING") and "FLYING exit_pick" in rig.pp_status, 10,
+             "exit_pick flying")
+        wait(lambda: rig.status == "HOLD", 30, "exit_pick complete")
+        wait(lambda: rig.info[83] == 1.0 and rig.info[85] == 0.0, 5, "exit recorded")
+        ex = [m for _, m in rig.refs]
+        x0 = np.array([ex[0].r_ed.x, ex[0].r_ed.y, ex[0].r_ed.z])
+        x1 = np.array([ex[-1].r_ed.x, ex[-1].r_ed.y, ex[-1].r_ed.z])
+        lateral = max(np.hypot(m.r_ed.x - x0[0], m.r_ed.y - x0[1]) for m in ex)
+        assert abs((x1 - x0)[2] - APPROACH_DZ) < 1e-3 and lateral < 1e-3, (x1 - x0, lateral)
+        assert all(np.allclose(np.array(m.q_d), ex[0].q_d, atol=1e-9) for m in ex), "arm moved"
+        assert rig.pp_status.startswith("DONE exit_pick next=go_to_place_start"), rig.pp_status
+        print(f"[7c] exit_pick: claw up {(x1 - x0)[2]:.3f} m, {lateral * 1e3:.2f} mm sideways, "
+              f"arm unchanged -> {rig.pp_status}")
+        rig.teleport(1, dz=APPROACH_DZ)
+
         T, refs = fly(rig, 2)
+        # from the clearance point: the leg starts there and needs no retreat climb
         z = np.array([m.x_cd.z for m in refs])
-        assert z.max() > refs[0].x_cd.z + 0.12, (z.max(), refs[0].x_cd.z)   # the retreat climb
-        print(f"[8] go_to_place_start T {T:.1f}s (retreat climb {z.max() - refs[0].x_cd.z:.3f} m)")
+        assert abs(refs[0].r_ed.z - x1[2]) < 1e-3, (refs[0].r_ed.z, x1[2])
+        print(f"[8] go_to_place_start T {T:.1f}s from the clearance point (no retreat; "
+              f"peak climb {z.max() - refs[0].x_cd.z:.3f} m)")
 
         # [9a] ABORT in the middle of execute_place: the leg is cut where it
         # is, the CoM stays continuous, the arm goes home and the vehicle climbs;
@@ -508,6 +586,35 @@ def main():
               f"{math.degrees(q[:, 0].max()):.1f}] q2 max {math.degrees(q[:, 1].max()):.1f} deg, "
               f"claw on the typed place point -> {rig.pp_status}")
 
+        # [9b] the DESCENT ON REQUEST (2026-10-03, the node default): re-fly
+        # execute_place -- it now holds above the target, a Place request
+        # far from the point above is refused, one inside descends
+        assert set_param(rig, "pick_place_descent_on_request", True).successful
+        assert set_param(rig, "pick_place_descent_trim", True).successful
+        r = call(rig, "descend_place")
+        assert not r.success and "not holding above the place target" in r.message, r.message
+
+        def far_then_refused(rig):
+            rig.teleport(3, dz=APPROACH_DZ, off=(0.08, 0.0, 0.0))
+            wait(lambda: abs(rig.arrival[2] - 0.08) < 2e-3, 5, "80 mm error")
+            r = call(rig, "descend_place")
+            assert not r.success and "wait for it to settle" in r.message, r.message
+            print(f"    held above; 80 mm off the request is refused: {r.message}")
+        # held 20 mm / -10 mm off above the target: the DESCENT TRIM shifts the
+        # goal by the opposite, so a controller with that steady offset lands
+        # its claw on the target
+        off = np.array([0.02, -0.01, 0.0])
+        T, refs = fly(rig, 3, above=far_then_refused, on_request=True, hover_off=tuple(off))
+        assert "trimmed by [-20.0, 10.0, -0.0] mm" in rig.descend_msg or \
+            "trimmed by [-20.0, 10.0, 0.0] mm" in rig.descend_msg, rig.descend_msg
+        last = refs[-1]
+        r_ed = np.array([last.r_ed.x, last.r_ed.y, last.r_ed.z])
+        assert np.linalg.norm(r_ed - (PLACE_GOAL - off)) < 1.5e-3, (r_ed, PLACE_GOAL - off)
+        print(f"    descent trim: {rig.descend_msg}")
+        print(f"[9b] execute_place on request T {T:.1f}s -> {rig.pp_status}")
+        assert set_param(rig, "pick_place_descent_on_request", False).successful
+        assert set_param(rig, "pick_place_descent_trim", False).successful
+
         T, _ = fly(rig, 4)
         print(f"[10] go_to_land_start T {T:.1f}s")
         T, refs = fly(rig, 5)
@@ -545,6 +652,27 @@ def main():
         assert abs(rig.base_anchor.pose.position.z - (z0 + 0.10)) < 1e-6
         assert set_param(rig, "pick_place_fence_max_z", 1.8).successful
         print(f"[11b] ceiling {z0 + 0.10:.2f} m: {r.message}")
+        assert set_param(rig, "pick_place_fence_max_z", 1.8).successful
+
+        # [11c] the SAFETY GUARD (2026-10-03): a tilt above
+        # pick_place_guard_tilt_deg (15) held for pick_place_guard_persist_s
+        # (0.1 s) aborts by itself; a shorter spike does not
+        wait(lambda: rig.status == "HOLD", 30, "hold before the guard test")
+        rig.roll = math.radians(20.0)
+        time.sleep(0.04)
+        rig.roll = 0.0
+        time.sleep(0.5)
+        assert not rig.pp_status.startswith("ABORTING (SAFETY"), rig.pp_status
+        rig.roll = math.radians(20.0)
+        wait(lambda: rig.pp_status.startswith(("ABORTING (SAFETY GUARD", "ABORTED (SAFETY GUARD")), 5,
+             "guard tripped")
+        tripped = rig.pp_status
+        wait(lambda: rig.status == "HOLD" and rig.pp_status.startswith("ABORTED (SAFETY GUARD"), 30,
+             "guard abort complete")
+        time.sleep(0.5)    # still tilted: no second abort (re-arms below 10 deg)
+        assert rig.status == "HOLD", rig.status
+        rig.roll = 0.0
+        print(f"[11c] safety guard: a 40 ms spike ignored; held 20 deg -> {tripped}")
 
         # [12] reset, SAFETY
         r = call(rig, "reset")

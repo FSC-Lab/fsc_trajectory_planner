@@ -42,6 +42,7 @@ add_library(planner_lib STATIC
   src/trajectory.cpp
   src/arm_sweep_planner.cpp
   src/pick_place.cpp
+  src/push_pull.cpp
   src/workspace.cpp)
 set_target_properties(planner_lib PROPERTIES
   POSITION_INDEPENDENT_CODE ON
@@ -107,6 +108,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_pick_place test/test_pick_place.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_pick_place planner_lib)
+  ament_add_gtest(test_push_pull test/test_push_pull.cpp
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(test_push_pull planner_lib)
   ament_add_gtest(test_teleop_reference test/test_teleop_reference.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_teleop_reference planner_lib)

@@ -20,7 +20,8 @@
 // Base poses are given in the world frame with the ACTUAL yaw (the drone
 // ground station's convention); RestSpec carries the MODEL heading phi =
 // yaw - pi/2. A claw target places the grasp point (the EE of the model) on
-// the measured point plus an offset; the heading is the bearing from the
+// the measured / typed point plus ONE shared EE offset (PickPlaceConfig::
+// ee_offset); the heading is the bearing from the
 // previous leg's base to that point, so the vehicle turns to face the object
 // over the whole leg (the flat planner's heading channel is smooth and
 // rate-bounded), and the arm sits on that bearing.
@@ -94,10 +95,20 @@ struct PickPlaceConfig
   VecN carry{(VecN() << 0.0, 0.698132, 0.698132, 0.0).finished()};
   VecN pick_pose{VecN::Zero()};
   VecN place_pose{VecN::Zero()};
-  // claw target = measured point + offset (world) [m]
-  Vec3 pick_ee_offset{Vec3::Zero()};
-  Vec3 place_ee_offset{Vec3::Zero()};
-  // turn the nose to face the claw target (else keep the previous heading)
+  // THE EE offset [m], one for both claw legs (2026-10-03, user decision: the
+  // same payload on the same pillars, so the claw goes to the same place
+  // relative to the box at both): from the box CG to the grasp point, in the
+  // box's frame. Each claw target is its 4-D pose plus the offset in that
+  // pose's frame: pick = obj_0 + Rz(pick_yaw) * ee_offset, place = the place
+  // pose + Rz(place_yaw) * ee_offset.
+  Vec3 ee_offset{Vec3::Zero()};
+  // THE CLAW LEGS' DRONE YAW (2026-10-03, user design): true = the target
+  // pose's yaw -- the captured object's at the pick (its handle aligned with
+  // the jaws), the typed place pose's at the place -- so the arm meets the
+  // payload the same way at both. false: face_target below.
+  bool align_yaw{true};
+  // align_yaw false: turn the nose to face the claw target (else keep the
+  // previous heading)
   bool face_target{true};
   // retreat before any leg flown from a table: climb dz, then back off along
   // -nose by `back`, arm unchanged. Both zero disables it.
@@ -107,6 +118,24 @@ struct PickPlaceConfig
   // claw above it), then -- once the claw is within the arrival tolerance --
   // descend vertically onto it (2026-10-02 audit, M2). 0 disables.
   double approach_dz{0.10};
+  // EXIT TO PICK / PLACE duration [s] (2026-10-03); 0 = the leg bounds (a_max
+  // 0.15 m/s^2: 3.2 s for a 0.20 m climb). Clamped to a payload that still
+  // rests on its pillar the vehicle must lift it OFF fast: a min-snap climb
+  // barely moves at first (8 mm in its first 0.7 s at 3.2 s), so the box stayed
+  // on the cap ~0.9 s into the exit, and the decoupled rig, pinned to it,
+  // tipped over (geo_16 / 19). When > 0 the exit is planned with T_min = exit_t
+  // and its translational bounds opened just enough for it; the rotor and
+  // joint-torque bounds still apply.
+  double exit_t{0.0};
+  // TRIM FIRST (2026-10-03): with a descent trim larger than kTrimFirstMin, the
+  // descent becomes three segments -- the claw moves SIDEWAYS by the trim at
+  // the hover height, holds there trim_settle_s, then descends STRAIGHT down.
+  // 0 = the old single segment, which moves the claw sideways WHILE it
+  // descends: the decoupled law (a ~5 cm trim) lagged that sideways part and
+  // overshot ~10 mm when it stopped -- at the bottom, with the open fingertips
+  // only 8.75 mm clear of the handle (geo_22: a finger on the handle, the claw
+  // then swung +-0.1 m around it and knocked the payload off its pillar).
+  double trim_settle_s{0.0};
   Geofence fence;
   // the execute_place leg
   ArmSweepOptions sweep;
@@ -116,8 +145,17 @@ struct PickPlaceTargets
 {
   // base poses, already shifted by the operator's calibration
   BasePose start, place_start, land_start, land;
-  // measured claw points (mocap obj_0 / drop_0), world [m]
+  // the box CG at the pick (mocap obj_0) and where it is to be released (the
+  // typed place pose, or drop_0), world [m] -- the SAME reference, so one
+  // ee_offset serves both
   Vec3 pick{Vec3::Zero()}, place{Vec3::Zero()};
+  // the captured pick OBJECT's yaw [rad] (mocap obj_0 = the payload's bottom
+  // box, its CG and heading; 2026-10-03): ee_offset is expressed in this
+  // object frame, so the claw target turns with the object. 0 = world axes.
+  double pick_yaw{0.0};
+  // the place pose's yaw [rad] (typed, 2026-10-03; or drop_0's): the frame
+  // ee_offset is applied in at the place. 0 = world axes.
+  double place_yaw{0.0};
 };
 
 struct PickPlaceWaypoints
@@ -159,6 +197,14 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
   const PlanOptions & opts, const PickPlaceConfig & c,
   const PickPlaceWaypoints & wp, int leg, const RestSpec & from);
 
+// A claw leg's EXIT (2026-10-03, user design: Ready -> gripper -> Exit): from
+// `from` (the hold on the target, gripper just closed / opened) straight UP by
+// approach_dz -- the safety margin -- heading and arm unchanged, back to the
+// clearance point. Throws "<leg> exit: <reason>".
+std::unique_ptr<Trajectory> planPickPlaceExit(
+  const VehicleModel & v, const TrajectoryPlanner & transition,
+  const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from);
+
 // Throws "<what>: the path leaves the geofence ..." when a sample of the body
 // origin along `traj` is outside `fence` -- or, for a bound the start itself
 // violates (a leg starting outside), further outside than the start.
@@ -167,12 +213,15 @@ void checkPathInFence(
 
 // The mission dry run behind the Plan button: leg 0 from `from`, every later
 // leg from the goal of the one before (a claw leg = its approach + descent,
-// the leg after it retreating). Throws "<leg>: <reason>" at the first
-// infeasible leg.
+// the leg after it retreating). With `exits`, each claw leg is followed by
+// its EXIT climb (stored there, indexed by the claw leg) and the next leg
+// starts from the clearance point instead, with no retreat. Throws
+// "<leg>: <reason>" at the first infeasible leg.
 std::vector<std::shared_ptr<const Trajectory>> planPickPlaceMission(
   const VehicleModel & v, const TrajectoryPlanner & transition,
   const PlanOptions & opts, const PickPlaceConfig & c,
-  const PickPlaceWaypoints & wp, const RestSpec & from);
+  const PickPlaceWaypoints & wp, const RestSpec & from,
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> * exits = nullptr);
 
 }  // namespace fsc_trajectory_planner
 

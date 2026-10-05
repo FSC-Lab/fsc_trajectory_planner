@@ -73,6 +73,26 @@ void checkPose(const VehicleModel & v, const VecN & q, const char * what, int le
   }
 }
 
+// How far past a half turn a typed turn is still flown as given [rad].
+constexpr double kTurnKeep = M_PI + 30.0 * M_PI / 180.0;
+
+double wrapAngle(double a) {return std::atan2(std::sin(a), std::cos(a));}
+
+// The heading leg `leg` ends on, on the 2*pi branch that makes its turn the
+// one the WAYPOINTS ask for (2026-10-03, user: typed 0 -> 180 -> 360 deg turns
+// the same way round twice, never twisting back): the change from the previous
+// leg's goal heading, kept as given up to kTurnKeep (so a measured pick yaw a
+// hair past the half turn does not flip the direction), the short way beyond
+// it and for the first leg; added to where the vehicle actually is (a re-fly
+// or a leg after ABORT starts elsewhere).
+double legHeading(const PickPlaceWaypoints & wp, int leg, const RestSpec & from)
+{
+  const double goal = wp.goal[leg].phi;
+  double d = leg == 0 ? wrapAngle(goal - from.phi) : goal - wp.goal[leg - 1].phi;
+  if (std::abs(d) > kTurnKeep) {d = wrapAngle(d);}
+  return goal + 2.0 * M_PI * std::round((from.phi + d - goal) / (2.0 * M_PI));
+}
+
 std::unique_ptr<Trajectory> transitionLeg(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const RestSpec & a, const RestSpec & b)
@@ -144,13 +164,17 @@ PickPlaceWaypoints pickPlaceWaypoints(
   checkPose(v, c.place_pose, "place pose", kExecutePlace);
   PickPlaceWaypoints wp;
   wp.goal[kGoToStart] = baseRest(t.start, c.home);
+  // each claw target = its 4-D pose + the ONE ee_offset in that pose's frame;
+  // the drone's yaw there = that pose's yaw (align_yaw), else facing it
+  const bool face = c.face_target && !c.align_yaw;
   wp.goal[kExecutePick] = clawRest(
-    v, c.pick_pose, t.pick + c.pick_ee_offset, wp.goal[kGoToStart].x_b, c.face_target,
-    wp.goal[kGoToStart].phi);
+    v, c.pick_pose, t.pick + Rz(t.pick_yaw) * c.ee_offset, wp.goal[kGoToStart].x_b, face,
+    c.align_yaw ? t.pick_yaw - 0.5 * M_PI : wp.goal[kGoToStart].phi);
   wp.goal[kGoToPlaceStart] = baseRest(t.place_start, c.carry);
+  // the place: the same offset, in the typed (or captured) place pose's frame
   wp.goal[kExecutePlace] = clawRest(
-    v, c.place_pose, t.place + c.place_ee_offset, wp.goal[kGoToPlaceStart].x_b, c.face_target,
-    wp.goal[kGoToPlaceStart].phi);
+    v, c.place_pose, t.place + Rz(t.place_yaw) * c.ee_offset, wp.goal[kGoToPlaceStart].x_b,
+    face, c.align_yaw ? t.place_yaw - 0.5 * M_PI : wp.goal[kGoToPlaceStart].phi);
   wp.goal[kGoToLandStart] = baseRest(t.land_start, c.home);
   wp.goal[kExecuteLand] = baseRest(t.land, c.home);
   for (int k = 0; k < kNumPickPlaceLegs; ++k) {
@@ -217,21 +241,25 @@ std::unique_ptr<Trajectory> planPickPlaceLeg(
   if (leg < 0 || leg >= kNumPickPlaceLegs) {
     throw std::runtime_error("pick-and-place: no leg " + std::to_string(leg));
   }
-  // a claw leg ends ABOVE its target; the descent is its own plan
-  const RestSpec & target = wp.approach[leg];
+  // a claw leg ends ABOVE its target; the descent is its own plan. Its
+  // heading is on the branch the waypoints' turn asks for, flown as given.
+  RestSpec target = wp.approach[leg];
+  target.phi = legHeading(wp, leg, from);
+  PlanOptions turn = opts;
+  turn.heading_as_given = true;
   std::unique_ptr<Trajectory> traj;
   try {
     std::vector<std::shared_ptr<const Trajectory>> segs;
     RestSpec start = from;
     if (from_table && (c.retreat_dz != 0.0 || c.retreat_back != 0.0)) {
       const RestSpec via = retreatRest(from, c);
-      segs.push_back(transitionLeg(v, transition, opts, from, via));
+      segs.push_back(transitionLeg(v, transition, turn, from, via));
       start = via;
     }
     if (leg == kExecutePlace) {
       segs.push_back(ArmSweepPlanner::plan(v, start, target, c.sweep));
     } else {
-      segs.push_back(transitionLeg(v, transition, opts, start, target));
+      segs.push_back(transitionLeg(v, transition, turn, start, target));
     }
     traj = std::make_unique<SequenceTrajectory>(std::move(segs));
   } catch (const std::exception & e) {
@@ -241,6 +269,40 @@ std::unique_ptr<Trajectory> planPickPlaceLeg(
   return traj;
 }
 
+namespace
+{
+// A TIMED static hold (HoldTrajectory has no duration): the claw settling
+// between the trim-first sideways move and the vertical descent.
+class PauseTrajectory : public Trajectory
+{
+public:
+  PauseTrajectory(const WholeBodyParams & p, const RestSpec & rest, double T)
+  : rest_(rest), ref_(restReference(p, rest)), T_(T)
+  {
+    diag_.T = T;
+    diag_.min_sigma_nd = sigmaNd(rest.q, p);
+    diag_.q_min_deg = rest.q * (180.0 / M_PI);
+    diag_.q_max_deg = diag_.q_min_deg;
+    std::ostringstream m;
+    m << "settle " << std::fixed << std::setprecision(1) << T << " s";
+    diag_.summary = m.str();
+  }
+  double duration() const override {return T_;}
+  WbReference eval(double) const override {return ref_;}
+  RestSpec goalRest() const override {return rest_;}
+  const PlanDiag & diag() const override {return diag_;}
+
+private:
+  RestSpec rest_;
+  WbReference ref_;
+  double T_;
+  PlanDiag diag_;
+};
+
+// a trim below this is flown in the descent itself (the whole-body law's, 1-7 mm)
+constexpr double kTrimFirstMin = 0.005;
+}  // namespace
+
 std::unique_ptr<Trajectory> planPickPlaceDescent(
   const VehicleModel & v, const TrajectoryPlanner & transition,
   const PlanOptions & opts, const PickPlaceConfig & c,
@@ -248,9 +310,53 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
 {
   const std::string what = std::string(pickPlaceLegName(leg)) + " descent";
   if (!pickPlaceLegIsClaw(leg)) {throw std::runtime_error(what + ": not a claw leg");}
+  // the goal carries the descent trim; from is the hold above the target
+  const RestSpec & goal = wp.goal[leg];
+  const double side = (goal.x_b - from.x_b).head<2>().norm();
   std::unique_ptr<Trajectory> traj;
   try {
-    traj = transitionLeg(v, transition, opts, from, wp.goal[leg]);
+    if (c.trim_settle_s > 0.0 && side > kTrimFirstMin) {
+      // TRIM FIRST: sideways at the hover height, settle, then straight down
+      RestSpec above = from;
+      above.x_b.head<2>() = goal.x_b.head<2>();
+      std::vector<std::shared_ptr<const Trajectory>> segs{
+        transitionLeg(v, transition, opts, from, above),
+        std::make_shared<PauseTrajectory>(v.params, above, c.trim_settle_s),
+        transitionLeg(v, transition, opts, above, goal)};
+      traj = std::make_unique<SequenceTrajectory>(std::move(segs));
+    } else {
+      traj = transitionLeg(v, transition, opts, from, goal);
+    }
+  } catch (const std::exception & e) {
+    throw std::runtime_error(what + ": " + e.what());
+  }
+  checkPathInFence(v, *traj, c.fence, what);
+  return traj;
+}
+
+std::unique_ptr<Trajectory> planPickPlaceExit(
+  const VehicleModel & v, const TrajectoryPlanner & transition,
+  const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from)
+{
+  const std::string what = std::string(pickPlaceLegName(leg)) + " exit";
+  if (!pickPlaceLegIsClaw(leg)) {throw std::runtime_error(what + ": not a claw leg");}
+  if (!(c.approach_dz > 0.0)) {throw std::runtime_error(what + ": the safety margin is 0");}
+  RestSpec up = from;
+  up.x_b(2) += c.approach_dz;
+  const std::string why = c.fence.violation(up.x_b);
+  if (!why.empty()) {throw std::runtime_error(what + ": " + why);}
+  PlanOptions o = opts;
+  if (c.exit_t > 0.0) {
+    // a rest-to-rest min-snap climb of dz in T peaks at 2.19 dz / T [m/s] and
+    // 7.51 dz / T^2 [m/s^2]; open the bounds to that (30 % margin for the
+    // B-spline's own profile) and let T_min set the duration
+    o.T_min = c.exit_t;
+    o.v_max = std::max(o.v_max, 1.3 * 2.19 * c.approach_dz / c.exit_t);
+    o.a_max = std::max(o.a_max, 1.3 * 7.51 * c.approach_dz / (c.exit_t * c.exit_t));
+  }
+  std::unique_ptr<Trajectory> traj;
+  try {
+    traj = transitionLeg(v, transition, o, from, up);
   } catch (const std::exception & e) {
     throw std::runtime_error(what + ": " + e.what());
   }
@@ -261,13 +367,16 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
 std::vector<std::shared_ptr<const Trajectory>> planPickPlaceMission(
   const VehicleModel & v, const TrajectoryPlanner & transition,
   const PlanOptions & opts, const PickPlaceConfig & c,
-  const PickPlaceWaypoints & wp, const RestSpec & from)
+  const PickPlaceWaypoints & wp, const RestSpec & from,
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> * exits)
 {
   std::vector<std::shared_ptr<const Trajectory>> legs;
   RestSpec r = from;
+  bool exited = false;   // the leg before was a claw leg followed by its exit
   for (int k = 0; k < kNumPickPlaceLegs; ++k) {
     std::shared_ptr<const Trajectory> leg =
-      planPickPlaceLeg(v, transition, opts, c, wp, k, r, pickPlaceLegRetreats(k));
+      planPickPlaceLeg(v, transition, opts, c, wp, k, r, pickPlaceLegRetreats(k) && !exited);
+    exited = false;
     if (pickPlaceLegIsClaw(k)) {
       // approach, then the descent from the approach rest
       std::vector<std::shared_ptr<const Trajectory>> segs{
@@ -277,6 +386,12 @@ std::vector<std::shared_ptr<const Trajectory>> planPickPlaceMission(
     }
     legs.push_back(leg);
     r = wp.goal[k];
+    if (exits != nullptr && pickPlaceLegIsClaw(k)) {
+      std::shared_ptr<const Trajectory> ex = planPickPlaceExit(v, transition, opts, c, k, r);
+      r = ex->goalRest();
+      (*exits)[k] = std::move(ex);
+      exited = true;
+    }
   }
   return legs;
 }

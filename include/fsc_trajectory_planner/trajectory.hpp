@@ -112,6 +112,10 @@ struct PlanOptions
   double tau_joint_max{3.0};
   bool rotor_bounds{true};
   int n_check{101};      // diagnostic grid, 0 disables
+  // false: the heading turns the short way between the rests; true: the goal
+  // rest's phi is taken EXACTLY as given (its 2*pi branch picks the direction
+  // -- pick-and-place, 2026-10-03). bspline only.
+  bool heading_as_given{false};
   // Called periodically inside a solve so a caller can yield (unused by the
   // C++ node -- solves run on a worker thread -- kept for parity).
   std::function<void()> yield_hook;

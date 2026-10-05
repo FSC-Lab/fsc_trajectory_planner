@@ -177,6 +177,16 @@ result is discarded, and the 100 Hz stream never waits on a solve. A plan
 takes milliseconds; the thread is kept because a stalled solver must still
 never stall the stream.
 
+**`Trajectory::eval()` MUST be thread-safe (2026-10-03).** The worker draws
+`viz_path` by sampling the new plan out to `t = T` WITHOUT the lock, while the
+stream tick evaluates the same plan near `t = 0`. `FlatPlan::eval` (wb_law)
+used `mutable` member scratch buffers, so a tick that overlapped the drawing
+published the leg's GOAL for one sample — run geo_8 (decoupled rig) got a
+2.17 m CoM step at a leg start and its drift watchdog left DIRECT. The scratch
+is now `thread_local`; `PickPlace.APlanCanBeEvaluatedFromTwoThreadsAtOnce`
+locks it (it HANGS against the old library). Any new `Trajectory` subclass:
+no mutable state in `eval`.
+
 ## Extending it
 
 **A new vehicle**: add one factory in `src/vehicle_model.cpp` returning a
@@ -440,9 +450,9 @@ is next, a re-fly included -- retreats first):
 | # | service (`whole_body_planner/pick_place/...`) | goal |
 |---|---|---|
 | 0 | `go_to_start` | `pick_place_start` + Adjust offset, arm home |
-| 1 | `execute_pick` | claw `approach_dz` ABOVE the captured `obj_0` point (+ `pick_place_pick_ee_offset`), arm in `pick_place_pick_pose_deg`, nose turned to face it; WAIT; then the vertical DESCENT onto the point |
+| 1 | `execute_pick` | claw `approach_dz` ABOVE the captured `obj_0` pose (+ `Rz(yaw) * pick_place_ee_offset`), arm in `pick_place_pick_pose_deg`, nose turned to face it; WAIT; then the vertical DESCENT onto the point |
 | 2 | `go_to_place_start` | RETREAT (climb `retreat_dz`, back off `retreat_back` along -nose), then `pick_place_place_start` + offset, arm in the carry pose |
-| 3 | `execute_place` | claw above the TYPED place point (`pick_place_place_point` + offset), **the arm sweeping its bands on the way** (`ArmSweepPlanner`); WAIT; DESCENT onto the point |
+| 3 | `execute_place` | claw above the TYPED place pose (`pick_place_place_point` + `Rz(its yaw) *` the SAME `pick_place_ee_offset`), **the arm sweeping its bands on the way** (`ArmSweepPlanner`); WAIT; DESCENT onto the point |
 | 4 | `go_to_land_start` | retreat, then `pick_place_land_start` + offset, arm home |
 | 5 | `execute_land` | `pick_place_land` + offset: the hover over the landing spot (0.8 m by default -- NOT lower, see the Isaac record below). The node never lands / arms / changes PX4 mode -- touchdown is the operator's SAFETY -> land |
 
@@ -454,14 +464,82 @@ nominal pose is shifted by -- the mocap centring changes between sessions.
 **Typed points (2026-10-02, user decision).** Only the PICK point is measured;
 start, place_start, land_start, land (`[x, y, z, yaw_deg]`) and the place
 point `pick_place_place_point` (`[x, y, z]`) are typed in -- the arm GS's
-Pick & Place tab writes these parameters live. The four BASE poses are shifted
-by the Adjust offset; **the place point is NOT** (2026-10-03, user decision,
+Pick & Place tab writes these parameters live. **Adjust WRITES its shift into
+the four BASE-pose parameters** (2026-10-03, user request): the GS's fields
+then show exactly what the legs fly to (the GS reloads them on the planner's
+parameter events), Plan adds nothing more, and a second Adjust with the vehicle
+unmoved measures ~0 against the moved Start. `pick_place/info` [0..3] is the
+LAST shift applied, for display. **The place point is NOT moved** (2026-10-03, user decision,
 same on hardware and in Isaac): it is the place mark read off mocap BEFORE the
 flight -- the cap that carries the payload then covers the mark -- so it is
 already in the mocap frame, like the captured pick point, and Adjust (where the
 vehicle stands against the typed Start) says nothing about the table. Until
 then the typed place point WAS shifted, which in Isaac's deliberately
-off-mark spawn put the release 0.17 m off the 50 mm-radius pillar. An
+off-mark spawn put the release 0.17 m off the 50 mm-radius pillar. **ONE EE
+offset, `pick_place_ee_offset`, for both claw legs** (2026-10-03, user decision:
+the same payload on the same pillars): box CG -> grasp point in the box frame;
+each claw target is its 4-D pose plus the offset in that pose's frame -- pick
+`obj_0 + Rz(captured yaw) * offset`, place `place + Rz(place yaw) * offset`. The
+place point is therefore a 4-D POSE, `[x, y, z, yaw_deg]` (a 3-value one still
+reads as yaw 0), in obj_0's reference -- where the box CG is released (pillar
+top + half the box + the release gap), not the bare pillar-top mark. The old `pick_place_pick_ee_offset`
+/ `_place_ee_offset` are refused at startup. **THE DRONE'S YAW** (2026-10-03,
+user design): `pick_place_align_yaw` (default true) puts the claw legs' drone
+yaw on the target pose's yaw -- the captured obj_0's at the pick (its rigid body
+defined so yaw 0 = the handle across a yaw-0 drone's jaws), the typed place
+pose's at the place -- instead of facing the target (`face_target`, now only
+with align off). **Typed yaws are flown as typed**: `legHeading` takes each
+leg's turn as the change from the previous leg's goal yaw, kept as given up to
+210 deg, and flies it with the flat planner's `heading_as_given` (else every
+transition turns the short way, and an exact half turn goes whichever way
+rounding tips it). So the sim mission 0 (pick) -> 180 (place start, place) ->
+360 (land start, land) turns the same way twice, monotonically (gtest
+`ClawYawFollowsTheTargetAndTypedTurnsKeepTheirDirection`); typing 0 instead of
+360 for land start turns back (the sim now types 0 -> -180 -> -360: clockwise,
+the same sense as the route). Adjust no longer wraps the yaws it writes.
+**READY -> GRIP -> EXIT** (2026-10-03, user design, arm GS cells 2 / 4): with
+`pick_place_descent_on_request` (default true) a claw leg HOLDS at
+`pick_place_approach_dz` (the GS's "Safety Margin", default 0.20) above its
+target, no timeout; `pick_place/descend_pick|descend_place` (the GS's Pick /
+Place) starts the descent, refused unless the claw is within arrival_tol of
+the point above; the leg then completes on the target; the GS closes / opens
+the gripper once its arrival error is within 2 cm (`pick_place_grip_tol`, a GS
+parameter); `pick_place/exit_pick|exit_place` climbs straight back up the
+margin (`planPickPlaceExit`), and the next leg starts there with no retreat.
+Plan's dry run draws the exits (`planPickPlaceMission(..., &exits)`). info
+[81..87]: exit T, exited, at-table, exit in flight, claw phase. **DESCENT TRIM**
+(`pick_place_descent_trim`, default true, window 1 s, max 0.10 m): while holding
+above the target the node averages the claw's error (approach EE - measured
+claw), and the descent goal's base is shifted by it, so a controller with a
+steady offset still lands the MEASURED claw on the target (the decoupled
+geometric + L1 law parks ~37 mm off on the mirror plant: unmatched force /
+Kp, and 36..79 mm between two identical flights); the arrival error stays
+measured against the true target; a request is refused above the max. With the
+trim on, the descend_* GATE checks the claw's deviation from its own average
+(the residual the trim leaves), not the raw error: a steady offset descends, a
+swinging claw waits. The loopback runs with it off ([9b] checks it on: a
+20 / -10 mm hover offset trims the goal by -20 / +10 mm).
+
+**EXIT TIME + TRIM FIRST (2026-10-03, the decoupled rig tipping at the grasp):**
+`pick_place_exit_time_s` (node default 0 = the leg bounds, ~3.2 s; the task
+block in both 4-D yamls sets 1.6) plans Exit To Pick / Place with T_min = that
+and the translational bounds opened just enough -- a 3.2 s min-snap climb left
+the clamped box on its pillar ~0.9 s into the exit. `pick_place_descent_trim_settle_s`
+(default 0; the task block sets 2.0): a descent trim > 5 mm is flown as three
+segments -- SIDEWAYS at the hover height, a timed settle (`PauseTrajectory`),
+then STRAIGHT down -- because flown inside the descent the decoupled law's ~5 cm
+trim overshot ~10 mm at the bottom, beyond the open fingertips' 8.75 mm handle
+clearance. Gtests `AnExitTimeMakesTheExitThatFastAndStillStraightUp`,
+`ALargeDescentTrimIsFlownSidewaysFirstThenStraightDown`. Pegasus
+`archive/pick_place_controllers_20261003/README.md` section 9.
+
+**SAFETY GUARD**
+(`pick_place_guard_tilt_deg` 15, `_persist_s` 0.1, 0 = off): a tilt from PX4's
+attitude held above the limit runs the ABORT path by itself (status
+"ABORTING (SAFETY GUARD: ...)", on which the arm GS opens the gripper);
+re-arms below limit - 5 deg; armed in DIRECT once a leg has flown. 15 deg from
+the measured tilts: <= 8.7 deg in the 2026-10-02 Isaac missions, <= 5.3 deg on
+the whole-body hardware flights; below the node's 20 deg watchdog. An
 `add_on_set_parameters_callback` checks
 their sizes, refuses edits while a leg is in flight and any `*_topic` change
 (fixed at launch), and makes the plan STALE on every waypoint edit (status

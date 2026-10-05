@@ -34,6 +34,12 @@
 //                 targets measured from mocap (obj_0 / drop_0). `plan` dry-
 //                 runs the whole mission; each leg's service re-plans it from
 //                 the CURRENT hold and executes it at once (pick_place.hpp).
+//     PUSH-AND-PULL MODE (2026-10-03): five steps (go_to_start, ready,
+//                 push, exit, go_to_land) that grasp a box on a table by a
+//                 handle on its side and slide it along the table with the
+//                 arm held still; the law's contact phase flag is CONTACT
+//                 from the claw's arrival on the handle (end of Ready) to the
+//                 Exit press, the claw world-held throughout (push_pull.hpp).
 //     TELEOP (2026-09-27): the PS4 pad drives the reference in real time --
 //                 D-pad + action buttons the CoM and heading, the sticks the
 //                 grasp point relative to the airframe and the wrist roll --
@@ -76,6 +82,7 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
@@ -91,6 +98,7 @@
 #include "fsc_trajectory_planner/ee_trajectory_planner.hpp"
 #include "fsc_trajectory_planner/kinematics.hpp"
 #include "fsc_trajectory_planner/pick_place.hpp"
+#include "fsc_trajectory_planner/push_pull.hpp"
 #include "fsc_trajectory_planner/teleop_reference.hpp"
 #include "fsc_trajectory_planner/trajectory.hpp"
 #include "fsc_trajectory_planner/vehicle_model.hpp"
@@ -255,6 +263,18 @@ public:
     declare_parameter<double>("ee_traj_q2_amp_deg", 8.0);
     declare_parameter<double>("ee_traj_q2_period_s", 0.0);
     declare_parameter<double>("ee_traj_qdot_max", 0.5);
+    // q2 sinusoid tied to the lap: > 0 sets ee_traj_q2_period_s = lap_time /
+    // cycles on every plan, so a lap time edited from the ground station (its
+    // Mean Velocity field) keeps the arm on whole cycles and the run ends on
+    // its start rest. 0 = use ee_traj_q2_period_s as given.
+    declare_parameter<int>("ee_traj_q2_cycles_per_lap", 0);
+    // Rate bounds for the EE trajectory ONLY (> 0 overrides v_max / a_max /
+    // w_max for this mode; 0 = inherit them). The shared bounds also size every
+    // transition (go-to-start, back-to-origin, ground-station targets); a fast
+    // figure-8 needs more CoM acceleration and yaw rate than those should get.
+    declare_parameter<double>("ee_traj_v_max", 0.0);
+    declare_parameter<double>("ee_traj_a_max", 0.0);
+    declare_parameter<double>("ee_traj_w_max", 0.0);
     declare_parameter<double>("ee_traj_time_scale", 1.0);
     declare_parameter<double>("ee_traj_start_pos_tol", 0.05);
     declare_parameter<double>("ee_traj_start_yaw_tol_deg", 5.0);
@@ -263,8 +283,8 @@ public:
 
     // --- pick-and-place mode (pick_place.hpp) ------------------------------
     // Base poses [x, y, z, yaw_deg], WORLD frame, ACTUAL yaw (the drone GS's
-    // convention). PLACEHOLDERS: every one is shifted by the Adjust offset,
-    // and any one can be measured instead from a mocap body through its
+    // convention). PLACEHOLDERS: Adjust WRITES its shift into all four (they
+    // then read what the legs fly to; 2026-10-03), and any one can be measured instead from a mocap body through its
     // pick_place_<point>_topic + capture_<point> (x, y measured; z and yaw
     // stay these).
     declare_parameter<std::vector<double>>("pick_place_start", std::vector<double>{0.0, 0.0, 1.0, 0.0});
@@ -282,18 +302,42 @@ public:
     declare_parameter<std::vector<double>>("pick_place_place_pose_deg", std::vector<double>{0.0, 0.0, 0.0, 0.0});
     declare_parameter<std::vector<double>>(
       "pick_place_carry_pose_deg", std::vector<double>{0.0, 40.0, 40.0, 0.0});
-    // The PLACE point (the place mark; the claw releases at it +
-    // pick_place_place_ee_offset), typed in [x, y, z], world [m] (2026-10-02,
+    // The PLACE pose (where the box CG is released, and its yaw -- the same
+    // reference as the captured obj_0 pose, so ONE pick_place_ee_offset serves
+    // both), typed in [x, y, z, yaw_deg], world [m] (yaw added 2026-10-03, user
+    // decision; a 3-value [x, y, z] is still read, yaw 0) (2026-10-02,
     // user decision: entered on the ground station, not measured live). NOT
     // shifted by the Adjust offset (2026-10-03, user decision): it is read off
     // mocap before the flight -- the cap that carries the payload then covers
     // the mark -- so it is already in the mocap frame, like the captured pick
     // point. A mocap capture still wins when pick_place_place_topic names a
     // body and capture_place was called.
-    declare_parameter<std::vector<double>>("pick_place_place_point", std::vector<double>{0.6, -1.6, 0.66});
-    // claw target = measured / typed point + offset, world [m]
-    declare_parameter<std::vector<double>>("pick_place_pick_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
-    declare_parameter<std::vector<double>>("pick_place_place_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter<std::vector<double>>(
+      "pick_place_place_point", std::vector<double>{0.6, -1.6, 0.66, 0.0});
+    // THE EE offset [m], ONE for both claw legs (2026-10-03, user decision:
+    // the same payload on the same pillars, so the claw goes to the same place
+    // relative to the box at both): box CG -> grasp point in the captured
+    // OBJECT's frame (obj_0 = the payload's bottom box, its CG and yaw). Pick:
+    // claw = obj_0 + Rz(yaw_obj) * offset; place: claw = place point +
+    // Rz(place yaw) * offset (PickPlaceConfig::ee_offset). Set by the arm
+    // GS's "EE Offset" button. It REPLACES pick_place_pick_ee_offset /
+    // pick_place_place_ee_offset: a file still setting those is refused below,
+    // since an ignored offset would put the claw into the box.
+    declare_parameter<std::vector<double>>("pick_place_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
+    {
+      const auto & ov = get_node_parameters_interface()->get_parameter_overrides();
+      for (const char * old : {"pick_place_pick_ee_offset", "pick_place_place_ee_offset"}) {
+        if (ov.count(old) != 0) {
+          throw std::runtime_error(
+            std::string(old) + " was replaced by pick_place_ee_offset (one EE offset for the "
+            "pick and the place, 2026-10-03): set that instead and delete " + old);
+        }
+      }
+    }
+    // the claw legs' drone yaw = the target pose's yaw (the captured object's
+    // at the pick -- its handle aligned with the jaws --, the typed place
+    // pose's at the place; 2026-10-03, user design). false: face_target.
+    declare_parameter<bool>("pick_place_align_yaw", true);
     declare_parameter<bool>("pick_place_face_target", true);
     // before go_to_place_start / go_to_land_start: climb, then back off [m]
     declare_parameter<double>("pick_place_retreat_dz", 0.15);
@@ -330,8 +374,34 @@ public:
     // has been within pick_place_arrival_tol for pick_place_settle_s; a wait
     // longer than pick_place_approach_wait_max [s] (0 = forever) ends the leg
     // incomplete, holding above.
-    declare_parameter<double>("pick_place_approach_dz", 0.10);
+    // THE SAFETY MARGIN (arm GS "Safety Margin", 2026-10-03: 0.10 -> 0.20 m):
+    // also how far exit_pick / exit_place climb back up from the target.
+    declare_parameter<double>("pick_place_approach_dz", 0.20);
+    // Exit To Pick / Place duration [s]; 0 = the leg bounds (see PickPlaceConfig::exit_t)
+    declare_parameter<double>("pick_place_exit_time_s", 0.0);
+    // Trim first: a descent trim > 5 mm is flown sideways at the hover height,
+    // held this long [s], then straight down; 0 = in the descent itself
+    declare_parameter<double>("pick_place_descent_trim_settle_s", 0.0);
     declare_parameter<double>("pick_place_approach_wait_max", 60.0);
+    // true (2026-10-03, user design: Ready -> Pick -> Exit): a claw leg ends
+    // HOLDING above its target; the descent waits for descend_pick /
+    // descend_place (the arm GS's Pick / Place button), refused unless the
+    // claw is within pick_place_arrival_tol of the point above the target,
+    // and the hold above never times out. false: the descent starts by
+    // itself once the claw has dwelt within the tolerance (2026-10-02).
+    declare_parameter<bool>("pick_place_descent_on_request", true);
+    // DESCENT TRIM (2026-10-03): a controller can hold the claw a steady few
+    // cm off its reference -- the decoupled geometric + L1 law parks at
+    // (unmatched force) / Kp, ~37 mm on the mirror plant, against +-8.75 mm of
+    // jaw clearance on the handle. While holding above the target the planner
+    // averages the claw's error over the last window, and the descent's goal
+    // is shifted by it, so the MEASURED claw lands on the target. Refused (on
+    // request) above trim_max: that much error means something else is wrong.
+    declare_parameter<bool>("pick_place_descent_trim", true);
+    declare_parameter<double>("pick_place_descent_trim_window_s", 1.0);
+    // 0.06 -> 0.10 m (2026-10-03): the decoupled law's steady hover offset
+    // varied 36..79 mm between two identical flights (geo_3 / geo_4)
+    declare_parameter<double>("pick_place_descent_trim_max", 0.10);
     declare_parameter<double>("pick_place_settle_s", 1.0);
     // PHASE-DEPENDENT EE ANCHOR (2026-10-02, Isaac pick_place_tune_20261001):
     // hold the claw in the WORLD from the moment a claw leg reaches the point
@@ -364,6 +434,18 @@ public:
     // ABORT (pick_place/abort): arm home and the vehicle this much higher [m],
     // x, y and heading kept -- the arm GS opens the gripper on the same press
     declare_parameter<double>("pick_place_abort_climb", 0.30);
+    // SAFETY GUARD (2026-10-03, user design): an AUTOMATIC abort -- the same
+    // response as the button: the arm GS opens the gripper (it sees the
+    // ABORTING status), arm home, this climb, hover -- when the body TILT
+    // (from PX4's attitude, which a mocap position flip does not move) stays
+    // above this [deg] for pick_place_guard_persist_s, in whole-body DIRECT
+    // once a pick-and-place leg has been flown. 15 deg: ~1.7x the worst
+    // nominal tilt measured (8.7 deg carrying in the 2026-10-02 Isaac runs;
+    // hardware whole-body flights <= 5.3 deg), below the whole-body node's own
+    // 20 deg tilt watchdog, which hands over to PX4. Re-arms below it - 5 deg.
+    // 0 disables.
+    declare_parameter<double>("pick_place_guard_tilt_deg", 15.0);
+    declare_parameter<double>("pick_place_guard_persist_s", 0.10);
     // a capture averages the samples of the last this-many seconds, and is
     // REFUSED when they scatter more than this: two publishers on one topic
     // (the Isaac emulator's phantom obj_0 at the origin did exactly that on
@@ -371,6 +453,94 @@ public:
     // moving / mis-tracked body must never become a goal [m]
     declare_parameter<double>("pick_place_capture_window", 0.5);
     declare_parameter<double>("pick_place_capture_max_spread", 0.02);
+
+    // --- push-and-pull mode (push_pull.hpp) --------------------------------
+    // The box: a mocap body (CG + yaw), captured by capture_box (the arm GS's
+    // Get); fixed at launch. The grasp point = the box + push_pull_ee_offset
+    // in the box's frame; the drone's ACTUAL yaw there = the box's yaw +
+    // push_pull_yaw_from_box_deg (-90: the handle on the box's +y side, the
+    // push along the box's -y).
+    declare_parameter<std::string>("push_pull_box_topic", "/obj_0/mocap");
+    declare_parameter<std::vector<double>>("push_pull_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
+    declare_parameter<double>("push_pull_yaw_from_box_deg", -90.0);
+    // the arm in the push: claw pitched 10 deg forward, 0.130 m ahead of and
+    // 0.316 m under the body origin, sigma_nd 0.298 (the pick pose)
+    declare_parameter<std::vector<double>>(
+      "push_pull_push_pose_deg", std::vector<double>{0.0, -20.0, 30.0, 0.0});
+    // THE SAFETY MARGIN: go_to_start holds the claw this far above the grasp
+    // point, ready descends it, exit climbs it [m]
+    declare_parameter<double>("push_pull_approach_dz", 0.20);
+    // the push: this far along the nose [m] (< 0 pulls), no faster than this
+    // [s], after holding the grasp this long [s] (the law's phase flag and the
+    // EE anchor switch at the press; the anchor blends over the node's
+    // wb_ee_anchor_blend_s, 1.0 s)
+    declare_parameter<double>("push_pull_push_distance", 0.50);
+    declare_parameter<double>("push_pull_push_time_s", 12.0);
+    declare_parameter<double>("push_pull_push_settle_s", 1.5);
+    declare_parameter<double>("push_pull_exit_time_s", 3.0);
+    // the land hover [x, y, z, yaw_deg] (world, ACTUAL yaw, flown as typed:
+    // from the push heading -90, -360 is 270 deg CLOCKWISE) and the start mark
+    // Adjust measures against; Adjust writes its x, y shift into both
+    declare_parameter<std::vector<double>>("push_pull_land", std::vector<double>{-0.5, 0.0, 0.8, -360.0});
+    declare_parameter<std::vector<double>>("push_pull_start_mark", std::vector<double>{0.0, 0.0, 1.0, 0.0});
+    declare_parameter<double>("push_pull_adjust_max", 0.5);
+    // THE TABLE [x_min, x_max, y_min, y_max, z_top] (world, axis-aligned; all 0
+    // = no table check): wherever the landing gear (push_pull_gear_depth under
+    // the body origin, within push_pull_gear_radius of it) or a point of the
+    // arm is over the top (+ push_pull_table_margin_xy), it must stay
+    // push_pull_table_clearance above it
+    declare_parameter<std::vector<double>>(
+      "push_pull_table", std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
+    declare_parameter<double>("push_pull_table_clearance", 0.05);
+    declare_parameter<double>("push_pull_table_margin_xy", 0.05);
+    declare_parameter<double>("push_pull_gear_depth", 0.313);
+    declare_parameter<double>("push_pull_gear_radius", 0.25);
+    declare_parameter<double>("push_pull_fence_min_z", 0.6);
+    declare_parameter<double>("push_pull_fence_max_z", 1.8);
+    declare_parameter<std::vector<double>>(
+      "push_pull_fence_xy", std::vector<double>{-2.5, 2.5, -2.5, 2.5});
+    // Ready's gate: the claw within this of the point above the handle [m]
+    // (less the descent trim, as the pick's), the trim no larger than max
+    declare_parameter<double>("push_pull_arrival_tol", 0.05);
+    declare_parameter<bool>("push_pull_descent_trim", true);
+    declare_parameter<double>("push_pull_descent_trim_window_s", 1.0);
+    declare_parameter<double>("push_pull_descent_trim_max", 0.10);
+    declare_parameter<double>("push_pull_leg_start_tol", 0.15);
+    // the claw held in the WORLD from the hover above the handle through the
+    // grasp (the pick's anchor, through pick_place_anchor_service)
+    declare_parameter<bool>("push_pull_world_anchor_ready", true);
+    // ... and through the PUSH (2026-10-04, after the first three flights):
+    // true = the claw follows the PLANNED world path while the box is
+    // clamped. With the CoM anchor a base offset drags the claw reference,
+    // loads the arm against the stuck box, and the platform observers then
+    // push the vehicle through the box's static friction until it breaks
+    // away (pl_1..3: a growing 0.3 Hz stick-slip cycle, box yaw to +-90 deg).
+    // World-held, base drift moves no reference: the arm's impedance against
+    // the planned path is what moves the box (pl_6..8: 3 / 3 pushes of
+    // 495..502 mm). false = the CoM anchor at the Push press (the first
+    // design).
+    declare_parameter<bool>("push_pull_world_anchor_push", true);
+    // THE INTERACTION PHASE: the whole-body node's contact phase flag, CONTACT
+    // from the claw's arrival on the handle (end of Ready; the jaws close
+    // next) to the Exit / Abort press; false = never call it
+    declare_parameter<bool>("push_pull_contact", true);
+    declare_parameter<std::string>(
+      "push_pull_contact_service", "fsc_autopilot_ros2/whole_body_direct_actuation/set_contact");
+    // ABORT: hold this long when the claw is on the handle (the gripper
+    // opens), climb this far, arm home
+    declare_parameter<double>("push_pull_abort_climb", 0.30);
+    declare_parameter<double>("push_pull_abort_release_wait_s", 0.5);
+    // SAFETY GUARDS -> ABORT: the tilt (PX4 attitude) above this for that
+    // long; the task force the whole-body node reads (wb_control_debug,
+    // low-passed) above this for that long while in contact. 0 disables.
+    declare_parameter<double>("push_pull_guard_tilt_deg", 15.0);
+    declare_parameter<double>("push_pull_guard_persist_s", 0.10);
+    declare_parameter<double>("push_pull_guard_force_n", 5.0);
+    declare_parameter<double>("push_pull_guard_force_persist_s", 0.30);
+    declare_parameter<std::string>(
+      "push_pull_force_topic", "fsc_autopilot_ros2/whole_body_direct_actuation/wb_control_debug");
+    declare_parameter<double>("push_pull_capture_window", 0.5);
+    declare_parameter<double>("push_pull_capture_max_spread", 0.02);
 
     // --- PS4 teleoperation (2026-09-27) -----------------------------------
     // Rates are at FULL deflection and PHYSICAL; teleop_time_scale converts
@@ -536,7 +706,24 @@ public:
     trigger(prefix + "/pick_place/adjust", [this](Trigger::Response::SharedPtr r) {onPpAdjust(r);});
     trigger(prefix + "/pick_place/plan", [this](Trigger::Response::SharedPtr r) {onPpPlan(r);});
     trigger(prefix + "/pick_place/reset", [this](Trigger::Response::SharedPtr r) {onPpReset(r);});
-    trigger(prefix + "/pick_place/abort", [this](Trigger::Response::SharedPtr r) {onPpAbort(r);});
+    trigger(prefix + "/pick_place/abort", [this](Trigger::Response::SharedPtr r) {
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          pp_guard_tripped_ = false;    // the operator's abort, not the guard's
+        }
+        onPpAbort(r);
+      });
+    // the claw legs' EXIT: straight back up the safety margin from the target
+    // (2026-10-03, user design: Ready -> gripper -> Exit)
+    // ... and their DESCENT on request (pick_place_descent_on_request)
+    trigger(prefix + "/pick_place/descend_pick",
+      [this](Trigger::Response::SharedPtr r) {onPpDescend(kExecutePick, r);});
+    trigger(prefix + "/pick_place/descend_place",
+      [this](Trigger::Response::SharedPtr r) {onPpDescend(kExecutePlace, r);});
+    trigger(prefix + "/pick_place/exit_pick",
+      [this](Trigger::Response::SharedPtr r) {onPpExit(kExecutePick, r);});
+    trigger(prefix + "/pick_place/exit_place",
+      [this](Trigger::Response::SharedPtr r) {onPpExit(kExecutePlace, r);});
     anchor_cli_ = create_client<SetBool>(get_parameter("pick_place_anchor_service").as_string());
     for (int k = 0; k < kNumPickPlaceLegs; ++k) {
       trigger(
@@ -555,6 +742,53 @@ public:
     publishPpStatus();
     publishPpInfo();
     publishPpPaths(nullptr);
+
+    // --- push-and-pull mode (arm GS "Push & Pull" tab) ---------------------
+    pl_status_pub_ = create_publisher<String>(prefix + "/push_pull/status", latched);
+    pl_info_pub_ = create_publisher<Float64MultiArray>(prefix + "/push_pull/info", latched);
+    pl_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/push_pull/path", latched);
+    pl_drone_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/push_pull/drone_path", latched);
+    pl_arrival_pub_ = create_publisher<Float64MultiArray>(prefix + "/push_pull/arrival_error", 10);
+    {
+      const auto pl_trigger = [this](const std::string & name, std::function<void(Trigger::Response::SharedPtr)> fn) {
+          pl_srvs_.push_back(create_service<Trigger>(
+            name, [fn](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {fn(r);}));
+        };
+      pl_trigger(prefix + "/push_pull/adjust", [this](Trigger::Response::SharedPtr r) {onPlAdjust(r);});
+      pl_trigger(prefix + "/push_pull/capture_box", [this](Trigger::Response::SharedPtr r) {onPlCapture(r);});
+      pl_trigger(prefix + "/push_pull/plan", [this](Trigger::Response::SharedPtr r) {onPlPlan(r);});
+      pl_trigger(prefix + "/push_pull/reset", [this](Trigger::Response::SharedPtr r) {onPlReset(r);});
+      pl_trigger(prefix + "/push_pull/abort", [this](Trigger::Response::SharedPtr r) {
+          {
+            std::lock_guard<std::recursive_mutex> lk(lock_);
+            pl_guard_tripped_ = false;    // the operator's abort, not a guard's
+          }
+          onPlAbort(r);
+        });
+      for (int k = 0; k < kNumPushPullSteps; ++k) {
+        pl_trigger(
+          prefix + "/push_pull/" + pushPullStepName(k),
+          [this, k](Trigger::Response::SharedPtr r) {onPlStep(k, r);});
+      }
+    }
+    contact_cli_ = create_client<SetBool>(get_parameter("push_pull_contact_service").as_string());
+    pl_box_topic_ = get_parameter("push_pull_box_topic").as_string();
+    if (!pl_box_topic_.empty()) {
+      pl_mocap_sub_ = create_subscription<Mocap>(
+        pl_box_topic_, rclcpp::SensorDataQoS(), [this](const Mocap & m) {onPlMocap(m);});
+    }
+    {
+      const auto ftopic = get_parameter("push_pull_force_topic").as_string();
+      if (!ftopic.empty()) {
+        pl_force_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
+          ftopic, rclcpp::SensorDataQoS(),
+          [this](const std_msgs::msg::Float32MultiArray & m) {onPlForce(m);});
+      }
+    }
+    pl_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() {publishPlArrival();});
+    publishPlStatus();
+    publishPlInfo();
+    publishPlPaths(nullptr);
 
     mode_sub_ = create_subscription<String>(
       mode_topic, latched, [this](const String & m) {onMode(m);});
@@ -614,6 +848,8 @@ public:
     // makes the plan STALE -- a plan from the old values must not be flown.
     pp_param_cb_ = add_on_set_parameters_callback(
       [this](const std::vector<rclcpp::Parameter> & ps) {return onPpParams(ps);});
+    pl_param_cb_ = add_on_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter> & ps) {return onPlParams(ps);});
 
     publishStatus();
     publishWorkspace();
@@ -630,6 +866,7 @@ public:
     if (worker_.joinable()) {worker_.join();}
     if (ee_worker_.joinable()) {ee_worker_.join();}
     if (pp_worker_.joinable()) {pp_worker_.join();}
+    if (pl_worker_.joinable()) {pl_worker_.join();}
   }
 
 private:
@@ -732,8 +969,23 @@ private:
         pp_abort_plan_.reset();
         pp_aborting_ = false;
         pp_aborted_ = false;
+        pp_guard_tripped_ = false;
         pp_planning_ = false;
         ++pp_gen_;
+        // push-and-pull: the plan and any step in flight go, and the claw is
+        // no longer on the handle (the arm planner folds it home on the
+        // revert); the box capture and the typed points stay. The whole-body
+        // node restores its yaml contact flag by itself.
+        pl_wp_.reset();
+        pl_flying_.reset();
+        pl_exec_plan_.reset();
+        pl_abort_plan_.reset();
+        pl_aborting_ = false;
+        pl_planning_ = false;
+        pl_at_handle_ = false;
+        pl_contact_ = false;
+        pl_guard_tripped_ = false;
+        ++pl_gen_;
         if (teleop_) {
           RCLCPP_WARN(get_logger(), "SAFETY -- PS4 teleoperation dropped.");
         }
@@ -752,6 +1004,9 @@ private:
     }
     publishPpStatus();
     publishPpInfo();
+    publishPlStatus();
+    publishPlInfo();
+    if (!direct) {publishPlPaths(nullptr);}
   }
 
   void setHold(const RestSpec & rest, bool keep_anchor = false)
@@ -880,9 +1135,59 @@ private:
     r_ned << 1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
       2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
       2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y);
-    std::lock_guard<std::recursive_mutex> lk(lock_);
-    att_R_ = kRIE * r_ned * kRBV;
-    att_time_ = Clock::now();
+    bool trip = false, pl_trip = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      att_R_ = kRIE * r_ned * kRBV;
+      att_time_ = Clock::now();
+      trip = guardCheck();
+      pl_trip = !trip && plGuardCheck();
+    }
+    if (pl_trip) {
+      auto resp = std::make_shared<Trigger::Response>();
+      onPlAbort(resp);
+      RCLCPP_ERROR(get_logger(), "push-and-pull SAFETY GUARD: %s -- %s", pl_guard_reason_.c_str(),
+        resp->message.c_str());
+    }
+    if (trip) {
+      // the button's path, outside the lock (it joins the planning worker)
+      auto resp = std::make_shared<Trigger::Response>();
+      onPpAbort(resp);
+      RCLCPP_ERROR(get_logger(), "pick-and-place SAFETY GUARD: %s -- %s", pp_guard_reason_.c_str(),
+        resp->message.c_str());
+    }
+  }
+
+  // The tilt guard (pick_place_guard_tilt_deg), with lock_ held: true = abort now.
+  bool guardCheck()
+  {
+    const double limit = get_parameter("pick_place_guard_tilt_deg").as_double();
+    if (!(limit > 0.0) || !att_R_.has_value()) {return false;}
+    const double tilt = std::acos(std::clamp((*att_R_)(2, 2), -1.0, 1.0)) * 180.0 / M_PI;
+    if (tilt < limit - 5.0) {
+      pp_guard_armed_ = true;     // re-armed once well below the limit
+      pp_guard_since_.reset();
+      return false;
+    }
+    const bool engaged = mode_direct_ && hold_.has_value() &&
+      (pp_completed_ >= 0 || pp_flying_.has_value() || pp_exiting_.has_value());
+    if (tilt <= limit || !engaged || !pp_guard_armed_ || pp_aborting_ || pp_abort_plan_) {
+      pp_guard_since_.reset();
+      return false;
+    }
+    if (!pp_guard_since_.has_value()) {pp_guard_since_ = Clock::now();}
+    if (secondsSince(pp_guard_since_) < get_parameter("pick_place_guard_persist_s").as_double()) {
+      return false;
+    }
+    pp_guard_armed_ = false;
+    pp_guard_since_.reset();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    m << "tilt " << tilt << " deg > " << limit << " deg";
+    pp_guard_reason_ = m.str();
+    pp_guard_tripped_ = true;
+    return true;
   }
 
   // Arm joints by name, ARM convention -> MODEL convention via arm_joint_sign.
@@ -1063,6 +1368,10 @@ private:
       pp_exec_plan_.reset();
       pp_abort_plan_.reset();
       pp_aborting_ = false;
+      pl_flying_.reset();
+      pl_exec_plan_.reset();
+      pl_abort_plan_.reset();
+      pl_aborting_ = false;
       req.rest0 = *hold_;
       std::string err;
       VecN q_goal;
@@ -1203,6 +1512,8 @@ private:
       pp_flying_.reset();
       pp_phase_ = kPpNone;
       pp_exec_plan_.reset();
+      pl_flying_.reset();
+      pl_exec_plan_.reset();
       if (mode_direct_) {state_ = "HOLD";}
     }
     publishStatus();
@@ -1573,6 +1884,13 @@ private:
           pp_at_table_ = false;   // climbed off, arm folded
         }
         pp_abort_plan_.reset();
+        if (pp_exit_plan_ && pp_exit_plan_ == plan_ && pp_exiting_.has_value()) {
+          pp_exited_[*pp_exiting_] = true;
+          pp_at_table_ = false;   // back at the clearance point: the next leg needs no retreat
+          RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", ppExitName(*pp_exiting_));
+        }
+        pp_exit_plan_.reset();
+        pp_exiting_.reset();
         if (pp_flying_.has_value() && pp_exec_plan_ && pp_exec_plan_ == plan_) {
           const int leg = *pp_flying_;
           // the leg flew to its APPROACH rest when that differs from the goal
@@ -1606,6 +1924,18 @@ private:
           pp_phase_ = kPpNone;
         }
         pp_exec_plan_.reset();
+        // push-and-pull: the abort, or a step flown to its end
+        if (pl_abort_plan_ && pl_abort_plan_ == plan_) {
+          RCLCPP_WARN(get_logger(), "push-and-pull: ABORT complete -- holding, arm home.");
+          pl_at_handle_ = false;
+        }
+        pl_abort_plan_.reset();
+        if (pl_flying_.has_value() && pl_exec_plan_ && pl_exec_plan_ == plan_) {
+          plStepDone(*pl_flying_);
+        } else {
+          pl_flying_.reset();
+        }
+        pl_exec_plan_.reset();
         setHold(plan_->goalRest());
         plan_.reset();
         pending_base_.reset();
@@ -1631,6 +1961,8 @@ private:
       publishVizPath(nullptr);
       publishPpStatus();
       publishPpInfo();
+      publishPlStatus();
+      publishPlInfo();
     }
     if (teleop_done) {
       publishStatus();
@@ -1854,10 +2186,18 @@ private:
     o.q2_center_deg = get_parameter("ee_traj_q2_center_deg").as_double();
     o.q2_amp_deg = get_parameter("ee_traj_q2_amp_deg").as_double();
     o.q2_period_s = get_parameter("ee_traj_q2_period_s").as_double();
+    const int64_t q2_cycles = get_parameter("ee_traj_q2_cycles_per_lap").as_int();
+    if (q2_cycles > 0) {
+      o.q2_period_s = get_parameter("ee_traj_lap_time").as_double() / static_cast<double>(q2_cycles);
+    }
     o.qdot_max = get_parameter("ee_traj_qdot_max").as_double();
-    o.v_max = get_parameter("v_max").as_double();
-    o.a_max = get_parameter("a_max").as_double();
-    o.w_max = get_parameter("w_max").as_double();
+    auto bound = [this](const char * ee_key, const char * shared_key) {
+        const double b = get_parameter(ee_key).as_double();
+        return b > 0.0 ? b : get_parameter(shared_key).as_double();
+      };
+    o.v_max = bound("ee_traj_v_max", "v_max");
+    o.a_max = bound("ee_traj_a_max", "a_max");
+    o.w_max = bound("ee_traj_w_max", "w_max");
     const double tjm = get_parameter("tau_joint_max").as_double();
     o.tau_joint_max = tjm > 0.0 ? tjm : -1.0;
     o.rotor_bounds = get_parameter("rotor_bounds").as_bool();
@@ -2382,7 +2722,7 @@ private:
 
   // ================================================= pick-and-place mode
   // Six legs (pick_place.hpp), each its own button. The goals come from the
-  // nominal base poses (shifted by the Adjust offset) and the claw points
+  // base-pose parameters (Adjust writes its shift into them) and the claw points
   // (pick captured, place typed; both mocap readings, not shifted); `plan` dry-runs the whole mission from the hold, and
   // each leg's service re-plans that leg from the CURRENT hold -- the vehicle
   // may have been nudged since (the PS4 fine correction) -- and executes it
@@ -2429,16 +2769,18 @@ private:
     if (!ppJoints("pick_place_carry_pose_deg", &c->carry, err) ||
       !ppJoints("pick_place_pick_pose_deg", &c->pick_pose, err) ||
       !ppJoints("pick_place_place_pose_deg", &c->place_pose, err) ||
-      !ppVec3("pick_place_pick_ee_offset", &c->pick_ee_offset, err) ||
-      !ppVec3("pick_place_place_ee_offset", &c->place_ee_offset, err) ||
+      !ppVec3("pick_place_ee_offset", &c->ee_offset, err) ||
       !ppJoints("pick_place_sweep_lo_deg", &c->sweep.lo, err) ||
       !ppJoints("pick_place_sweep_hi_deg", &c->sweep.hi, err) ||
       !ppJoints("pick_place_sweep_phase_deg", &c->sweep.phase, err))
     {
       return false;
     }
+    c->align_yaw = get_parameter("pick_place_align_yaw").as_bool();
     c->face_target = get_parameter("pick_place_face_target").as_bool();
     c->approach_dz = get_parameter("pick_place_approach_dz").as_double();
+    c->exit_t = get_parameter("pick_place_exit_time_s").as_double();
+    c->trim_settle_s = get_parameter("pick_place_descent_trim_settle_s").as_double();
     c->fence.min_z = get_parameter("pick_place_fence_min_z").as_double();
     c->fence.max_z = get_parameter("pick_place_fence_max_z").as_double();
     const auto xy = get_parameter("pick_place_fence_xy").as_double_array();
@@ -2468,8 +2810,9 @@ private:
     return true;
   }
 
-  // The goals' inputs: the nominal base poses + the Adjust offset (x, y from
-  // a mocap capture instead when one was taken), the captured pick point and
+  // The goals' inputs: the base-pose parameters as they stand -- Adjust has
+  // already written its shift into them (x, y from a mocap capture instead
+  // when one was taken), the captured pick point and
   // the typed (or captured) place point -- the two claw points are mocap
   // readings and are never shifted. Called under the lock.
   bool ppTargets(PickPlaceTargets * t, std::string * err) const
@@ -2479,9 +2822,8 @@ private:
     std::string missing;
     for (int k = 0; k < kNumPickPlaceLegs; ++k) {
       if (base[k] != nullptr) {
+        // the parameters already carry the Adjust shift (onPpAdjust writes it in)
         if (!ppBase(std::string("pick_place_") + kPpPoint[k], base[k], err)) {return false;}
-        base[k]->p += pp_offset_;
-        base[k]->yaw += pp_yaw_offset_;
         if (pp_capture_[k].has_value()) {
           base[k]->p.head<2>() = pp_capture_[k]->head<2>();   // measured: no offset
         }
@@ -2494,7 +2836,13 @@ private:
         // the mocap frame, exactly like the captured pick point. The Adjust
         // offset is where the vehicle stands relative to the typed Start; it
         // says nothing about where the table is.
-        if (!ppVec3("pick_place_place_point", &t->place, err)) {return false;}
+        const auto v = get_parameter("pick_place_place_point").as_double_array();
+        if (v.size() != 3 && v.size() != 4) {
+          *err = "pick_place_place_point needs [x, y, z, yaw_deg]";
+          return false;
+        }
+        t->place = Vec3{v[0], v[1], v[2]};
+        t->place_yaw = v.size() == 4 ? v[3] * M_PI / 180.0 : 0.0;
         continue;
       }
       if (!pp_capture_[k].has_value()) {
@@ -2503,6 +2851,8 @@ private:
         continue;
       }
       (k == kExecutePick ? t->pick : t->place) = *pp_capture_[k];
+      // a capture carries the body's yaw too: the frame ee_offset is applied in
+      (k == kExecutePick ? t->pick_yaw : t->place_yaw) = pp_capture_yaw_[k].value_or(0.0);
     }
     if (!missing.empty()) {
       *err = "capture " + missing + " first";
@@ -2543,10 +2893,16 @@ private:
         want(4);
       } else if (n == "pick_place_fence_xy") {
         want(4);
-      } else if (n == "pick_place_place_point" || n == "pick_place_pick_ee_offset" ||
-        n == "pick_place_place_ee_offset")
-      {
+      } else if (n == "pick_place_ee_offset") {
         want(3);
+      } else if (n == "pick_place_place_point") {
+        // [x, y, z, yaw_deg]; a 3-value [x, y, z] (before 2026-10-03) is yaw 0
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (p.as_double_array().size() != 3 && p.as_double_array().size() != 4))
+        {
+          r.successful = false;
+          r.reason = n + " needs [x, y, z, yaw_deg]";
+        }
       }
       if (!r.successful) {return r;}
       // what only gates or reports leaves the plan valid
@@ -2555,7 +2911,11 @@ private:
         n != "pick_place_adjust_yaw" && n != "pick_place_settle_s" &&
         n != "pick_place_approach_wait_max" && n != "pick_place_leg_start_tol" &&
         n != "pick_place_adjust_max" && n != "pick_place_abort_climb" &&
-        n != "pick_place_world_anchor_pick" && n != "pick_place_world_anchor_place")
+        n != "pick_place_world_anchor_pick" && n != "pick_place_world_anchor_place" &&
+        n != "pick_place_descent_on_request" && n != "pick_place_guard_tilt_deg" &&
+        n != "pick_place_descent_trim" && n != "pick_place_descent_trim_window_s" &&
+        n != "pick_place_descent_trim_max" &&
+        n != "pick_place_guard_persist_s")
       {
         stale = true;
       }
@@ -2580,10 +2940,13 @@ private:
   {
     const Vec3 p{msg.pose.position.x, msg.pose.position.y, msg.pose.position.z};
     if (!p.allFinite()) {return;}
+    // the body's yaw (ENU): the pick object's heading, which pick_place_ee_offset follows
+    const auto & o = msg.pose.orientation;
+    const double yaw = std::atan2(2.0 * (o.w * o.z + o.x * o.y), 1.0 - 2.0 * (o.y * o.y + o.z * o.z));
     std::lock_guard<std::recursive_mutex> lk(lock_);
     auto & d = pp_mocap_[k];
-    d.emplace_back(Clock::now(), p);
-    while (d.size() > 1 && (secondsSince(d.front().first) > 2.0 || d.size() > 2000)) {
+    d.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0});
+    while (d.size() > 1 && (secondsSince(d.front().t) > 2.0 || d.size() > 2000)) {
       d.pop_front();
     }
   }
@@ -2619,8 +2982,13 @@ private:
       const double window = get_parameter("pick_place_capture_window").as_double();
       Vec3 sum = Vec3::Zero();
       std::vector<Vec3> pts;
+      double ys = 0.0, yc = 0.0;
       for (const auto & s : pp_mocap_[k]) {
-        if (secondsSince(s.first) <= window) {pts.push_back(s.second);}
+        if (secondsSince(s.t) <= window) {
+          pts.push_back(s.p);
+          ys += std::sin(s.yaw);
+          yc += std::cos(s.yaw);
+        }
       }
       if (pts.empty()) {
         m.precision(2);
@@ -2647,12 +3015,15 @@ private:
         return;
       }
       const bool was_planned = pp_wp_.has_value();
+      const double yaw = std::atan2(ys, yc);   // circular mean: no wrap at +-180 deg
       pp_capture_[k] = mean;
+      pp_capture_yaw_[k] = yaw;
       ppInvalidate();
       m.precision(3);
       m << "captured " << kPpPoint[k] << " at [" << mean(0) << ", " << mean(1) << ", " << mean(2)
-        << "] m from " << pp_topic_[k] << " (" << pts.size() << " samples, spread "
-        << std::setprecision(1) << spread * 1e3 << " mm)";
+        << "] m, yaw " << std::setprecision(1) << yaw * 180.0 / M_PI << " deg from " << pp_topic_[k]
+        << " (" << pts.size() << " samples, spread " << spread * 1e3 << " mm)";
+      if (k == kExecutePick) {m << "; the EE offset is applied in this object frame";}
       if (k != kExecutePick && k != kExecutePlace) {m << "; x, y replace the nominal pose";}
       if (was_planned) {m << " -- the plan is stale, press Plan";}
     }
@@ -2711,12 +3082,40 @@ private:
         resp->message = m.str();
         return;
       }
-      pp_offset_ = off;
+      // WRITE the shift into the four drone-point parameters themselves
+      // (2026-10-03, user request): the arm GS's typed fields then show exactly
+      // what the legs fly to, and a second Adjust with the vehicle unmoved
+      // measures ~0 against the moved Start. Place is never moved.
+      std::vector<rclcpp::Parameter> moved;
+      for (const char * name : {"pick_place_start", "pick_place_place_start",
+          "pick_place_land_start", "pick_place_land"})
+      {
+        auto v = get_parameter(name).as_double_array();
+        if (v.size() != 4) {
+          resp->success = false;
+          resp->message = std::string(name) + " needs 4 numbers -- not adjusted";
+          return;
+        }
+        v[0] += off(0);
+        v[1] += off(1);
+        v[2] += off(2);
+        v[3] += yoff * 180.0 / M_PI;   // NOT wrapped: 0 -> 180 -> 360 is a typed turn direction
+        moved.emplace_back(name, v);
+      }
+      const auto results = set_parameters(moved);   // onPpParams: checked, plan made stale
+      for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].successful) {
+          resp->success = false;
+          resp->message = moved[i].get_name() + " not moved: " + results[i].reason;
+          return;
+        }
+      }
+      pp_offset_ = off;          // the LAST shift applied -- shown, not added again
       pp_yaw_offset_ = yoff;
       ppInvalidate();
-      m << "offset [" << off(0) << ", " << off(1) << ", " << off(2) << "] m, yaw "
+      m << "drone points moved by [" << off(0) << ", " << off(1) << ", " << off(2) << "] m, yaw "
         << std::setprecision(1) << yoff * 180.0 / M_PI
-        << " deg -- the four drone points are shifted by it (not Place); press Plan";
+        << " deg (written into Start, Place Start, Land Start, Land; Place not moved); press Plan";
     }
     resp->success = true;
     resp->message = m.str();
@@ -2764,6 +3163,7 @@ private:
       gen = pp_gen_;
       pp_planning_ = true;
       pp_aborted_ = false;
+      pp_guard_tripped_ = false;
     }
     publishPpStatus();
     publishPpPaths(nullptr);
@@ -2771,12 +3171,18 @@ private:
     pp_worker_ = std::thread([this, tg, cfg, opts, from, gen]() {
         std::optional<PickPlaceWaypoints> wp;
         std::vector<std::shared_ptr<const Trajectory>> legs;
+        std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> exits;
         std::shared_ptr<Trajectory> whole;
         std::string err;
         try {
           wp = pickPlaceWaypoints(*vehicle_, cfg, tg);
-          legs = planPickPlaceMission(*vehicle_, *planner_, opts, cfg, *wp, from);
-          whole = std::make_shared<SequenceTrajectory>(legs);
+          legs = planPickPlaceMission(*vehicle_, *planner_, opts, cfg, *wp, from, &exits);
+          std::vector<std::shared_ptr<const Trajectory>> all;   // drawn: each exit after its leg
+          for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+            all.push_back(legs[k]);
+            if (exits[k]) {all.push_back(exits[k]);}
+          }
+          whole = std::make_shared<SequenceTrajectory>(all);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -2791,11 +3197,13 @@ private:
             pp_wp_ = wp;
             for (int k = 0; k < kNumPickPlaceLegs; ++k) {
               pp_leg_T_[k] = legs[k]->duration();
+              pp_exit_T_[k] = exits[k] ? exits[k]->duration() : 0.0;
               RCLCPP_INFO(
                 get_logger(), "pick-and-place %s: %s", pickPlaceLegName(k),
                 legs[k]->diag().summary.c_str());
             }
-            RCLCPP_INFO(get_logger(), "pick-and-place planned: %.1f s of flight in six legs.", whole->duration());
+            RCLCPP_INFO(get_logger(), "pick-and-place planned: %.1f s of flight in six legs and two exits.",
+              whole->duration());
           }
         }
         publishPpStatus();
@@ -2867,10 +3275,12 @@ private:
       home_goal_ = false;
       pp_flying_ = leg;
       pp_phase_ = kPpTravel;
+      pp_exited_[leg] = false;
       pp_exec_plan_.reset();
       pp_error_.clear();
       pp_timed_out_ = false;
       pp_aborted_ = false;
+      pp_guard_tripped_ = false;
       restoreAnchor();
     }
     const bool from_table = pp_at_table_;
@@ -2994,6 +3404,8 @@ private:
       pp_timed_out_ = false;
       pp_aborted_ = true;
       pp_aborting_ = true;
+      pp_exit_plan_.reset();
+      pp_exiting_.reset();
       restoreAnchor();                  // the climb is a flight motion: CoM anchor
     }
     publishStatus();
@@ -3044,6 +3456,193 @@ private:
     RCLCPP_WARN(get_logger(), "pick-and-place: %s", resp->message.c_str());
   }
 
+  // EXIT (exit_pick / exit_place, 2026-10-03, user design): from the hold on a
+  // claw target -- the gripper just closed (pick) or opened (place) on the arm
+  // GS -- straight up by the safety margin (pick_place_approach_dz) to the
+  // clearance point, heading and arm unchanged, CoM anchor (a flight motion).
+  // The leg after it then starts there, with no retreat.
+  void onPpExit(int leg, Trigger::Response::SharedPtr resp)
+  {
+    RestSpec from;
+    PickPlaceConfig cfg;
+    PlanOptions opts;
+    unsigned gen = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::string err;
+      if (!mode_direct_ || !hold_.has_value()) {
+        err = "not in whole-body DIRECT";
+      } else if (pp_planning_) {
+        err = "the mission is still planning";
+      } else if (pp_flying_.has_value() || pp_exiting_.has_value() || pp_aborting_ || pp_abort_plan_) {
+        err = "a pick-and-place motion is in flight -- wait for it, or Abort";
+      } else if (teleopActive()) {
+        err = "PS4 teleoperation engaged -- disengage it first";
+      } else if (state_ == "EXECUTING" || state_ == "CALCULATING") {
+        err = "planner is " + state_ + " -- wait for HOLD";
+      } else if (pp_completed_ != leg || !pp_at_table_) {
+        err = std::string("not holding on the ") + (leg == kExecutePick ? "pick" : "place") +
+          " target -- fly " + pickPlaceLegName(leg) + " first";
+      } else if (!odom_p_.has_value() || secondsSince(odom_p_time_) > kOdomFreshS) {
+        err = "no fresh odometry -- a climb must not start blind";
+      }
+      if (err.empty()) {ppConfig(&cfg, &err);}
+      if (!err.empty()) {
+        resp->success = false;
+        resp->message = std::string(ppExitName(leg)) + ": " + err;
+        return;
+      }
+      from = *hold_;
+      opts = planOptions();
+      gen = ++plan_gen_;
+      state_ = "CALCULATING";
+      plan_.reset();
+      goal_override_.reset();
+      auto_send_ = false;
+      pending_base_.reset();
+      ee_target_.reset();
+      home_goal_ = false;
+      pp_exiting_ = leg;
+      pp_exit_plan_.reset();
+      pp_error_.clear();
+      pp_timed_out_ = false;
+      pp_aborted_ = false;
+      pp_guard_tripped_ = false;
+      restoreAnchor();                  // the climb is a flight motion: CoM anchor
+    }
+    publishStatus();
+    publishPpStatus();
+    publishPpInfo();
+    if (worker_.joinable()) {worker_.join();}
+    worker_ = std::thread([this, leg, from, cfg, opts, gen]() {
+        std::shared_ptr<Trajectory> traj;
+        std::string err;
+        try {
+          traj = planPickPlaceExit(*vehicle_, *planner_, opts, cfg, leg, from);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != plan_gen_ || state_ != "CALCULATING") {return;}   // superseded
+          if (!traj) {
+            state_ = "INFEASIBLE";
+            infeasible_reason_ = err;
+            pp_error_ = err;
+            pp_exiting_.reset();
+            RCLCPP_WARN(get_logger(), "pick-and-place exit refused: %s", err.c_str());
+          } else {
+            plan_ = traj;
+            pp_exit_plan_ = traj;
+            exec_t0_ = Clock::now();
+            state_ = "EXECUTING";
+            RCLCPP_INFO(get_logger(), "pick-and-place %s: executing -- %s", ppExitName(leg),
+              traj->diag().summary.c_str());
+          }
+        }
+        publishStatus();
+        publishPpStatus();
+        publishPpInfo();
+        publishVizPath(traj.get());
+      });
+    resp->success = true;
+    resp->message = std::string(ppExitName(leg)) + ": climbing " +
+      std::to_string(static_cast<int>(std::lround(cfg.approach_dz * 100.0))) +
+      " cm straight up to the clearance point";
+    RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
+  }
+
+  static const char * ppExitName(int leg) {return leg == kExecutePick ? "exit_pick" : "exit_place";}
+
+  // What the descent gate checks (lock_ held): the claw's current error, less
+  // the trim when it is on (the steady part the descent will cancel).
+  double descentResidual() const
+  {
+    if (pp_trim_buf_.empty()) {return pp_last_err_;}
+    return (pp_trim_buf_.back().second - descentTrim()).norm();
+  }
+
+  // The descent trim (lock_ held): the mean claw error over the hover window,
+  // zero when disabled or with under half a window of samples.
+  Vec3 descentTrim() const
+  {
+    if (!get_parameter("pick_place_descent_trim").as_bool() || pp_trim_buf_.size() < 2) {
+      return Vec3::Zero();
+    }
+    const double span = std::chrono::duration<double>(
+      pp_trim_buf_.back().first - pp_trim_buf_.front().first).count();
+    if (span < 0.5 * get_parameter("pick_place_descent_trim_window_s").as_double()) {
+      return Vec3::Zero();
+    }
+    Vec3 m = Vec3::Zero();
+    for (const auto & s : pp_trim_buf_) {m += s.second;}
+    return m / static_cast<double>(pp_trim_buf_.size());
+  }
+
+  // DESCENT ON REQUEST (descend_pick / descend_place, the arm GS's Pick /
+  // Place button): from the hold above the target straight down onto it, the
+  // claw leg then completing there as before. Refused unless the leg is
+  // holding above its target with the claw within pick_place_arrival_tol of
+  // the point above it.
+  void onPpDescend(int leg, Trigger::Response::SharedPtr resp)
+  {
+    const char * name = leg == kExecutePick ? "descend_pick" : "descend_place";
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::string err;
+      const double tol = get_parameter("pick_place_arrival_tol").as_double();
+      if (!mode_direct_ || !hold_.has_value()) {
+        err = "not in whole-body DIRECT";
+      } else if (!get_parameter("pick_place_descent_on_request").as_bool()) {
+        err = "the descent starts by itself (pick_place_descent_on_request is false)";
+      } else if (!pp_flying_.has_value() || *pp_flying_ != leg || pp_phase_ != kPpWait ||
+        state_ != "HOLD")
+      {
+        err = std::string("not holding above the ") + (leg == kExecutePick ? "pick" : "place") +
+          " target -- fly " + pickPlaceLegName(leg) + " (Ready) first";
+      } else if (teleopActive()) {
+        err = "PS4 teleoperation engaged -- disengage it first";
+      } else if (!(descentResidual() <= tol)) {
+        // with the trim, a STEADY offset is fine (the trim cancels it): what
+        // must be inside the tolerance is the claw's deviation from its own
+        // average -- a claw still swinging waits
+        std::ostringstream m;
+        m.setf(std::ios::fixed);
+        m.precision(0);
+        m << "the claw is " << descentResidual() * 1e3 << " mm from "
+          << (get_parameter("pick_place_descent_trim").as_bool() ? "its trimmed point above the target"
+                                                                 : "the point above the target")
+          << " (> " << tol * 1e3 << " mm) -- wait for it to settle";
+        err = m.str();
+      } else if (descentTrim().norm() > get_parameter("pick_place_descent_trim_max").as_double()) {
+        std::ostringstream m;
+        m.setf(std::ios::fixed);
+        m.precision(0);
+        m << "the claw holds " << descentTrim().norm() * 1e3 << " mm off the point above the target "
+          << "on average (> pick_place_descent_trim_max " << get_parameter("pick_place_descent_trim_max").as_double() * 1e3
+          << " mm) -- not trimming that far";
+        err = m.str();
+      }
+      if (!err.empty()) {
+        resp->success = false;
+        resp->message = std::string(name) + ": " + err;
+        return;
+      }
+    }
+    startPpDescent();
+    resp->success = true;
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      m << name << ": descending onto the target (goal trimmed by [" << pp_descent_trim_(0) * 1e3 << ", "
+        << pp_descent_trim_(1) * 1e3 << ", " << pp_descent_trim_(2) * 1e3 << "] mm, the hover error)";
+    }
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
+  }
+
   // Ask the whole-body node for the CoM (com = true) or world anchor. Fire and
   // forget: the node blends over its own wb_ee_anchor_blend_s, refuses outside
   // DIRECT, and restores its yaml anchor on every mode change by itself.
@@ -3079,7 +3678,9 @@ private:
       }
       pp_completed_ = -1;
       pp_aborted_ = false;
+      pp_guard_tripped_ = false;
       pp_at_table_ = false;
+      pp_exited_.fill(false);
       ppInvalidate();
       restoreAnchor();
     }
@@ -3124,6 +3725,19 @@ private:
         want = above ? pp_wp_->approach_ee[leg] : pp_wp_->ee[leg];
       }
       const Vec3 e = want - meas;
+      // the descent trim's samples: the claw's error while holding above
+      if (claw && pp_phase_ == kPpWait && state_ == "HOLD") {
+        const auto now = Clock::now();
+        pp_trim_buf_.push_back({now, e});
+        const double win = get_parameter("pick_place_descent_trim_window_s").as_double();
+        while (!pp_trim_buf_.empty() &&
+          std::chrono::duration<double>(now - pp_trim_buf_.front().first).count() > win)
+        {
+          pp_trim_buf_.pop_front();
+        }
+      } else if (pp_phase_ != kPpWait) {
+        pp_trim_buf_.clear();
+      }
       const double tol = get_parameter("pick_place_arrival_tol").as_double();
       const bool within = e.norm() <= tol;
       // a DWELL inside the tolerance (audit L1): the claw settles THROUGH it
@@ -3136,7 +3750,9 @@ private:
         secondsSince(pp_within_since_) >= get_parameter("pick_place_settle_s").as_double();
       const bool settled = dwelt && !pp_flying_.has_value() && state_ == "HOLD";
       pp_last_err_ = e.norm();
-      if (pp_phase_ == kPpWait && state_ == "HOLD") {
+      if (pp_phase_ == kPpWait && state_ == "HOLD" &&
+        !get_parameter("pick_place_descent_on_request").as_bool())
+      {
         const double wait_max = get_parameter("pick_place_approach_wait_max").as_double();
         if (dwelt) {
           descend = true;
@@ -3202,17 +3818,24 @@ private:
       leg = *pp_flying_;
       from = *hold_;
       wp = *pp_wp_;
+      // the descent trim: shift the goal by the averaged hover error (the
+      // arm pose is fixed, so moving the base moves the claw alike); the
+      // arrival error stays measured against the TRUE target (pp_wp_)
+      pp_descent_trim_ = descentTrim();
+      wp.goal[leg].x_b += pp_descent_trim_;
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
       plan_.reset();
       pp_phase_ = kPpDescent;
       pp_exec_plan_.reset();
-      RCLCPP_INFO(get_logger(), "pick-and-place %s: claw within tolerance above the target -- descending.",
-        pickPlaceLegName(leg));
+      RCLCPP_INFO(get_logger(), "pick-and-place %s: claw within tolerance above the target -- descending "
+        "(goal trimmed by [%.1f, %.1f, %.1f] mm, the hover error).", pickPlaceLegName(leg),
+        pp_descent_trim_(0) * 1e3, pp_descent_trim_(1) * 1e3, pp_descent_trim_(2) * 1e3);
     }
     publishStatus();
     publishPpStatus();
+    publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
     worker_ = std::thread([this, leg, from, wp, cfg, opts, gen]() {
         std::shared_ptr<Trajectory> traj;
@@ -3257,24 +3880,33 @@ private:
       if (!mode_direct_) {
         m << "NOT IN DIRECT";
       } else if (pp_aborting_ || pp_abort_plan_) {
-        m << "ABORTING -- arm home, climbing " << std::setprecision(2) << pp_abort_climb_ << " m";
+        m << "ABORTING" << (pp_guard_tripped_ ? " (SAFETY GUARD: " + pp_guard_reason_ + ")" : std::string())
+          << " -- gripper open, arm home, climbing " << std::setprecision(2) << pp_abort_climb_ << " m";
       } else if (pp_planning_) {
         m << "PLANNING";
       } else if (pp_flying_.has_value() && pp_phase_ == kPpWait) {
         m << "WAITING " << pickPlaceLegName(*pp_flying_) << ": claw " << std::setprecision(0)
           << pp_last_err_ * 1e3 << " mm from the point above the target (tolerance "
-          << get_parameter("pick_place_arrival_tol").as_double() * 1e3
-          << " mm) -- descends once inside";
+          << get_parameter("pick_place_arrival_tol").as_double() * 1e3;
+        if (get_parameter("pick_place_descent_on_request").as_bool()) {
+          m << " mm) -- press " << (*pp_flying_ == kExecutePick ? "Pick" : "Place") << " to descend";
+        } else {
+          m << " mm) -- descends once inside";
+        }
       } else if (pp_flying_.has_value()) {
         m << "FLYING " << pickPlaceLegName(*pp_flying_);
         if (pickPlaceLegIsClaw(*pp_flying_)) {
           m << (pp_phase_ == kPpDescent ? " (descent)" : " (approach)");
         }
         if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
+      } else if (pp_exiting_.has_value()) {
+        m << "FLYING " << ppExitName(*pp_exiting_) << " (up the safety margin)";
+        if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
       } else if (!pp_error_.empty()) {
         m << (pp_timed_out_ ? "INCOMPLETE: " : "INFEASIBLE: ") << pp_error_;
       } else if (pp_aborted_) {
-        m << "ABORTED -- holding higher, arm home; ";
+        m << "ABORTED" << (pp_guard_tripped_ ? " (SAFETY GUARD: " + pp_guard_reason_ + ")" : std::string())
+          << " -- holding higher, arm home; ";
         if (!pp_wp_.has_value()) {
           m << "press Plan";
         } else if (pp_completed_ >= kNumPickPlaceLegs - 1) {
@@ -3291,9 +3923,18 @@ private:
       } else if (pp_completed_ < 0) {
         m << "READY next=" << pickPlaceLegName(0);
       } else {
-        m << "DONE " << pickPlaceLegName(pp_completed_) << " next="
-          << pickPlaceLegName(pp_completed_ + 1);
-        if (pickPlaceLegIsClaw(pp_completed_)) {
+        const bool claw = pickPlaceLegIsClaw(pp_completed_);
+        if (claw && pp_exited_[pp_completed_]) {
+          m << "DONE " << ppExitName(pp_completed_) << " next=" << pickPlaceLegName(pp_completed_ + 1);
+        } else if (claw && pp_at_table_) {
+          m << "DONE " << pickPlaceLegName(pp_completed_) << " next="
+            << (pp_completed_ == kExecutePick ? "exit_pick (close the gripper first)"
+                                              : "exit_place (open the gripper first)");
+        } else {
+          m << "DONE " << pickPlaceLegName(pp_completed_) << " next="
+            << pickPlaceLegName(pp_completed_ + 1);
+        }
+        if (claw && !pp_exited_[pp_completed_]) {
           m << (pp_settled_ ? " -- claw within tolerance: fine correction OK"
                 : pp_within_ ? " -- claw inside tolerance, settling"
                              : " -- claw outside tolerance");
@@ -3311,7 +3952,12 @@ private:
   // tolerance [m], [8..13] each leg's planned duration [s], [14..55] per leg
   // [goal base x, y, z, actual yaw deg, claw x, y, z], [56..79] per point
   // (start, pick, place_start, place, land_start, land) [captured x, y, z,
-  // valid]. NaN where there is nothing.
+  // valid], [80] the captured pick object's yaw [deg] (2026-10-03; the frame
+  // pick_place_ee_offset is applied in), [81] / [82] exit_pick / exit_place
+  // planned duration [s], [83] / [84] exit_pick / exit_place flown (0 / 1),
+  // [85] holding on a claw target (0 / 1), [86] the exit in flight (1 pick,
+  // 3 place, -1 none), [87] the claw leg's phase (0 none, 1 to the point
+  // above, 2 holding there, 3 the descent). NaN where there is nothing.
   void publishPpInfo()
   {
     Float64MultiArray m;
@@ -3333,7 +3979,7 @@ private:
         const RestSpec & g = pp_wp_->goal[k];
         const Vec3 & e = pp_wp_->ee[k];
         m.data.insert(
-          m.data.end(), {g.x_b(0), g.x_b(1), g.x_b(2), wrapPi(g.phi + 0.5 * M_PI) * 180.0 / M_PI,
+          m.data.end(), {g.x_b(0), g.x_b(1), g.x_b(2), (g.phi + 0.5 * M_PI) * 180.0 / M_PI,
             e(0), e(1), e(2)});
       }
       for (int k = 0; k < kNumPickPlaceLegs; ++k) {
@@ -3344,6 +3990,15 @@ private:
           m.data.insert(m.data.end(), {nan, nan, nan, 0.0});
         }
       }
+      const auto & py = pp_capture_yaw_[kExecutePick];
+      m.data.push_back(py.has_value() ? *py * 180.0 / M_PI : nan);
+      for (int k : {kExecutePick, kExecutePlace}) {
+        m.data.push_back(pp_wp_.has_value() ? pp_exit_T_[k] : nan);
+      }
+      for (int k : {kExecutePick, kExecutePlace}) {m.data.push_back(pp_exited_[k] ? 1.0 : 0.0);}
+      m.data.push_back(pp_at_table_ ? 1.0 : 0.0);
+      m.data.push_back(pp_exiting_.has_value() ? static_cast<double>(*pp_exiting_) : -1.0);
+      m.data.push_back(static_cast<double>(pp_phase_));
     }
     pp_info_pub_->publish(m);
   }
@@ -3357,6 +4012,1082 @@ private:
     }
     pp_path_pub_->publish(a);
     pp_drone_path_pub_->publish(b);
+  }
+
+  // ================================================== push-and-pull mode
+  // Five steps (push_pull.hpp), one button each on the arm GS's "Push & Pull"
+  // tab: go_to_start (the claw the safety margin straight above the box's
+  // handle, the nose along the push), ready (straight down onto the handle --
+  // the GS opens the gripper first), push (the GS has CLOSED the gripper on
+  // the handle: the law's phase flag is CONTACT (since the end of ready), the
+  // claw stays world-held (push_pull_world_anchor_push), and the base slides
+  // the box push_distance along the nose
+  // with the arm held still), exit (the GS has OPENED the gripper: the phase
+  // flag back to free, straight up, arm home), go_to_land (a hover over the
+  // landing spot, turning the typed way round). The box is MEASURED (Get,
+  // mocap obj_0: its CG and yaw); the land point is typed and moved by Adjust.
+  // Every step re-plans from the CURRENT hold and executes as soon as it is
+  // planned; the steps go in order (go_to_land and go_to_start whenever the
+  // claw is off the handle).
+  bool plConfig(PushPullConfig * c, std::string * err) const
+  {
+    c->home = home_pose_;
+    if (!ppJoints("push_pull_push_pose_deg", &c->push_pose, err) ||
+      !ppVec3("push_pull_ee_offset", &c->ee_offset, err))
+    {
+      return false;
+    }
+    c->yaw_from_box = get_parameter("push_pull_yaw_from_box_deg").as_double() * M_PI / 180.0;
+    c->approach_dz = get_parameter("push_pull_approach_dz").as_double();
+    c->push_distance = get_parameter("push_pull_push_distance").as_double();
+    c->push_time = get_parameter("push_pull_push_time_s").as_double();
+    c->push_settle = get_parameter("push_pull_push_settle_s").as_double();
+    c->exit_time = get_parameter("push_pull_exit_time_s").as_double();
+    c->fence.min_z = get_parameter("push_pull_fence_min_z").as_double();
+    c->fence.max_z = get_parameter("push_pull_fence_max_z").as_double();
+    const auto xy = get_parameter("push_pull_fence_xy").as_double_array();
+    if (xy.size() != 4) {
+      *err = "push_pull_fence_xy needs [x_min, x_max, y_min, y_max]";
+      return false;
+    }
+    c->fence.x_min = xy[0];
+    c->fence.x_max = xy[1];
+    c->fence.y_min = xy[2];
+    c->fence.y_max = xy[3];
+    const auto tb = get_parameter("push_pull_table").as_double_array();
+    if (tb.size() != 5) {
+      *err = "push_pull_table needs [x_min, x_max, y_min, y_max, z_top] (all 0 = no table check)";
+      return false;
+    }
+    c->table.x_min = tb[0];
+    c->table.x_max = tb[1];
+    c->table.y_min = tb[2];
+    c->table.y_max = tb[3];
+    c->table.z_top = tb[4];
+    c->table_clearance = get_parameter("push_pull_table_clearance").as_double();
+    c->table_margin_xy = get_parameter("push_pull_table_margin_xy").as_double();
+    c->gear_depth = get_parameter("push_pull_gear_depth").as_double();
+    c->gear_radius = get_parameter("push_pull_gear_radius").as_double();
+    return true;
+  }
+
+  // The goals' inputs: the captured box and the typed (Adjust-shifted) land
+  // hover. Called under the lock.
+  bool plTargets(PushPullTargets * t, std::string * err) const
+  {
+    if (!ppBase("push_pull_land", &t->land, err)) {return false;}
+    if (!pl_box_.has_value()) {
+      *err = "Get the box first (" + (pl_box_topic_.empty()
+        ? std::string("no push_pull_box_topic set") : "mocap " + pl_box_topic_) + ")";
+      return false;
+    }
+    t->box = *pl_box_;
+    t->box_yaw = pl_box_yaw_.value_or(0.0);
+    return true;
+  }
+
+  rcl_interfaces::msg::SetParametersResult onPlParams(const std::vector<rclcpp::Parameter> & ps)
+  {
+    rcl_interfaces::msg::SetParametersResult r;
+    r.successful = true;
+    // only gate or report: the plan stays valid when these change
+    static const char * const kGateOnly[] = {
+      "push_pull_arrival_tol", "push_pull_leg_start_tol", "push_pull_adjust_max",
+      "push_pull_abort_climb", "push_pull_abort_release_wait_s", "push_pull_guard_tilt_deg",
+      "push_pull_guard_persist_s", "push_pull_guard_force_n", "push_pull_guard_force_persist_s",
+      "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
+      "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
+      "push_pull_capture_window",
+      "push_pull_capture_max_spread", "push_pull_start_mark"};
+    bool stale = false;
+    for (const auto & p : ps) {
+      const std::string & n = p.get_name();
+      if (n.rfind("push_pull_", 0) != 0) {continue;}
+      if (n == "push_pull_box_topic" || n == "push_pull_contact_service" ||
+        n == "push_pull_force_topic")
+      {
+        r.successful = false;
+        r.reason = n + " is fixed at launch (its subscription / client is made then)";
+        return r;
+      }
+      size_t len = 0;
+      if (n == "push_pull_land" || n == "push_pull_start_mark" || n == "push_pull_push_pose_deg" ||
+        n == "push_pull_fence_xy")
+      {
+        len = 4;
+      } else if (n == "push_pull_ee_offset") {
+        len = 3;
+      } else if (n == "push_pull_table") {
+        len = 5;
+      }
+      if (len > 0 && (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+        p.as_double_array().size() != len))
+      {
+        r.successful = false;
+        r.reason = n + " needs " + std::to_string(len) + " numbers";
+        return r;
+      }
+      if (std::none_of(std::begin(kGateOnly), std::end(kGateOnly),
+        [&n](const char * g) {return n == g;}))
+      {
+        stale = true;
+      }
+    }
+    if (stale) {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pl_flying_.has_value()) {
+        r.successful = false;
+        r.reason = "a push-and-pull step is in flight -- edit once it holds";
+        return r;
+      }
+      if (pl_wp_.has_value() || pl_planning_) {
+        RCLCPP_INFO(get_logger(), "push-and-pull: parameters changed -- the plan is stale, press Plan");
+      }
+      plInvalidate();
+      pl_params_dirty_ = true;   // published from the 10 Hz timer, once the values are set
+    }
+    return r;
+  }
+
+  void onPlMocap(const Mocap & msg)
+  {
+    const Vec3 p{msg.pose.position.x, msg.pose.position.y, msg.pose.position.z};
+    if (!p.allFinite()) {return;}
+    const auto & o = msg.pose.orientation;
+    const double yaw = std::atan2(2.0 * (o.w * o.z + o.x * o.y), 1.0 - 2.0 * (o.y * o.y + o.z * o.z));
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    pl_mocap_.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0});
+    while (pl_mocap_.size() > 1 &&
+      (secondsSince(pl_mocap_.front().t) > 2.0 || pl_mocap_.size() > 2000))
+    {
+      pl_mocap_.pop_front();
+    }
+  }
+
+  // The inputs changed: a plan made from the old ones must not be flown.
+  // Called under the lock.
+  void plInvalidate()
+  {
+    pl_wp_.reset();
+    pl_planning_ = false;
+    pl_error_.clear();
+    ++pl_gen_;
+  }
+
+  // Ask the whole-body node for the contact (true) or free (false) phase flag
+  // of its 4-D attribution. Fire and forget: the node refuses outside DIRECT
+  // and restores its yaml flag on every mode change by itself; a refusal is
+  // logged here.
+  void requestContact(bool on)
+  {
+    pl_contact_ = on;
+    if (!get_parameter("push_pull_contact").as_bool()) {return;}
+    if (!contact_cli_ || !contact_cli_->service_is_ready()) {
+      RCLCPP_WARN(
+        get_logger(), "push-and-pull: contact-flag service %s not available -- the law keeps "
+        "its yaml phase flag (is this the whole-body 4-D L1 node?)",
+        contact_cli_ ? contact_cli_->get_service_name() : "?");
+      return;
+    }
+    auto req = std::make_shared<SetBool::Request>();
+    req->data = on;
+    contact_cli_->async_send_request(
+      req, [this](rclcpp::Client<SetBool>::SharedFuture f) {
+        const auto r = f.get();
+        if (r->success) {
+          RCLCPP_INFO(get_logger(), "push-and-pull: %s", r->message.c_str());
+        } else {
+          RCLCPP_WARN(get_logger(), "push-and-pull: the contact flag was REFUSED: %s", r->message.c_str());
+        }
+      });
+  }
+
+  void onPlCapture(Trigger::Response::SharedPtr resp)
+  {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
+        resp->success = false;
+        resp->message = "a push-and-pull step is in flight -- Get once it holds";
+        return;
+      }
+      if (pl_at_handle_) {
+        resp->success = false;
+        resp->message = "the box is in the gripper -- Get it before Ready, or after Exit";
+        return;
+      }
+      if (pl_box_topic_.empty()) {
+        resp->success = false;
+        resp->message = "no mocap body for the box -- set push_pull_box_topic";
+        return;
+      }
+      const double window = get_parameter("push_pull_capture_window").as_double();
+      std::vector<Vec3> pts;
+      double ys = 0.0, yc = 0.0;
+      for (const auto & s : pl_mocap_) {
+        if (secondsSince(s.t) <= window) {
+          pts.push_back(s.p);
+          ys += std::sin(s.yaw);
+          yc += std::cos(s.yaw);
+        }
+      }
+      if (pts.empty()) {
+        m.precision(2);
+        m << "no sample on " << pl_box_topic_ << " in the last " << window
+          << " s -- is the box tracked and broadcast?";
+        resp->success = false;
+        resp->message = m.str();
+        return;
+      }
+      Vec3 mean = Vec3::Zero();
+      for (const Vec3 & p : pts) {mean += p;}
+      mean /= static_cast<double>(pts.size());
+      double spread = 0.0;
+      for (const Vec3 & p : pts) {spread = std::max(spread, (p - mean).norm());}
+      const double max_spread = get_parameter("push_pull_capture_max_spread").as_double();
+      if (spread > max_spread) {
+        m.precision(1);
+        m << pts.size() << " samples from " << pl_box_topic_ << " in " << window << " s scatter "
+          << spread * 1e3 << " mm (> " << max_spread * 1e3 << " mm): more than one publisher on the "
+             "topic, or the box is moving or mis-tracked -- NOT captured";
+        resp->success = false;
+        resp->message = m.str();
+        RCLCPP_WARN(get_logger(), "push-and-pull capture refused: %s", resp->message.c_str());
+        return;
+      }
+      const double yaw = std::atan2(ys, yc);   // circular mean: no wrap at +-180 deg
+      pl_box_ = mean;
+      pl_box_yaw_ = yaw;
+      plInvalidate();
+      m.precision(3);
+      m << "captured the box at [" << mean(0) << ", " << mean(1) << ", " << mean(2) << "] m, yaw "
+        << std::setprecision(1) << yaw * 180.0 / M_PI << " deg from " << pl_box_topic_ << " ("
+        << pts.size() << " samples, spread " << spread * 1e3
+        << " mm); the EE offset is applied in this box frame -- press Plan";
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "push-and-pull: %s", resp->message.c_str());
+    publishPlStatus();
+    publishPlInfo();
+    publishPlPaths(nullptr);
+  }
+
+  // ADJUST: the vehicle is on (or over) its start mark; its measured position
+  // minus push_pull_start_mark is written into the start mark and the land
+  // point (x, y): the mocap centring changes between sessions, the room does
+  // not. The box is measured and never moved.
+  void onPlAdjust(Trigger::Response::SharedPtr resp)
+  {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(3);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
+        resp->success = false;
+        resp->message = "a push-and-pull step is in flight -- adjust once it holds";
+        return;
+      }
+      if (!odom_p_.has_value() || secondsSince(odom_p_time_) > kOdomFreshS) {
+        resp->success = false;
+        resp->message = "no fresh odometry -- cannot measure the vehicle's position";
+        return;
+      }
+      BasePose mark;
+      std::string err;
+      if (!ppBase("push_pull_start_mark", &mark, &err)) {
+        resp->success = false;
+        resp->message = err;
+        return;
+      }
+      Vec3 off = *odom_p_ - mark.p;
+      off(2) = 0.0;
+      const double max_off = get_parameter("push_pull_adjust_max").as_double();
+      if (off.norm() > max_off) {
+        m << "offset [" << off(0) << ", " << off(1) << "] m is larger than " << max_off
+          << " m -- is the vehicle on its start mark? Not adjusted";
+        resp->success = false;
+        resp->message = m.str();
+        return;
+      }
+      std::vector<rclcpp::Parameter> moved;
+      for (const char * name : {"push_pull_start_mark", "push_pull_land"}) {
+        auto v = get_parameter(name).as_double_array();
+        if (v.size() != 4) {
+          resp->success = false;
+          resp->message = std::string(name) + " needs 4 numbers -- not adjusted";
+          return;
+        }
+        v[0] += off(0);
+        v[1] += off(1);
+        moved.emplace_back(name, v);
+      }
+      const auto results = set_parameters(moved);   // onPlParams: checked, plan made stale
+      for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].successful) {
+          resp->success = false;
+          resp->message = moved[i].get_name() + " not moved: " + results[i].reason;
+          return;
+        }
+      }
+      pl_offset_ = off;
+      plInvalidate();
+      m << "start mark and land point moved by [" << off(0) << ", " << off(1)
+        << "] m (the box is measured and not moved); press Plan";
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "push-and-pull adjust: %s", resp->message.c_str());
+    publishPlStatus();
+    publishPlInfo();
+    publishPlPaths(nullptr);
+  }
+
+  // Another mode's motion in flight (lock_ held): a step must not start under it.
+  bool otherModeBusy() const
+  {
+    return pp_flying_.has_value() || pp_exiting_.has_value() || pp_aborting_ ||
+           static_cast<bool>(pp_abort_plan_);
+  }
+
+  void onPlPlan(Trigger::Response::SharedPtr resp)
+  {
+    PushPullTargets tg;
+    PushPullConfig cfg;
+    PlanOptions opts;
+    RestSpec from;
+    unsigned gen = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::string err;
+      if (!mode_direct_ || !hold_.has_value()) {
+        err = "not in whole-body DIRECT (the first step is planned from the hold)";
+      } else if (teleopActive()) {
+        err = "PS4 teleoperation engaged -- disengage it first";
+      } else if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_ ||
+        state_ == "EXECUTING" || state_ == "CALCULATING")
+      {
+        err = "planner is " + state_ + " -- plan once it holds";
+      } else if (pl_at_handle_) {
+        err = "the claw is on the handle -- Exit first (Plan dry-runs from Go To Start)";
+      } else if (otherModeBusy()) {
+        err = "another mode is flying -- wait for it";
+      }
+      if (err.empty()) {plConfig(&cfg, &err);}
+      if (err.empty()) {plTargets(&tg, &err);}
+      if (!err.empty()) {
+        resp->success = false;
+        resp->message = err;
+        return;
+      }
+      opts = planOptions();
+      from = *hold_;
+      plInvalidate();
+      gen = pl_gen_;
+      pl_planning_ = true;
+      pl_aborted_ = false;
+      pl_guard_tripped_ = false;
+    }
+    publishPlStatus();
+    publishPlPaths(nullptr);
+    if (pl_worker_.joinable()) {pl_worker_.join();}
+    pl_worker_ = std::thread([this, tg, cfg, opts, from, gen]() {
+        std::optional<PushPullWaypoints> wp;
+        std::vector<std::shared_ptr<const Trajectory>> steps;
+        std::shared_ptr<Trajectory> whole;
+        std::string err;
+        try {
+          wp = pushPullWaypoints(*vehicle_, cfg, tg);
+          steps = planPushPullMission(*vehicle_, *planner_, opts, cfg, *wp, from);
+          whole = std::make_shared<SequenceTrajectory>(steps);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != pl_gen_) {return;}   // superseded
+          pl_planning_ = false;
+          if (!err.empty()) {
+            pl_error_ = err;
+            RCLCPP_WARN(get_logger(), "push-and-pull plan refused: %s", err.c_str());
+          } else {
+            pl_wp_ = wp;
+            for (int k = 0; k < kNumPushPullSteps; ++k) {
+              pl_T_[k] = steps[k]->duration();
+              RCLCPP_INFO(
+                get_logger(), "push-and-pull %s: %s", pushPullStepName(k),
+                steps[k]->diag().summary.c_str());
+            }
+            RCLCPP_INFO(
+              get_logger(), "push-and-pull planned: %.1f s of flight in five steps; the push slides "
+              "the box %.2f m along yaw %.1f deg.", whole->duration(), cfg.push_distance,
+              wp->drone_yaw * 180.0 / M_PI);
+          }
+        }
+        publishPlStatus();
+        publishPlInfo();
+        publishPlPaths(whole.get());
+      });
+    resp->success = true;
+    resp->message = "planning the five steps from the current hold -- the status reads READY when done";
+  }
+
+  // What the Ready descent gates on (lock_ held), as the pick's: the claw's
+  // current error above the handle less the trim (its steady part), and the
+  // trim itself -- the mean hover error over the window, zero when disabled or
+  // with under half a window of samples.
+  Vec3 plTrim() const
+  {
+    if (!get_parameter("push_pull_descent_trim").as_bool() || pl_trim_buf_.size() < 2) {
+      return Vec3::Zero();
+    }
+    const double span = std::chrono::duration<double>(
+      pl_trim_buf_.back().first - pl_trim_buf_.front().first).count();
+    if (span < 0.5 * get_parameter("push_pull_descent_trim_window_s").as_double()) {
+      return Vec3::Zero();
+    }
+    Vec3 m = Vec3::Zero();
+    for (const auto & s : pl_trim_buf_) {m += s.second;}
+    return m / static_cast<double>(pl_trim_buf_.size());
+  }
+
+  double plResidual() const
+  {
+    if (pl_trim_buf_.empty()) {return pl_last_err_;}
+    return (pl_trim_buf_.back().second - plTrim()).norm();
+  }
+
+  void onPlStep(int s, Trigger::Response::SharedPtr resp)
+  {
+    RestSpec from;
+    PushPullWaypoints wp;
+    PushPullConfig cfg;
+    PlanOptions opts;
+    unsigned gen = 0;
+    Vec3 trim = Vec3::Zero();
+    const char * name = pushPullStepName(s);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::string err;
+      std::ostringstream w;
+      w.setf(std::ios::fixed);
+      w.precision(0);
+      if (!mode_direct_ || !hold_.has_value()) {
+        err = "not in whole-body DIRECT";
+      } else if (pl_planning_) {
+        err = "the mission is still planning";
+      } else if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
+        err = std::string(pl_flying_.has_value() ? pushPullStepName(*pl_flying_) : "the abort") +
+          " is in flight -- wait for it, or Abort";
+      } else if (!pl_wp_.has_value()) {
+        err = "not planned -- Get the box and press Plan";
+      } else if (teleopActive()) {
+        err = "PS4 teleoperation engaged -- disengage it first";
+      } else if (state_ == "EXECUTING" || state_ == "CALCULATING") {
+        err = "planner is " + state_ + " -- wait for HOLD";
+      } else if (otherModeBusy()) {
+        err = "another mode is flying -- wait for it";
+      } else if (!odom_p_.has_value() || secondsSince(odom_p_time_) > kOdomFreshS) {
+        err = "no fresh odometry -- a step must not start blind";
+      } else if ((*odom_p_ - hold_->x_b).norm() > get_parameter("push_pull_leg_start_tol").as_double()) {
+        w << "the body is " << (*odom_p_ - hold_->x_b).norm() * 1e3 << " mm from its hold (> "
+          << get_parameter("push_pull_leg_start_tol").as_double() * 1e3 << " mm) -- wait for it to settle";
+        err = w.str();
+      } else if (s == kPlGoToStart || s == kPlGoToLand) {
+        if (pl_at_handle_) {err = "the claw is on the handle -- Exit first";}
+      } else if (s == kPlReady) {
+        const double tol = get_parameter("push_pull_arrival_tol").as_double();
+        if (pl_at_handle_) {
+          err = "the claw is already on the handle";
+        } else if (pl_completed_ != kPlGoToStart) {
+          err = "not holding above the handle -- fly Go To Start first";
+        } else if (!(plResidual() <= tol)) {
+          w << "the claw is " << plResidual() * 1e3 << " mm from "
+            << (get_parameter("push_pull_descent_trim").as_bool() ? "its trimmed point above the handle"
+                                                                   : "the point above the handle")
+            << " (> " << tol * 1e3 << " mm) -- wait for it to settle";
+          err = w.str();
+        } else if (plTrim().norm() > get_parameter("push_pull_descent_trim_max").as_double()) {
+          w << "the claw holds " << plTrim().norm() * 1e3 << " mm off the point above the handle on "
+            "average (> push_pull_descent_trim_max " <<
+            get_parameter("push_pull_descent_trim_max").as_double() * 1e3 << " mm) -- not trimming that far";
+          err = w.str();
+        }
+      } else if (s == kPlPush) {
+        if (!pl_at_handle_ || pl_completed_ != kPlReady) {
+          err = pl_completed_ == kPlPush ? "already pushed -- Exit (open the gripper first)"
+                                         : "not holding on the handle -- Ready first";
+        }
+      } else if (s == kPlExit) {
+        if (!pl_at_handle_) {err = "the claw is not on the handle -- nothing to exit";}
+      }
+      if (err.empty()) {plConfig(&cfg, &err);}
+      if (!err.empty()) {
+        resp->success = false;
+        resp->message = std::string(name) + ": " + err;
+        return;
+      }
+      from = *hold_;
+      wp = *pl_wp_;
+      opts = planOptions();
+      gen = ++plan_gen_;
+      state_ = "CALCULATING";
+      plan_.reset();
+      goal_override_.reset();
+      auto_send_ = false;
+      pending_base_.reset();
+      ee_target_.reset();
+      home_goal_ = false;
+      pl_flying_ = s;
+      pl_exec_plan_.reset();
+      pl_error_.clear();
+      pl_aborted_ = false;
+      pl_guard_tripped_ = false;
+      switch (s) {
+        case kPlReady:
+          // the descent keeps the world-held claw requested on arrival above
+          trim = plTrim();
+          pl_trim_ = trim;
+          break;
+        case kPlPush:
+          // THE INTERACTION PHASE (user, 2026-10-03): from the clamp on, the
+          // law's phase flag is CONTACT -- the handle's reaction is the task
+          // wrench, rendered on the EE impedance instead of rejected -- and
+          // the EE reference follows the CoM (a world-held claw in contact
+          // fights the base, 2026-10-02). The push holds push_settle first.
+          // push_pull_world_anchor_push keeps the world-held claw instead.
+          if (get_parameter("push_pull_world_anchor_push").as_bool()) {
+            requestAnchor(false);
+          } else {
+            restoreAnchor();
+          }
+          requestContact(true);
+          break;
+        case kPlExit:
+          // the gripper is open: no contact any more
+          requestContact(false);
+          restoreAnchor();
+          break;
+        default:
+          restoreAnchor();
+      }
+    }
+    publishStatus();
+    publishPlStatus();
+    publishPlInfo();
+    if (worker_.joinable()) {worker_.join();}
+    worker_ = std::thread([this, s, from, wp, cfg, opts, gen, trim]() {
+        std::shared_ptr<Trajectory> traj;
+        std::string err;
+        try {
+          switch (s) {
+            case kPlGoToStart:
+              traj = planPushPullGoToStart(*vehicle_, *planner_, opts, cfg, wp, from);
+              break;
+            case kPlReady:
+              traj = planPushPullReady(*vehicle_, *planner_, opts, cfg, wp, from, trim);
+              break;
+            case kPlPush:
+              traj = planPushPullPush(*vehicle_, *planner_, opts, cfg, from);
+              break;
+            case kPlExit:
+              traj = planPushPullExit(*vehicle_, *planner_, opts, cfg, from);
+              break;
+            default:
+              traj = planPushPullGoToLand(*vehicle_, *planner_, opts, cfg, wp, from);
+          }
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != plan_gen_ || state_ != "CALCULATING") {return;}   // superseded
+          if (!traj) {
+            state_ = "INFEASIBLE";
+            infeasible_reason_ = err;
+            pl_error_ = err;
+            pl_flying_.reset();
+            RCLCPP_WARN(get_logger(), "push-and-pull step refused: %s", err.c_str());
+          } else {
+            plan_ = traj;
+            pl_exec_plan_ = traj;
+            exec_t0_ = Clock::now();
+            state_ = "EXECUTING";
+            RCLCPP_INFO(
+              get_logger(), "push-and-pull %s: executing -- %s", pushPullStepName(s),
+              traj->diag().summary.c_str());
+          }
+        }
+        publishStatus();
+        publishPlStatus();
+        publishPlInfo();
+        publishVizPath(traj.get());
+      });
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    m << name << ": planning from the current hold; it executes as soon as it is planned";
+    if (s == kPlReady) {
+      m << " (goal trimmed by [" << trim(0) * 1e3 << ", " << trim(1) * 1e3 << ", " << trim(2) * 1e3
+        << "] mm, the hover error)";
+    } else if (s == kPlPush) {
+      m << " -- CONTACT phase on, the push holds " << cfg.push_settle << " s, then slides "
+        << cfg.push_distance << " m";
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "push-and-pull: %s", resp->message.c_str());
+  }
+
+  // Called from the stream tick, under the lock, when step s has been flown
+  // to its end.
+  void plStepDone(int s)
+  {
+    pl_completed_ = s;
+    pl_flying_.reset();
+    switch (s) {
+      case kPlGoToStart:
+        pl_at_handle_ = false;
+        pl_trim_buf_.clear();
+        // from the hover above the handle through the descent and the grasp
+        // the claw is held in the WORLD (the pick's validated anchor) -- and
+        // through the push too with push_pull_world_anchor_push
+        if (get_parameter("push_pull_world_anchor_ready").as_bool()) {requestAnchor(false);}
+        break;
+      case kPlReady:
+        // THE INTERACTION PHASE STARTS ON THE HANDLE (2026-10-04, first
+        // flight): the jaws close next, and from the clamp on the box --
+        // held on the table by static friction -- is part of the chain. With
+        // the flag still free during the close, the whole-body node's platform
+        // observer integrated that reaction for the ~1.5 s before the Push
+        // press (51 mm of drift on a fixed reference). Push asks again
+        // (idempotent); Exit and ABORT clear it.
+        pl_at_handle_ = true;
+        requestContact(true);
+        break;
+      case kPlPush:
+        pl_at_handle_ = true;
+        break;
+      default:
+        pl_at_handle_ = false;
+    }
+    RCLCPP_INFO(get_logger(), "push-and-pull: %s complete.", pushPullStepName(s));
+  }
+
+  // ABORT: the GS opens the gripper on the same press; here the phase flag
+  // goes back to free, the EE reference to the CoM, and the vehicle -- held
+  // still push_pull_abort_release_wait_s first when the claw is on the handle,
+  // so the opening jaws do not lift the box -- climbs push_pull_abort_climb
+  // with the arm unchanged and then folds it home. In the middle of a step it
+  // CUTS the step at the current reference (x_c continuous). After an abort
+  // with the box touched the capture and the plan are dropped: the box may have
+  // moved -- Get and Plan again.
+  void onPlAbort(Trigger::Response::SharedPtr resp)
+  {
+    RestSpec from;
+    PushPullConfig cfg;
+    PlanOptions opts;
+    unsigned gen = 0;
+    bool cut = false;
+    double climb = 0.0, wait = 0.0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !hold_.has_value()) {
+        resp->success = false;
+        resp->message = "not in whole-body DIRECT -- use the drone ground station";
+        return;
+      }
+      if (pl_abort_plan_ || pl_aborting_) {
+        resp->success = false;
+        resp->message = "already aborting";
+        return;
+      }
+      std::string err;
+      if (!plConfig(&cfg, &err)) {
+        // an abort is never refused for a configuration error: the defaults
+        cfg = PushPullConfig{};
+        cfg.home = home_pose_;
+        RCLCPP_WARN(get_logger(), "push-and-pull ABORT with the default configuration (%s)", err.c_str());
+      }
+      from = *hold_;
+      std::optional<WbReference> cut_ref;
+      if (state_ == "EXECUTING" && plan_ && exec_t0_.has_value()) {
+        const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
+        cut_ref = plan_->eval(std::min(t, plan_->duration()));
+      }
+      if (cut_ref.has_value()) {
+        const WbReference & ref = *cut_ref;
+        from.phi = std::atan2(ref.b1_d(1), ref.b1_d(0));
+        from.q = ref.q_d;
+        Vec3 r0c;
+        armKinematics(ref.q_d, vehicle_->params, &r0c, nullptr, nullptr);
+        from.x_b = ref.x_cd - Rz(from.phi) * r0c;   // x_c continuous
+        cut = true;
+      }
+      const bool touched = pl_at_handle_ ||
+        (pl_flying_.has_value() && (*pl_flying_ == kPlReady || *pl_flying_ == kPlPush));
+      climb = std::max(0.0, std::min(
+          get_parameter("push_pull_abort_climb").as_double(), cfg.fence.max_z - from.x_b(2)));
+      wait = touched ? get_parameter("push_pull_abort_release_wait_s").as_double() : 0.0;
+      pl_abort_climb_ = climb;
+      opts = planOptions();
+      gen = ++plan_gen_;
+      plan_.reset();
+      goal_override_.reset();
+      auto_send_ = false;
+      pending_base_.reset();
+      ee_target_.reset();
+      home_goal_ = false;
+      setHold(from);
+      state_ = "CALCULATING";
+      pl_flying_.reset();
+      pl_exec_plan_.reset();
+      pl_error_.clear();
+      pl_aborted_ = true;
+      pl_aborting_ = true;
+      requestContact(false);
+      restoreAnchor();
+      if (touched) {
+        pl_box_.reset();
+        pl_box_yaw_.reset();
+        plInvalidate();
+        pl_completed_ = -1;
+      }
+    }
+    publishStatus();
+    publishPlStatus();
+    publishPlInfo();
+    if (worker_.joinable()) {worker_.join();}
+    worker_ = std::thread([this, from, cfg, opts, gen, climb, wait]() {
+        std::shared_ptr<Trajectory> traj;
+        std::string err;
+        try {
+          traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != plan_gen_ || state_ != "CALCULATING") {return;}   // superseded
+          pl_aborting_ = false;
+          if (!traj) {
+            state_ = "INFEASIBLE";
+            infeasible_reason_ = "abort: " + err;
+            pl_error_ = "abort refused: " + err + " -- holding where it was cut";
+            RCLCPP_ERROR(get_logger(), "push-and-pull ABORT could not plan: %s", err.c_str());
+          } else {
+            plan_ = traj;
+            pl_abort_plan_ = traj;
+            exec_t0_ = Clock::now();
+            state_ = "EXECUTING";
+            RCLCPP_WARN(get_logger(), "push-and-pull ABORT: %s", traj->diag().summary.c_str());
+          }
+        }
+        publishStatus();
+        publishPlStatus();
+        publishVizPath(traj.get());
+      });
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(2);
+    m << "ABORT: contact off, " << (wait > 0.0 ? "release " : "") << "then up " << climb << " m and the "
+      << "arm home, from " << (cut ? "the point the step was cut at" : "the hold");
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_WARN(get_logger(), "push-and-pull: %s", resp->message.c_str());
+  }
+
+  void onPlReset(Trigger::Response::SharedPtr resp)
+  {
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
+        resp->success = false;
+        resp->message = "a push-and-pull step is in flight -- Abort it first";
+        return;
+      }
+      if (pl_at_handle_) {
+        resp->success = false;
+        resp->message = "the claw is on the handle -- Exit (or Abort) first";
+        return;
+      }
+      pl_completed_ = -1;
+      pl_aborted_ = false;
+      pl_guard_tripped_ = false;
+      plInvalidate();
+      restoreAnchor();
+    }
+    resp->success = true;
+    resp->message = "push-and-pull progress and plan cleared (the box capture and the typed points kept)";
+    publishPlStatus();
+    publishPlInfo();
+    publishPlPaths(nullptr);
+  }
+
+  // The tilt guard (push_pull_guard_tilt_deg), with lock_ held: true = abort now.
+  bool plGuardCheck()
+  {
+    const double limit = get_parameter("push_pull_guard_tilt_deg").as_double();
+    if (!(limit > 0.0) || !att_R_.has_value()) {return false;}
+    const double tilt = std::acos(std::clamp((*att_R_)(2, 2), -1.0, 1.0)) * 180.0 / M_PI;
+    if (tilt < limit - 5.0) {
+      pl_guard_armed_ = true;
+      pl_guard_since_.reset();
+      return false;
+    }
+    const bool engaged = mode_direct_ && hold_.has_value() &&
+      (pl_completed_ >= 0 || pl_flying_.has_value() || pl_at_handle_);
+    if (tilt <= limit || !engaged || !pl_guard_armed_ || pl_aborting_ || pl_abort_plan_) {
+      pl_guard_since_.reset();
+      return false;
+    }
+    if (!pl_guard_since_.has_value()) {pl_guard_since_ = Clock::now();}
+    if (secondsSince(pl_guard_since_) < get_parameter("push_pull_guard_persist_s").as_double()) {
+      return false;
+    }
+    pl_guard_armed_ = false;
+    pl_guard_since_.reset();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    m << "tilt " << tilt << " deg > " << limit << " deg";
+    pl_guard_reason_ = m.str();
+    pl_guard_tripped_ = true;
+    return true;
+  }
+
+  // THE PUSH-FORCE GUARD (2026-10-03): the whole-body node's own reading of
+  // the task force (wb_control_debug [97..99], the 4-D attribution's raw F_hat,
+  // world [N]) low-passed at kPlForceOmega; above push_pull_guard_force_n for
+  // push_pull_guard_force_persist_s while the claw is on the handle in CONTACT
+  // -- the box jammed, or the vehicle drifting against the clamp -- the same
+  // response as ABORT. The bench's along-arm capacity is ~6 N (interaction
+  // campaign, 2026-09-27); the box's friction is ~1.5 N.
+  static constexpr double kPlForceOmega = 3.0;   // [rad/s]
+  void onPlForce(const std_msgs::msg::Float32MultiArray & msg)
+  {
+    if (msg.data.size() < 100) {return;}
+    const Vec3 F{msg.data[97], msg.data[98], msg.data[99]};
+    if (!F.allFinite()) {return;}
+    bool trip = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      const auto now = Clock::now();
+      const double dt = pl_force_t_.has_value()
+        ? std::clamp(std::chrono::duration<double>(now - *pl_force_t_).count(), 0.0, 0.1) : 0.0;
+      pl_force_t_ = now;
+      const double a = std::exp(-kPlForceOmega * dt);
+      pl_force_f_ = a * pl_force_f_ + (1.0 - a) * F;
+      const double limit = get_parameter("push_pull_guard_force_n").as_double();
+      const bool armed = limit > 0.0 && mode_direct_ && pl_contact_ &&
+        (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush)) &&
+        !pl_aborting_ && !pl_abort_plan_;
+      if (!armed || pl_force_f_.norm() <= limit) {
+        pl_force_since_.reset();
+      } else {
+        if (!pl_force_since_.has_value()) {pl_force_since_ = now;}
+        if (secondsSince(pl_force_since_) >=
+          get_parameter("push_pull_guard_force_persist_s").as_double())
+        {
+          std::ostringstream m;
+          m.setf(std::ios::fixed);
+          m.precision(1);
+          m << "push force " << pl_force_f_.norm() << " N > " << limit << " N";
+          pl_guard_reason_ = m.str();
+          pl_guard_tripped_ = true;
+          pl_force_since_.reset();
+          trip = true;
+        }
+      }
+    }
+    if (trip) {
+      auto resp = std::make_shared<Trigger::Response>();
+      onPlAbort(resp);
+      RCLCPP_ERROR(get_logger(), "push-and-pull SAFETY GUARD: %s -- %s", pl_guard_reason_.c_str(),
+        resp->message.c_str());
+    }
+  }
+
+  // 10 Hz: how far the step in flight (else the last one flown) is from its
+  // target, measured -- the claw (FK on the encoders, odometry position, PX4
+  // attitude) for go_to_start (the point above the handle), ready (the grasp
+  // point) and push (the pushed grasp point), the body origin otherwise.
+  // [0] step, [1] 1 = claw target / 0 = base target, [2] |error| [m],
+  // [3..5] error target - measured, world [m], [6] tolerance [m], [7] within,
+  // [8] holding (no step in flight, HOLD), [9] the claw's error along the
+  // box's x axis -- the jaws' closing axis [m], [10] the low-passed |F_hat| [N].
+  void publishPlArrival()
+  {
+    if (pl_params_dirty_.exchange(false)) {
+      publishPlStatus();
+      publishPlInfo();
+      publishPlPaths(nullptr);
+    }
+    Float64MultiArray m;
+    bool changed = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !pl_wp_.has_value()) {return;}
+      const int s = pl_flying_.has_value() ? *pl_flying_ : pl_completed_;
+      if (s < 0) {return;}
+      Vec3 x_b;
+      Mat3 r0;
+      if (!odomPair(&x_b, &r0) || odomAge() > kOdomFreshS || !q_meas_.has_value()) {return;}
+      const bool claw = s == kPlGoToStart || s == kPlReady || s == kPlPush;
+      Vec3 meas = x_b, want = s == kPlExit ? pl_wp_->exited.x_b : pl_wp_->land.x_b;
+      if (claw) {
+        Vec3 r0e;
+        armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
+        meas = x_b + r0 * (vehicle_->r_model * r0e);
+        want = s == kPlGoToStart ? pl_wp_->approach_ee
+                                 : s == kPlReady ? pl_wp_->grasp_ee : pl_wp_->pushed_ee;
+      }
+      const Vec3 e = want - meas;
+      const bool holding = !pl_flying_.has_value() && state_ == "HOLD";
+      // the descent trim's samples: the claw's error while holding above
+      if (s == kPlGoToStart && holding) {
+        const auto now = Clock::now();
+        pl_trim_buf_.push_back({now, e});
+        const double win = get_parameter("push_pull_descent_trim_window_s").as_double();
+        while (!pl_trim_buf_.empty() &&
+          std::chrono::duration<double>(now - pl_trim_buf_.front().first).count() > win)
+        {
+          pl_trim_buf_.pop_front();
+        }
+      } else {
+        pl_trim_buf_.clear();
+      }
+      const double tol = get_parameter("push_pull_arrival_tol").as_double();
+      const bool within = e.norm() <= tol;
+      const double yb = pl_box_yaw_.value_or(0.0);
+      const double axis = std::cos(yb) * e(0) + std::sin(yb) * e(1);
+      pl_last_err_ = e.norm();
+      m.data = {static_cast<double>(s), claw ? 1.0 : 0.0, e.norm(), e(0), e(1), e(2), tol,
+        within ? 1.0 : 0.0, holding ? 1.0 : 0.0, axis, pl_force_f_.norm()};
+      if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding)) {
+        pl_within_ = within;
+        pl_err_step_ = s;
+        changed = true;
+      }
+    }
+    pl_arrival_pub_->publish(m);
+    if (changed) {publishPlStatus();}
+  }
+
+  void publishPlStatus()
+  {
+    std::string s;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::ostringstream m;
+      m.setf(std::ios::fixed);
+      m.precision(1);
+      const std::string guard = pl_guard_tripped_ ? " (SAFETY GUARD: " + pl_guard_reason_ + ")" : "";
+      if (!mode_direct_) {
+        m << "NOT IN DIRECT";
+      } else if (pl_aborting_ || pl_abort_plan_) {
+        m << "ABORTING" << guard << " -- gripper open, contact off, climbing " << std::setprecision(2)
+          << pl_abort_climb_ << " m, then the arm home";
+      } else if (pl_planning_) {
+        m << "PLANNING";
+      } else if (pl_flying_.has_value()) {
+        m << "FLYING " << pushPullStepName(*pl_flying_);
+        if (*pl_flying_ == kPlPush) {m << " (CONTACT)";}
+        if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
+      } else if (!pl_error_.empty()) {
+        m << "INFEASIBLE: " << pl_error_;
+      } else if (pl_aborted_) {
+        m << "ABORTED" << guard << " -- holding higher, arm home, contact off; "
+          << (!pl_wp_.has_value() ? "Get the box and press Plan" : "re-fly go_to_start, or go_to_land");
+      } else if (!pl_wp_.has_value()) {
+        PushPullTargets t;
+        std::string err;
+        m << "NOT PLANNED: " << (plTargets(&t, &err) ? std::string("press Plan") : err);
+      } else if (pl_completed_ >= kPlGoToLand) {
+        m << "COMPLETE -- touch down with SAFETY -> land";
+      } else if (pl_completed_ < 0) {
+        m << "READY next=go_to_start";
+      } else if (pl_completed_ == kPlGoToStart) {
+        m << "DONE go_to_start next=ready (the gripper opens first) -- claw " << std::setprecision(0)
+          << pl_last_err_ * 1e3 << " mm from the point above the handle (tolerance "
+          << get_parameter("push_pull_arrival_tol").as_double() * 1e3 << " mm)";
+      } else if (pl_completed_ == kPlReady) {
+        m << "DONE ready next=push (CONTACT on: the gripper closes first)";
+      } else if (pl_completed_ == kPlPush) {
+        m << "DONE push next=exit (the gripper opens first)";
+      } else {
+        m << "DONE " << pushPullStepName(pl_completed_) << " next=" << pushPullStepName(pl_completed_ + 1);
+      }
+      s = m.str();
+    }
+    String msg;
+    msg.data = s;
+    pl_status_pub_->publish(msg);
+  }
+
+  // [0..2] Adjust offset [m], [3] reserved (0), [4] planned, [5] last step
+  // completed (-1 none), [6] step in flight (-1 none), [7] arrival tolerance
+  // [m], [8..12] each step's planned duration [s], [13] box captured (0 / 1),
+  // [14..17] the box x, y, z [m], yaw [deg], [18..52] per step [goal base x,
+  // y, z, actual yaw deg, claw x, y, z], [53] the claw on the handle (0 / 1),
+  // [54] the contact phase requested (0 / 1), [55] the world-held claw
+  // requested (0 / 1), [56] the push distance [m], [57] the low-passed |F_hat|
+  // [N], [58] the drone's yaw at the box [deg], [59] the descent trim of the
+  // last Ready [m, norm]. NaN where there is nothing.
+  void publishPlInfo()
+  {
+    Float64MultiArray m;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      const bool planned = pl_wp_.has_value();
+      m.data = {pl_offset_(0), pl_offset_(1), pl_offset_(2), 0.0, planned ? 1.0 : 0.0,
+        static_cast<double>(pl_completed_),
+        pl_flying_.has_value() ? static_cast<double>(*pl_flying_) : -1.0,
+        get_parameter("push_pull_arrival_tol").as_double()};
+      for (int k = 0; k < kNumPushPullSteps; ++k) {m.data.push_back(planned ? pl_T_[k] : nan);}
+      if (pl_box_.has_value()) {
+        m.data.insert(m.data.end(), {1.0, (*pl_box_)(0), (*pl_box_)(1), (*pl_box_)(2),
+            pl_box_yaw_.value_or(0.0) * 180.0 / M_PI});
+      } else {
+        m.data.insert(m.data.end(), {0.0, nan, nan, nan, nan});
+      }
+      for (int k = 0; k < kNumPushPullSteps; ++k) {
+        if (!planned) {
+          m.data.insert(m.data.end(), 7, nan);
+          continue;
+        }
+        const PushPullWaypoints & w = *pl_wp_;
+        const RestSpec & g = k == kPlGoToStart ? w.approach : k == kPlReady ? w.grasp :
+          k == kPlPush ? w.pushed : k == kPlExit ? w.exited : w.land;
+        const Vec3 e = clawOf(*vehicle_, g);
+        m.data.insert(
+          m.data.end(), {g.x_b(0), g.x_b(1), g.x_b(2), (g.phi + 0.5 * M_PI) * 180.0 / M_PI,
+            e(0), e(1), e(2)});
+      }
+      m.data.push_back(pl_at_handle_ ? 1.0 : 0.0);
+      m.data.push_back(pl_contact_ ? 1.0 : 0.0);
+      m.data.push_back(pp_anchor_world_ ? 1.0 : 0.0);
+      m.data.push_back(get_parameter("push_pull_push_distance").as_double());
+      m.data.push_back(pl_force_f_.norm());
+      m.data.push_back(planned ? pl_wp_->drone_yaw * 180.0 / M_PI : nan);
+      m.data.push_back(pl_trim_.norm());
+    }
+    pl_info_pub_->publish(m);
+  }
+
+  void publishPlPaths(const Trajectory * whole)
+  {
+    Float64MultiArray a, b;
+    if (whole != nullptr) {
+      eePathRows(*whole, 600, &a.data);
+      dronePathRows(*whole, 600, &b.data);
+    }
+    pl_path_pub_->publish(a);
+    pl_drone_path_pub_->publish(b);
   }
 
   // ---------------------------------------------------------------- status
@@ -3469,7 +5200,9 @@ private:
   Vec3 pp_offset_{Vec3::Zero()};                                  // Adjust
   double pp_yaw_offset_{0.0};
   std::array<std::optional<Vec3>, kNumPickPlaceLegs> pp_capture_;
-  std::array<std::deque<std::pair<Clock::time_point, Vec3>>, kNumPickPlaceLegs> pp_mocap_;
+  std::array<std::optional<double>, kNumPickPlaceLegs> pp_capture_yaw_;   // [rad], with each capture
+  struct PpSample {Clock::time_point t; Vec3 p; double yaw;};               // a mocap sample
+  std::array<std::deque<PpSample>, kNumPickPlaceLegs> pp_mocap_;
   std::optional<PickPlaceWaypoints> pp_wp_;                       // set by Plan
   std::array<double, kNumPickPlaceLegs> pp_leg_T_{};
   bool pp_planning_{false};
@@ -3501,18 +5234,62 @@ private:
   PpPhase pp_phase_{kPpNone};
   Clock::time_point pp_wait_t0_{};
   std::optional<Clock::time_point> pp_within_since_;
+  std::deque<std::pair<Clock::time_point, Vec3>> pp_trim_buf_;   // claw error while holding above
+  Vec3 pp_descent_trim_{Vec3::Zero()};                          // the trim the last descent used
   double pp_last_err_{0.0};
   bool pp_at_table_{false};                     // holding at a table: the next leg retreats first
   bool pp_within_{false};                       // the claw inside the tolerance (dwell not yet done)
   bool pp_timed_out_{false};                    // pp_error_ is a wait timeout, not a refusal
   double pp_abort_climb_{0.0};                  // the (fence-clipped) climb of the abort in flight
   std::shared_ptr<Trajectory> pp_abort_plan_;   // the abort transition in flight
+  bool pp_guard_armed_{true};                    // the tilt guard may fire (re-armed below limit - 5 deg)
+  bool pp_guard_tripped_{false};                 // the abort in flight / held was the guard's
+  std::optional<Clock::time_point> pp_guard_since_;   // tilt above the limit since
+  std::string pp_guard_reason_;
+  std::optional<int> pp_exiting_;                // the claw leg whose exit is planning / flying
+  std::shared_ptr<Trajectory> pp_exit_plan_;     // ... and its climb
+  std::array<bool, kNumPickPlaceLegs> pp_exited_{};   // a claw leg's exit flown
+  std::array<double, kNumPickPlaceLegs> pp_exit_T_{}; // planned exit durations (Plan) [s]
   bool pp_aborting_{false};                     // ... or being planned
   bool pp_aborted_{false};                      // until the next pick-and-place action
   // phase-dependent EE anchor (pick_place_world_anchor_*)
   rclcpp::Client<SetBool>::SharedPtr anchor_cli_;
   bool pp_anchor_world_{false};                 // the whole-body node was asked for WORLD
   OnSetParametersCallbackHandle::SharedPtr pp_param_cb_;
+  // push-and-pull mode (push_pull.hpp)
+  std::string pl_box_topic_;                    // the box's mocap body
+  std::deque<PpSample> pl_mocap_;
+  std::optional<Vec3> pl_box_;                  // captured box CG ...
+  std::optional<double> pl_box_yaw_;            // ... and yaw [rad]
+  Vec3 pl_offset_{Vec3::Zero()};                // the last Adjust shift
+  std::optional<PushPullWaypoints> pl_wp_;      // set by Plan
+  std::array<double, kNumPushPullSteps> pl_T_{};
+  bool pl_planning_{false};
+  std::string pl_error_;
+  int pl_completed_{-1};                        // the last step flown to its end
+  std::optional<int> pl_flying_;                // the step planning / executing
+  std::shared_ptr<Trajectory> pl_exec_plan_;    // ... and its trajectory
+  bool pl_at_handle_{false};                    // the claw on the handle (ready / push done)
+  bool pl_aborting_{false};                     // the abort being planned
+  bool pl_aborted_{false};                      // until the next push-and-pull action
+  double pl_abort_climb_{0.0};
+  std::shared_ptr<Trajectory> pl_abort_plan_;   // the abort in flight
+  bool pl_contact_{false};                      // the contact phase flag requested
+  bool pl_guard_armed_{true}, pl_guard_tripped_{false};
+  std::optional<Clock::time_point> pl_guard_since_;
+  std::string pl_guard_reason_;
+  Vec3 pl_force_f_{Vec3::Zero()};               // the low-passed F_hat [N]
+  std::optional<Clock::time_point> pl_force_t_, pl_force_since_;
+  std::deque<std::pair<Clock::time_point, Vec3>> pl_trim_buf_;   // claw error holding above
+  Vec3 pl_trim_{Vec3::Zero()};                  // the trim the last Ready used
+  double pl_last_err_{0.0};
+  bool pl_within_{false};
+  int pl_err_step_{-1};
+  unsigned pl_gen_{0};
+  std::thread pl_worker_;
+  std::atomic<bool> pl_params_dirty_{false};
+  rclcpp::Client<SetBool>::SharedPtr contact_cli_;
+  OnSetParametersCallbackHandle::SharedPtr pl_param_cb_;
 
   // ---- live samples --------------------------------------------------------
   std::optional<Vec3> odom_p_;
@@ -3562,6 +5339,13 @@ private:
   rclcpp::Service<Trigger>::SharedPtr teleop_home_srv_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr teleop_state_pub_, skeleton_pub_;
   rclcpp::Publisher<String>::SharedPtr teleop_note_pub_;
+  rclcpp::Publisher<String>::SharedPtr pl_status_pub_;
+  rclcpp::Publisher<Float64MultiArray>::SharedPtr pl_info_pub_, pl_path_pub_, pl_drone_path_pub_,
+    pl_arrival_pub_;
+  std::vector<rclcpp::Service<Trigger>::SharedPtr> pl_srvs_;
+  rclcpp::Subscription<Mocap>::SharedPtr pl_mocap_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pl_force_sub_;
+  rclcpp::TimerBase::SharedPtr pl_timer_;
 };
 
 }  // namespace fsc_trajectory_planner

@@ -96,6 +96,7 @@ std::unique_ptr<Trajectory> FlatBSplineTransitionPlanner::plan(
   fo.rotor_bounds = o.rotor_bounds;
   fo.n_check = o.n_check;
   fo.sigma_nd_min = vehicle.sigma_nd_margin;
+  fo.heading_as_given = o.heading_as_given;
   FlatPlan plan = planFlatTransition(*params, req.rest0, *req.rest1, fo);
   return std::make_unique<FlatTrajectory>(params, std::move(plan), *req.rest1);
 }
