@@ -429,6 +429,64 @@ watch when the circle is moved away from the vehicle: §7.15.5 measures
 50-90 mm of settled error after a 0.5 m leg, the same order as the tolerance.
 
 
+## Quadrotor CCM planner (2026-09-29) — `quadrotor_ccm_planner`
+
+A second, independent node for a BARE quadrotor: it streams the reference of the torque-mode (R)CCM
+stack (`fsc_autopilot_ros2` `single_drone_ccm_direct_actuation` + `torch_model_loader`
+`CCM_torque_direct`). It does not touch `VehicleModel` / `WbReference` (those require the 4-joint
+arm); it has its own small registry.
+
+- `quadrotor_model.hpp/.cpp`: `QuadrotorModel` (mass, inertia, gravity, rotor time constant),
+  registry `quadrotorModelFactories()` (`t650`, `generic`), and `flatReference()` — the closed-form
+  differential-flatness map, a line-for-line port of CCM_quad `planners/planner_quad_torque.py`.
+- `quadrotor_trajectory.hpp/.cpp`: `QuadTrajectory` (hover / circle / figure8) anchored at its start
+  point, septic ramp in/out (zero velocity..snap at both ends, whole laps end back on the anchor),
+  `time_scale` (lap = `lap_time / time_scale`, ramps unchanged), `requestStop()`;
+  `quadShapeStartOffset()` (start minus centre: circle (R,0,0), figure-8 0); `QuadTransition`, the
+  rest-to-rest move of fly-to-start / back-to-hover (nonic phasing, so snap and hence the torque
+  reference are continuous at both ends; `T = max(t_min, 2.4609375 |dp| / v_peak)`); and
+  `sampleCcmReference()` for either, which adds the actuator-lag command `u*_c = u* + tau du*/dt`.
+- Heading (2026-09-30): `circle` / `figure8` hold the heading the vehicle has when the run starts;
+  `circle_tangent` / `figure8_tangent` (`QuadShape::k*Tangent`, `quadShapeGeometry()` gives the path)
+  fly the same paths with the yaw along the path tangent, `QuadTrajectory::yawJets()` (analytic
+  psi, dpsi, ddpsi from the tangent of s(theta), defined at rest; start heading 90 deg circle /
+  45 deg figure-8, ccw). `QuadTransition` also turns yaw0 -> yaw1 the shorter way with the nonic
+  (peak `transition_yaw_rate`), so fly-to-start turns the vehicle to the start heading and
+  back-to-hover turns it back to the hover heading (`start` also needs the heading within
+  `start_yaw_tolerance`). `start` is refused above `max_yaw_rate` (1.5 rad/s) / `max_yaw_accel`
+  (2 rad/s^2): circle_tangent needs 0.79 rad/s at the default lap, figure8_tangent 2.5 rad/s and
+  4.2 rad/s^2 -- fly it at time_scale <= ~0.55. `info` carries `yaw_tangent`, `yaw_rate_max`,
+  `yaw_accel_max`, `start_yaw`, `max_yaw_rate`, `max_yaw_accel`.
+- Node: params in `config/quadrotor_ccm_planner_t650.yaml`, launch
+  `launch/quadrotor_ccm_planner_launch.py`. Phases IDLE -> HOLD <-> TRANSITION -> HOLD at the start
+  -> RUNNING -> FINISHED (`CcmReference.PHASE_*`, TRANSITION = 4). Publishes
+  `quadrotor_planner/ccm_reference` (`fsc_autopilot_ros2_msgs/CcmReference`) once an operator asked
+  for a hold or a fly-to-start, and -- so the SAFETY baseline flies the same path --
+  `fsc_autopilot_ros2/position_controller/reference` from then until the flight node LEAVES CCM or
+  `release` (then the operator's position commands are no longer overridden; `info.pos_ref`).
+  Services (Trigger, the ground station's "CCM Trajectory" tab): `hold`, `go_to_start` (shape placed
+  by `center` / `height`), `start` (only when holding at the start, and within `max_speed` /
+  `max_accel`), `back_to_hover` (ramps a run out first), `stop`, `release`. Topics in: `select`
+  (String), `time_scale` (Float64, clamped to `time_scale_min..max`, applies at the next start).
+  Latched out: `status`, `info` (JSON incl. the selection's 128-point XY `path`),
+  `available_trajectories` (JSON, once). Leaves a run / move and re-captures a hold when the flight
+  node leaves CCM (`hold_on_ccm_exit`). Optional disturbance in the flatness map
+  (`use_disturbance_estimate`), from `disturbance_source`: `"ude"` = the SAFETY baseline's linear UDE
+  (`position_controller/ude`, force / mass), or `"ccm"` = the CCM flight node's velocity-based
+  estimator (`disturbance_topic`, AccelStamped: linear m/s^2 world ENU + angular rad/s^2 body FLU;
+  the rotor stack remaps it to `ccm_rotor_actuation/disturbance`). The linear part enters
+  `a_T = p'' + g e3 - d`; with `use_angular_disturbance` the angular part enters the reference torque
+  `tau* = J (w'* - d_w) + w* x J w*` (capped at `max_disturbance_angular_accel`). An estimate older
+  than 0.5 s is dropped. `CcmReference.disturbance` / `.angular_disturbance` carry what was folded in.
+- `test/test_quadrotor_planner.cpp` (11 tests, all passing 2026-09-30): parity with the Python planner
+  on all four shapes (`test/data/python_quadrotor_ccm_reference.txt`, 48 rows, 1e-9), the reference
+  satisfies the rigid-body dynamics (tangent shapes included), rest at both ends, stop, the command's
+  lag term, the transition is rest-to-rest and consistent, the tangent yaw follows the direction of
+  travel with consistent derivatives, transitions turn the shorter way, the time scale / centre
+  placement, and a reference with linear + angular disturbance satisfies the disturbed dynamics
+  (`ReferenceSatisfiesDisturbedDynamics`: clean torque - disturbed torque = J d_w).
+
+
 ## Pick-and-place mode (2026-10-01)
 
 A third planning mode beside the transitions and the EE trajectories: SIX

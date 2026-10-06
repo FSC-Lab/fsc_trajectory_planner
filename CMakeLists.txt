@@ -39,6 +39,8 @@ add_library(planner_lib STATIC
   src/bspline_fit.cpp
   src/ee_trajectory_planner.cpp
   src/trajectory.cpp
+  src/quadrotor_model.cpp
+  src/quadrotor_trajectory.cpp
   src/arm_sweep_planner.cpp
   src/pick_place.cpp
   src/workspace.cpp)
@@ -60,13 +62,21 @@ ament_target_dependencies(whole_body_trajectory_planner
   rclcpp std_msgs std_srvs geometry_msgs nav_msgs sensor_msgs
   trajectory_msgs px4_msgs fsc_autopilot_ros2_msgs)
 
+# Torque-mode (R)CCM reference for a bare quadrotor (quadrotor_model.hpp /
+# quadrotor_trajectory.hpp): CcmReference + PositionControllerReference.
+add_executable(quadrotor_ccm_planner
+  src/quadrotor_ccm_planner_node.cpp)
+target_link_libraries(quadrotor_ccm_planner planner_lib)
+ament_target_dependencies(quadrotor_ccm_planner
+  rclcpp std_msgs std_srvs geometry_msgs nav_msgs px4_msgs fsc_autopilot_ros2_msgs)
+
 install(TARGETS planner_lib
   EXPORT export_planner_lib
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include)
-install(TARGETS whole_body_trajectory_planner
+install(TARGETS whole_body_trajectory_planner quadrotor_ccm_planner
   DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
@@ -102,6 +112,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_ee_trajectory_planner test/test_ee_trajectory_planner.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_ee_trajectory_planner planner_lib)
+  ament_add_gtest(test_quadrotor_planner test/test_quadrotor_planner.cpp
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(test_quadrotor_planner planner_lib)
   ament_add_gtest(test_pick_place test/test_pick_place.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_pick_place planner_lib)
