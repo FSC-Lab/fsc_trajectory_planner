@@ -387,6 +387,12 @@ public:
     // Trim first: a descent trim > 5 mm is flown sideways at the hover height,
     // held this long [s], then straight down; 0 = in the descent itself
     declare_parameter<double>("pick_place_descent_trim_settle_s", 0.0);
+    // HOOK GRASP (2026-10-07, the box payload's hanger): > 0 = the pick
+    // approaches from this far BEHIND the target at its own height and slides
+    // in horizontally [m]; the place exit first backs off this far, then
+    // climbs [m]. 0 = the vertical approach / exit (see PickPlaceConfig).
+    declare_parameter<double>("pick_place_pick_approach_back", 0.0);
+    declare_parameter<double>("pick_place_place_exit_back", 0.0);
     declare_parameter<double>("pick_place_approach_wait_max", 60.0);
     // true (2026-10-03, user design: Ready -> Pick -> Exit): a claw leg ends
     // HOLDING above its target; the descent waits for descend_pick /
@@ -475,6 +481,19 @@ public:
     // THE SAFETY MARGIN: go_to_start holds the claw this far above the grasp
     // point, ready descends it, exit climbs it [m]
     declare_parameter<double>("push_pull_approach_dz", 0.20);
+    // (2026-10-06) the approach also starts this far BEHIND the grasp along the
+    // nose [m] (a forward-pitched claw slides onto a vertical post); 0 = straight
+    // down, unchanged. The exit climb [m]; 0 = push_pull_approach_dz.
+    declare_parameter<double>("push_pull_approach_back", 0.0);
+    declare_parameter<double>("push_pull_exit_dz", 0.0);
+    // (2026-10-06) WHEN the law's contact phase flag switches. Default = the
+    // 2026-10-04 timing: CONTACT on at the end of Ready (claw on the handle, jaws
+    // still open), off at Exit (after the jaws opened). The gripper timing:
+    // contact_at_ready false -> CONTACT on at the Push press, which the GS sends
+    // on the jaws' stall (the box joins the chain); contact_off_at_push_end true
+    // -> free as soon as the push completes, before the GS opens the jaws.
+    declare_parameter<bool>("push_pull_contact_at_ready", true);
+    declare_parameter<bool>("push_pull_contact_off_at_push_end", false);
     // the push: this far along the nose [m] (< 0 pulls), no faster than this
     // [s], after holding the grasp this long [s] (the law's phase flag and the
     // EE anchor switch at the press; the anchor blends over the node's
@@ -483,6 +502,17 @@ public:
     declare_parameter<double>("push_pull_push_time_s", 12.0);
     declare_parameter<double>("push_pull_push_settle_s", 1.5);
     declare_parameter<double>("push_pull_exit_time_s", 3.0);
+    // THE UNLOAD (2026-10-07, see PushPullConfig::unload_time): > 0 = after the
+    // slide the push holds push_pull_unload_wait_s, the hold is then re-seated
+    // on the claw's measured position -- the whole-body law's own task error
+    // e_y (wb_control_debug [24..26], world) averaged over the last
+    // push_pull_unload_avg_s of that hold -- over this many seconds, still
+    // gripping and in CONTACT, and held unload_wait again. An error above
+    // push_pull_unload_max is not applied (warned). 0 = off (unchanged).
+    declare_parameter<double>("push_pull_unload_time_s", 0.0);
+    declare_parameter<double>("push_pull_unload_wait_s", 1.0);
+    declare_parameter<double>("push_pull_unload_avg_s", 0.5);
+    declare_parameter<double>("push_pull_unload_max", 0.03);
     // the land hover [x, y, z, yaw_deg] (world, ACTUAL yaw, flown as typed:
     // from the push heading -90, -360 is 270 deg CLOCKWISE) and the start mark
     // Adjust measures against; Adjust writes its x, y shift into both
@@ -514,6 +544,16 @@ public:
     // the claw held in the WORLD from the hover above the handle through the
     // grasp (the pick's anchor, through pick_place_anchor_service)
     declare_parameter<bool>("push_pull_world_anchor_ready", true);
+    // (2026-10-07) with push_pull_world_anchor_ready FALSE (the hover above
+    // and the Ready descent CoM-anchored): true = switch the claw to WORLD-held
+    // on arrival at the handle, before the jaws close. World-held in free
+    // flight the claw's vertical loop bobbed (height error 6-30 mm p-p hovering,
+    // 20-57 mm in the descent; one flip); CoM-anchored it is calm but follows
+    // the base's drift (one run 14 mm off-centre across a 5 mm fin, never
+    // gripped). This keeps the free-flight world hold to the grasp alone.
+    // Pair it with push_pull_descent_trim false: a trim measured CoM-anchored
+    // is the base's wander, not the world-held claw's steady error.
+    declare_parameter<bool>("push_pull_world_anchor_on_handle", false);
     // ... and through the PUSH (2026-10-04, after the first three flights):
     // true = the claw follows the PLANNED world path while the box is
     // clamped. With the CoM anchor a base offset drags the claw reference,
@@ -1883,6 +1923,12 @@ private:
           have_ref = true;
         }
       }
+      if (finished && plUnloadStart()) {
+        // the push flew to its end: the unload leg replaced it (still the push)
+        finished = false;
+        ref = plan_->eval(0.0);
+        have_ref = true;
+      }
       if (finished) {
         if (pp_abort_plan_ && pp_abort_plan_ == plan_) {
           RCLCPP_WARN(get_logger(), "pick-and-place: ABORT complete -- holding, arm home.");
@@ -2788,6 +2834,8 @@ private:
     c->approach_dz = get_parameter("pick_place_approach_dz").as_double();
     c->exit_t = get_parameter("pick_place_exit_time_s").as_double();
     c->trim_settle_s = get_parameter("pick_place_descent_trim_settle_s").as_double();
+    c->pick_approach_back = get_parameter("pick_place_pick_approach_back").as_double();
+    c->place_exit_back = get_parameter("pick_place_place_exit_back").as_double();
     c->fence.min_z = get_parameter("pick_place_fence_min_z").as_double();
     c->fence.max_z = get_parameter("pick_place_fence_max_z").as_double();
     const auto xy = get_parameter("pick_place_fence_xy").as_double_array();
@@ -3553,7 +3601,10 @@ private:
         publishVizPath(traj.get());
       });
     resp->success = true;
-    resp->message = std::string(ppExitName(leg)) + ": climbing " +
+    const bool back_out = leg == kExecutePlace && cfg.place_exit_back > 0.0;
+    resp->message = std::string(ppExitName(leg)) + ": " +
+      (back_out ? "backing out " + std::to_string(static_cast<int>(std::lround(cfg.place_exit_back * 100.0))) +
+       " cm (out from under the arch), then " : std::string()) + "climbing " +
       std::to_string(static_cast<int>(std::lround(cfg.approach_dz * 100.0))) +
       " cm straight up to the clearance point";
     RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
@@ -3907,7 +3958,7 @@ private:
         }
         if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
       } else if (pp_exiting_.has_value()) {
-        m << "FLYING " << ppExitName(*pp_exiting_) << " (up the safety margin)";
+        m << "FLYING " << ppExitName(*pp_exiting_) << " (up the vertical margin)";
         if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
       } else if (!pp_error_.empty()) {
         m << (pp_timed_out_ ? "INCOMPLETE: " : "INFEASIBLE: ") << pp_error_;
@@ -4046,10 +4097,14 @@ private:
     }
     c->yaw_from_box = get_parameter("push_pull_yaw_from_box_deg").as_double() * M_PI / 180.0;
     c->approach_dz = get_parameter("push_pull_approach_dz").as_double();
+    c->approach_back = get_parameter("push_pull_approach_back").as_double();
+    c->exit_dz = get_parameter("push_pull_exit_dz").as_double();
     c->push_distance = get_parameter("push_pull_push_distance").as_double();
     c->push_time = get_parameter("push_pull_push_time_s").as_double();
     c->push_settle = get_parameter("push_pull_push_settle_s").as_double();
     c->exit_time = get_parameter("push_pull_exit_time_s").as_double();
+    c->unload_time = get_parameter("push_pull_unload_time_s").as_double();
+    c->unload_wait = get_parameter("push_pull_unload_wait_s").as_double();
     c->fence.min_z = get_parameter("push_pull_fence_min_z").as_double();
     c->fence.max_z = get_parameter("push_pull_fence_max_z").as_double();
     const auto xy = get_parameter("push_pull_fence_xy").as_double_array();
@@ -4104,8 +4159,11 @@ private:
       "push_pull_guard_persist_s", "push_pull_guard_force_n", "push_pull_guard_force_persist_s",
       "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
       "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
+      "push_pull_world_anchor_on_handle",
+      "push_pull_contact_at_ready", "push_pull_contact_off_at_push_end",
       "push_pull_capture_window",
-      "push_pull_capture_max_spread", "push_pull_start_mark"};
+      "push_pull_capture_max_spread", "push_pull_start_mark",
+      "push_pull_unload_avg_s", "push_pull_unload_max"};
     bool stale = false;
     for (const auto & p : ps) {
       const std::string & n = p.get_name();
@@ -4572,6 +4630,8 @@ private:
             restoreAnchor();
           }
           requestContact(true);
+          pl_unloaded_ = false;
+          pl_ey_buf_.clear();
           break;
         case kPlExit:
           // the gripper is open: no contact any more
@@ -4649,6 +4709,64 @@ private:
     RCLCPP_INFO(get_logger(), "push-and-pull: %s", resp->message.c_str());
   }
 
+  // Called from the stream tick, under the lock, when the plan in flight has
+  // ended. THE UNLOAD (push_pull_unload_time_s > 0): when that plan is the
+  // push, replace it with the unload leg -- the hold re-seated by the law's
+  // averaged task error, still gripping and in CONTACT -- and return true (the
+  // push continues). Planned here, synchronously: a few-mm rest-to-rest leg
+  // plans in milliseconds and the stream must not see a gap.
+  bool plUnloadStart()
+  {
+    if (!pl_flying_.has_value() || *pl_flying_ != kPlPush || !pl_exec_plan_ ||
+      pl_exec_plan_ != plan_ || pl_unloaded_ || pl_aborting_ || pl_abort_plan_)
+    {
+      return false;
+    }
+    PushPullConfig cfg;
+    std::string err;
+    if (!plConfig(&cfg, &err) || cfg.unload_time <= 0.0) {return false;}
+    pl_unloaded_ = true;
+    const auto now = Clock::now();
+    const double avg = get_parameter("push_pull_unload_avg_s").as_double();
+    Vec3 shift = Vec3::Zero();
+    int n = 0;
+    for (const auto & e : pl_ey_buf_) {
+      if (std::chrono::duration<double>(now - e.first).count() <= avg) {
+        shift += e.second;
+        ++n;
+      }
+    }
+    if (n == 0) {
+      RCLCPP_WARN(get_logger(), "push-and-pull unload: no task error in the last %.2f s -- "
+        "skipped (is the whole-body node's wb_control_debug flowing?)", avg);
+      return false;
+    }
+    shift /= static_cast<double>(n);
+    const double max_shift = get_parameter("push_pull_unload_max").as_double();
+    if (shift.norm() > max_shift) {
+      RCLCPP_WARN(get_logger(), "push-and-pull unload: the claw's task error %.1f mm exceeds "
+        "push_pull_unload_max %.1f mm -- not re-seated", shift.norm() * 1e3, max_shift * 1e3);
+      return false;
+    }
+    const RestSpec from = plan_->goalRest();
+    std::shared_ptr<Trajectory> traj;
+    try {
+      traj = planPushPullUnload(*vehicle_, *planner_, planOptions(), cfg, from, shift);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(get_logger(), "push-and-pull unload refused (%s) -- the push completes "
+        "without it", e.what());
+      return false;
+    }
+    setHold(from, true);
+    plan_ = traj;
+    pl_exec_plan_ = traj;
+    exec_t0_ = now;
+    RCLCPP_INFO(get_logger(), "push-and-pull unload: re-seating the hold by [%.1f %.1f %.1f] mm "
+      "(the law's task error over %.2f s, %d samples) -- %s", shift(0) * 1e3, shift(1) * 1e3,
+      shift(2) * 1e3, avg, n, traj->diag().summary.c_str());
+    return true;
+  }
+
   // Called from the stream tick, under the lock, when step s has been flown
   // to its end.
   void plStepDone(int s)
@@ -4673,10 +4791,27 @@ private:
         // press (51 mm of drift on a fixed reference). Push asks again
         // (idempotent); Exit and ABORT clear it.
         pl_at_handle_ = true;
-        requestContact(true);
+        if (!get_parameter("push_pull_world_anchor_ready").as_bool() &&
+          get_parameter("push_pull_world_anchor_on_handle").as_bool())
+        {
+          requestAnchor(false);
+          RCLCPP_INFO(get_logger(), "push-and-pull: on the handle -- the claw now WORLD-held "
+            "(push_pull_world_anchor_on_handle): pulled onto the grasp point before the jaws close");
+        }
+        if (get_parameter("push_pull_contact_at_ready").as_bool()) {
+          requestContact(true);
+        } else {
+          RCLCPP_INFO(get_logger(), "push-and-pull: on the handle -- the contact phase waits for the "
+            "jaws (push_pull_contact_at_ready false: CONTACT at the Push press)");
+        }
         break;
       case kPlPush:
         pl_at_handle_ = true;
+        if (get_parameter("push_pull_contact_off_at_push_end").as_bool()) {
+          requestContact(false);
+          RCLCPP_INFO(get_logger(), "push-and-pull: push complete -- contact phase free before the "
+            "jaws open (push_pull_contact_off_at_push_end)");
+        }
         break;
       default:
         pl_at_handle_ = false;
@@ -4883,6 +5018,16 @@ private:
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       const auto now = Clock::now();
+      // the unload's input: the law's task error while the push flies
+      const Vec3 ey{msg.data[24], msg.data[25], msg.data[26]};
+      if (pl_flying_.has_value() && *pl_flying_ == kPlPush && ey.allFinite()) {
+        pl_ey_buf_.emplace_back(now, ey);
+        while (!pl_ey_buf_.empty() &&
+          std::chrono::duration<double>(now - pl_ey_buf_.front().first).count() > 3.0)
+        {
+          pl_ey_buf_.pop_front();
+        }
+      }
       const double dt = pl_force_t_.has_value()
         ? std::clamp(std::chrono::duration<double>(now - *pl_force_t_).count(), 0.0, 0.1) : 0.0;
       pl_force_t_ = now;
@@ -5288,6 +5433,8 @@ private:
   Vec3 pl_force_f_{Vec3::Zero()};               // the low-passed F_hat [N]
   std::optional<Clock::time_point> pl_force_t_, pl_force_since_;
   std::deque<std::pair<Clock::time_point, Vec3>> pl_trim_buf_;   // claw error holding above
+  std::deque<std::pair<Clock::time_point, Vec3>> pl_ey_buf_;     // the law's e_y in the push
+  bool pl_unloaded_{false};                     // the push's unload has been started
   Vec3 pl_trim_{Vec3::Zero()};                  // the trim the last Ready used
   double pl_last_err_{0.0};
   bool pl_within_{false};

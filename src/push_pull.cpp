@@ -202,8 +202,13 @@ PushPullWaypoints pushPullWaypoints(
 {
   checkPose(v, c.home, "home pose", kPlExit);
   checkPose(v, c.push_pose, "push pose", kPlReady);
-  if (!(c.approach_dz > 0.0)) {
-    throw std::runtime_error("ready: the safety margin (approach_dz) must be > 0");
+  if (!(c.approach_dz > 0.0) && !(c.approach_back > 0.0)) {
+    throw std::runtime_error(
+      "ready: the safety margin must be > 0 (approach_dz above or approach_back behind the grasp)");
+  }
+  const double exit_dz = c.exit_dz > 0.0 ? c.exit_dz : c.approach_dz;
+  if (!(exit_dz > 0.0)) {
+    throw std::runtime_error("exit: the climb must be > 0 (exit_dz, or approach_dz when exit_dz is 0)");
   }
   PushPullWaypoints wp;
   wp.drone_yaw = t.box_yaw + c.yaw_from_box;
@@ -218,12 +223,13 @@ PushPullWaypoints pushPullWaypoints(
   wp.grasp.x_b = wp.grasp_ee - Rz(phi) * r0e;
   wp.approach = wp.grasp;
   wp.approach.x_b(2) += c.approach_dz;
+  wp.approach.x_b -= c.approach_back * wp.push_dir;
   wp.approach_ee = clawOf(v, wp.approach);
   wp.pushed = wp.grasp;
   wp.pushed.x_b += c.push_distance * wp.push_dir;
   wp.pushed_ee = clawOf(v, wp.pushed);
   wp.lifted = wp.pushed;
-  wp.lifted.x_b(2) += c.approach_dz;
+  wp.lifted.x_b(2) += exit_dz;
   wp.exited = wp.lifted;
   wp.exited.q = c.home;
   wp.land.x_b = t.land.p;
@@ -273,6 +279,29 @@ std::unique_ptr<Trajectory> planPushPullPush(
       }
       segs.push_back(transitionLeg(
         v, transition, timedOptions(opts, c.push_distance, c.push_time), from, goal));
+      // the unload measures the claw's task error over the end of this hold
+      if (c.unload_time > 0.0 && c.unload_wait > 0.0) {
+        segs.push_back(std::make_shared<PauseTrajectory>(v.params, goal, c.unload_wait));
+      }
+      return std::make_unique<SequenceTrajectory>(std::move(segs));
+    });
+}
+
+std::unique_ptr<Trajectory> planPushPullUnload(
+  const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
+  const PushPullConfig & c, const RestSpec & from, const Vec3 & shift)
+{
+  RestSpec goal = from;
+  const bool move = shift.norm() >= 5e-4 && c.unload_time > 0.0;
+  if (move) {goal.x_b += shift;}
+  return step(v, c, "unload", [&]() -> std::unique_ptr<Trajectory> {
+      std::vector<std::shared_ptr<const Trajectory>> segs;
+      if (move) {
+        segs.push_back(transitionLeg(
+          v, transition, timedOptions(opts, shift.norm(), c.unload_time), from, goal));
+      }
+      segs.push_back(std::make_shared<PauseTrajectory>(
+        v.params, goal, std::max(c.unload_wait, 1e-3)));
       return std::make_unique<SequenceTrajectory>(std::move(segs));
     });
 }
@@ -281,13 +310,14 @@ std::unique_ptr<Trajectory> planPushPullExit(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from)
 {
+  const double exit_dz = c.exit_dz > 0.0 ? c.exit_dz : c.approach_dz;
   RestSpec up = from;
-  up.x_b(2) += c.approach_dz;
+  up.x_b(2) += exit_dz;
   RestSpec home = up;
   home.q = c.home;
   return step(v, c, "exit", [&]() -> std::unique_ptr<Trajectory> {
       std::vector<std::shared_ptr<const Trajectory>> segs{
-        transitionLeg(v, transition, timedOptions(opts, c.approach_dz, c.exit_time), from, up)};
+        transitionLeg(v, transition, timedOptions(opts, exit_dz, c.exit_time), from, up)};
       if ((up.q - c.home).cwiseAbs().maxCoeff() > 1e-6) {
         segs.push_back(transitionLeg(v, transition, opts, up, home));
       }

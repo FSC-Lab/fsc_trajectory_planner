@@ -118,6 +118,19 @@ struct PickPlaceConfig
   // claw above it), then -- once the claw is within the arrival tolerance --
   // descend vertically onto it (2026-10-02 audit, M2). 0 disables.
   double approach_dz{0.10};
+  // HOOK GRASP (2026-10-07, the box payload: a hanger whose arch rests on the
+  // two closed fingers -- the fingers must slide in UNDER the arch, so neither
+  // claw leg may come down onto the payload from above). Both 0 = the vertical
+  // legs above, unchanged.
+  // pick_approach_back > 0: execute_pick's approach rest is this far BEHIND the
+  // goal (along -nose) at the goal's own height, and the pick "descent" is a
+  // horizontal move in -- no trim-first split (the trimmed goal is flown
+  // directly). The exit is still straight up: it lifts the payload.
+  double pick_approach_back{0.0};
+  // place_exit_back > 0: Exit To Place first backs off this far along -nose at
+  // the hold's height (the fingers slide out from under the arch), then climbs
+  // approach_dz.
+  double place_exit_back{0.0};
   // EXIT TO PICK / PLACE duration [s] (2026-10-03); 0 = the leg bounds (a_max
   // 0.15 m/s^2: 3.2 s for a 0.20 m climb). Clamped to a payload that still
   // rests on its pillar the vehicle must lift it OFF fast: a min-snap climb

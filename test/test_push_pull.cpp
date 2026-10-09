@@ -137,6 +137,52 @@ TEST(PushPull, PushHoldsTheArmAndHeadingAndMovesAlongTheNose)
   EXPECT_LT((traj->eval(traj->duration()).r_ed - wp.pushed_ee).norm(), 1e-6);
 }
 
+// THE UNLOAD (2026-10-07): off by default (the push unchanged); on, the push
+// ends with a hold of unload_wait, and the unload leg translates the whole rest
+// by the measured task error -- the claw by exactly that, arm and heading held
+// -- then holds; a sub-millimetre error is the hold alone.
+TEST(PushPull, UnloadReSeatsTheHoldOnTheMeasuredClaw)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PushPullConfig c = config(*v);
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, scene());
+  const double T_off = planPushPullPush(*v, *planner, PlanOptions{}, c, wp.grasp)->duration();
+  c.unload_time = 1.5;
+  c.unload_wait = 1.0;
+  const auto push = planPushPullPush(*v, *planner, PlanOptions{}, c, wp.grasp);
+  EXPECT_NEAR(push->duration(), T_off + c.unload_wait, 1e-9);
+  EXPECT_LT((push->goalRest().x_b - wp.pushed.x_b).norm(), 1e-9);
+
+  const RestSpec from = push->goalRest();
+  const Vec3 claw0 = clawOf(*v, from);
+  const Vec3 shift(0.001, -0.007, 0.006);   // the law's e_y at the end of a pull
+  const auto un = planPushPullUnload(*v, *planner, PlanOptions{}, c, from, shift);
+  EXPECT_GE(un->duration(), c.unload_time + c.unload_wait - 1e-9);
+  EXPECT_LT((un->eval(0.0).r_ed - claw0).norm(), 1e-6) << "the unload must start on the push's end";
+  EXPECT_LT((un->eval(un->duration()).r_ed - (claw0 + shift)).norm(), 1e-6);
+  EXPECT_LT((un->goalRest().q - from.q).norm(), 1e-12);
+  EXPECT_NEAR(un->goalRest().phi, from.phi, 1e-12);
+  double max_dq = 0.0, max_off = 0.0;
+  for (int k = 0; k <= 200; ++k) {
+    const WbReference r = un->eval(un->duration() * k / 200.0);
+    max_dq = std::max(max_dq, (r.q_d - from.q).cwiseAbs().maxCoeff());
+    // the claw moves along the shift only (no overshoot past either end)
+    const Vec3 d = r.r_ed - claw0;
+    const double s = d.dot(shift) / shift.squaredNorm();
+    max_off = std::max(max_off, (d - s * shift).norm());
+    EXPECT_GT(s, -0.05);
+    EXPECT_LT(s, 1.05);
+  }
+  EXPECT_LT(max_dq, 1e-6) << "the arm moved in the unload";
+  // off the line only by what the acceleration tilt swings the claw (as the push)
+  EXPECT_LT(max_off, 1e-3) << "the claw left the shift's line";
+
+  const auto still = planPushPullUnload(*v, *planner, PlanOptions{}, c, from, Vec3(2e-4, 0.0, 0.0));
+  EXPECT_NEAR(still->duration(), c.unload_wait, 1e-9);
+  EXPECT_LT((still->goalRest().x_b - from.x_b).norm(), 1e-12);
+}
+
 TEST(PushPull, ReadyDescendsStraightOntoTheGraspPoint)
 {
   const auto v = makeVehicleModel("t650_aerial_manipulator");

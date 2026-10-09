@@ -84,6 +84,13 @@ struct PushPullConfig
   // the safety margin: go_to_start holds the claw this far above the grasp
   // point, ready descends it, exit climbs it [m]
   double approach_dz{0.20};
+  // (2026-10-06) the approach ALSO starts this far BEHIND the grasp point along
+  // the nose [m]: with a claw pitched forward (push pose beta ~60 deg) the jaws
+  // slide onto a vertical post handle instead of dropping onto a fin. 0 = the
+  // straight-down approach (unchanged). approach_dz may then be 0.
+  double approach_back{0.0};
+  // the exit climb [m]; 0 = approach_dz (unchanged)
+  double exit_dz{0.0};
   // how far the push moves the base along the nose [m]; < 0 PULLS back
   double push_distance{0.50};
   // the push's shortest duration [s] (its speed: a min-snap move of d in T
@@ -94,6 +101,16 @@ struct PushPullConfig
   double push_settle{1.0};
   // the exit climb's duration [s]; 0 = the leg bounds
   double exit_time{3.0};
+  // THE UNLOAD (2026-10-07): when the slide ends the box is held by static
+  // friction while the claw still sits short of its reference, so the arm's
+  // impedance stores K_y e (~2 N at the end of a pull) that is released into
+  // the arm when CONTACT ends or the jaws open. unload_time > 0: the push holds
+  // unload_wait at its end, the node then re-seats the hold on the claw's
+  // measured position (planPushPullUnload, the law's own task error, gripping
+  // and in CONTACT) over unload_time and holds unload_wait again before the
+  // push completes. 0 = off (unchanged).
+  double unload_time{0.0};
+  double unload_wait{1.0};
   Geofence fence;
   TableKeepOut table;
   // the gear bottom and every arm point must stay this far above the table
@@ -154,6 +171,12 @@ std::unique_ptr<Trajectory> planPushPullPush(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from);
 // straight up approach_dz (arm unchanged), then the arm home in place
+// The unload (after the push, still gripping, in CONTACT): the whole rest
+// translated by `shift` (the claw's measured task error, world [m]) over
+// c.unload_time, then held c.unload_wait. A shift under 0.5 mm is only the hold.
+std::unique_ptr<Trajectory> planPushPullUnload(
+  const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
+  const PushPullConfig & c, const RestSpec & from, const Vec3 & shift);
 std::unique_ptr<Trajectory> planPushPullExit(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from);

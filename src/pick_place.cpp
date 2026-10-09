@@ -180,7 +180,13 @@ PickPlaceWaypoints pickPlaceWaypoints(
   for (int k = 0; k < kNumPickPlaceLegs; ++k) {
     wp.ee[k] = clawOf(v, wp.goal[k]);
     wp.approach[k] = wp.goal[k];
-    if (pickPlaceLegIsClaw(k)) {wp.approach[k].x_b(2) += c.approach_dz;}
+    if (k == kExecutePick && c.pick_approach_back > 0.0) {
+      // the hook grasp: behind the target at its own height (model +y = the nose)
+      const double phi = wp.goal[k].phi;
+      wp.approach[k].x_b -= c.pick_approach_back * Vec3{-std::sin(phi), std::cos(phi), 0.0};
+    } else if (pickPlaceLegIsClaw(k)) {
+      wp.approach[k].x_b(2) += c.approach_dz;
+    }
     wp.approach_ee[k] = clawOf(v, wp.approach[k]);
     for (const RestSpec * r : {&wp.goal[k], &wp.approach[k]}) {
       const std::string why = c.fence.violation(r->x_b);
@@ -315,7 +321,10 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
   const double side = (goal.x_b - from.x_b).head<2>().norm();
   std::unique_ptr<Trajectory> traj;
   try {
-    if (c.trim_settle_s > 0.0 && side > kTrimFirstMin) {
+    if (leg == kExecutePick && c.pick_approach_back > 0.0) {
+      // the hook grasp's approach is already level with the goal: fly straight in
+      traj = transitionLeg(v, transition, opts, from, goal);
+    } else if (c.trim_settle_s > 0.0 && side > kTrimFirstMin) {
       // TRIM FIRST: sideways at the hover height, settle, then straight down
       RestSpec above = from;
       above.x_b.head<2>() = goal.x_b.head<2>();
@@ -340,7 +349,7 @@ std::unique_ptr<Trajectory> planPickPlaceExit(
 {
   const std::string what = std::string(pickPlaceLegName(leg)) + " exit";
   if (!pickPlaceLegIsClaw(leg)) {throw std::runtime_error(what + ": not a claw leg");}
-  if (!(c.approach_dz > 0.0)) {throw std::runtime_error(what + ": the safety margin is 0");}
+  if (!(c.approach_dz > 0.0)) {throw std::runtime_error(what + ": the vertical margin is 0");}
   RestSpec up = from;
   up.x_b(2) += c.approach_dz;
   const std::string why = c.fence.violation(up.x_b);
@@ -356,7 +365,20 @@ std::unique_ptr<Trajectory> planPickPlaceExit(
   }
   std::unique_ptr<Trajectory> traj;
   try {
-    traj = transitionLeg(v, transition, o, from, up);
+    if (leg == kExecutePlace && c.place_exit_back > 0.0) {
+      // the hook grasp: slide the fingers out from under the arch, then climb
+      RestSpec back = from;
+      back.x_b -= c.place_exit_back * Vec3{-std::sin(from.phi), std::cos(from.phi), 0.0};
+      up.x_b.head<2>() = back.x_b.head<2>();
+      const std::string why_back = c.fence.violation(up.x_b);
+      if (!why_back.empty()) {throw std::runtime_error(why_back);}
+      std::vector<std::shared_ptr<const Trajectory>> segs{
+        transitionLeg(v, transition, opts, from, back),
+        transitionLeg(v, transition, o, back, up)};
+      traj = std::make_unique<SequenceTrajectory>(std::move(segs));
+    } else {
+      traj = transitionLeg(v, transition, o, from, up);
+    }
   } catch (const std::exception & e) {
     throw std::runtime_error(what + ": " + e.what());
   }

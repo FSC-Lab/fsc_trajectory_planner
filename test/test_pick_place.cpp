@@ -319,6 +319,69 @@ TEST(PickPlace, ALargeDescentTrimIsFlownSidewaysFirstThenStraightDown)
   EXPECT_TRUE(s0 == nullptr || s0->segmentStarts().size() == 1u);
 }
 
+TEST(PickPlace, TheHookGraspApproachesLevelAndThePlaceExitBacksOutFirst)
+{
+  // the box payload (2026-10-07): a hanger whose arch rests on the two closed
+  // fingers, so the claw slides in UNDER the arch at the pick and out from
+  // under it at the place -- never down onto it or up out of it there
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.trim_settle_s = 2.0;                 // must NOT split the horizontal approach
+  c.pick_approach_back = 0.12;
+  c.place_exit_back = 0.12;
+  PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  const auto nose = [](double phi) {return Vec3(-std::sin(phi), std::cos(phi), 0.0);};
+  const int kp = kExecutePick, kl = kExecutePlace;
+  // the pick's ready point: 0.12 m behind the goal, at its height, same arm
+  const Vec3 n_p = nose(wp.goal[kp].phi);
+  EXPECT_LT((wp.goal[kp].x_b - wp.approach[kp].x_b - 0.12 * n_p).norm(), 1e-12);
+  EXPECT_LT((wp.ee[kp] - wp.approach_ee[kp] - 0.12 * n_p).norm(), 1e-9);
+  EXPECT_LT((wp.approach[kp].q - wp.goal[kp].q).norm(), 1e-12);
+  // the place keeps its vertical approach
+  EXPECT_LT((wp.approach[kl].x_b - wp.goal[kl].x_b - Vec3(0.0, 0.0, 0.20)).norm(), 1e-12);
+
+  // the pick "descent": level the whole way, straight onto the goal, one segment
+  wp.goal[kp].x_b += Vec3(0.004, -0.003, 0.002);          // a whole-body-size trim
+  const auto D = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, kp, wp.approach[kp]);
+  const auto * sd = dynamic_cast<const SequenceTrajectory *>(D.get());
+  EXPECT_TRUE(sd == nullptr || sd->segmentStarts().size() == 1u);
+  // level to within the airframe's own tilt while it accelerates (the arm is
+  // fixed, so the claw rides the pitch: ~1.4 mm here) -- against the 0.20 m
+  // vertical approach it replaces
+  const WbReference d0 = D->eval(0.0), dT = D->eval(D->duration());
+  for (int i = 0; i <= 40; ++i) {
+    const WbReference a = D->eval(D->duration() * i / 40.0);
+    EXPECT_GT(a.r_ed(2), std::min(d0.r_ed(2), dT.r_ed(2)) - 0.003);
+    EXPECT_LT(a.r_ed(2), std::max(d0.r_ed(2), dT.r_ed(2)) + 0.003);
+  }
+  EXPECT_LT((dT.x_cd - restReference(v->params, wp.goal[kp]).x_cd).norm(), 1e-6);
+
+  // the pick exit still lifts straight up (it carries the payload off the pillar)
+  const auto EP = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kp, wp.goal[kp]);
+  EXPECT_LT((EP->eval(EP->duration()).r_ed - EP->eval(0.0).r_ed - Vec3(0.0, 0.0, 0.20)).norm(), 1e-6);
+
+  // the place exit: back 0.12 m at the hold's height, THEN up 0.20 m
+  const auto EX = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl]);
+  const auto * se = dynamic_cast<const SequenceTrajectory *>(EX.get());
+  ASSERT_NE(se, nullptr);
+  ASSERT_EQ(se->segmentStarts().size(), 2u);
+  const double t1 = se->segmentStarts()[1];
+  const Vec3 n_l = nose(wp.goal[kl].phi);
+  const WbReference e0 = EX->eval(0.0), e1 = EX->eval(t1), eT = EX->eval(EX->duration());
+  for (int i = 0; i <= 40; ++i) {
+    EXPECT_NEAR(EX->eval(t1 * i / 40.0).r_ed(2), e0.r_ed(2), 0.003);  // level while backing out
+  }
+  EXPECT_LT((e1.r_ed - e0.r_ed + 0.12 * n_l).norm(), 1e-6);
+  EXPECT_LT((eT.r_ed - e1.r_ed - Vec3(0.0, 0.0, 0.20)).norm(), 1e-6);
+  // the mission dry run flies it too
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> exits;
+  const PickPlaceWaypoints wp2 = pickPlaceWaypoints(*v, c, scene());
+  const auto legs = planPickPlaceMission(*v, *planner, PlanOptions{}, c, wp2, wp2.goal[kGoToStart], &exits);
+  EXPECT_EQ(legs.size(), static_cast<size_t>(kNumPickPlaceLegs));
+}
+
 TEST(PickPlace, APlanCanBeEvaluatedFromTwoThreadsAtOnce)
 {
   // The node's stream tick evaluates the plan near t = 0 while its worker
