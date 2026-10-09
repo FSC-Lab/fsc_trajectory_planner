@@ -384,9 +384,12 @@ public:
     declare_parameter<double>("pick_place_approach_dz", 0.20);
     // Exit To Pick / Place duration [s]; 0 = the leg bounds (see PickPlaceConfig::exit_t)
     declare_parameter<double>("pick_place_exit_time_s", 0.0);
-    // Trim first: a descent trim > 5 mm is flown sideways at the hover height,
+    // Trim first: a descent trim > pick_place_descent_trim_first_min is flown sideways at the hover height,
     // held this long [s], then straight down; 0 = in the descent itself
     declare_parameter<double>("pick_place_descent_trim_settle_s", 0.0);
+    // ... for a horizontal trim above this [m]; 0 = trim first always, so the
+    // descent's duration does not depend on the hover error (2026-10-09)
+    declare_parameter<double>("pick_place_descent_trim_first_min", 0.005);
     // HOOK GRASP (2026-10-07, the box payload's hanger): > 0 = the pick
     // approaches from this far BEHIND the target at its own height and slides
     // in horizontally [m]; the place exit first backs off this far, then
@@ -2834,6 +2837,7 @@ private:
     c->approach_dz = get_parameter("pick_place_approach_dz").as_double();
     c->exit_t = get_parameter("pick_place_exit_time_s").as_double();
     c->trim_settle_s = get_parameter("pick_place_descent_trim_settle_s").as_double();
+    c->trim_first_min = get_parameter("pick_place_descent_trim_first_min").as_double();
     c->pick_approach_back = get_parameter("pick_place_pick_approach_back").as_double();
     c->place_exit_back = get_parameter("pick_place_place_exit_back").as_double();
     c->fence.min_z = get_parameter("pick_place_fence_min_z").as_double();

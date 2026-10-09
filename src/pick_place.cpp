@@ -305,8 +305,6 @@ private:
   PlanDiag diag_;
 };
 
-// a trim below this is flown in the descent itself (the whole-body law's, 1-7 mm)
-constexpr double kTrimFirstMin = 0.005;
 }  // namespace
 
 std::unique_ptr<Trajectory> planPickPlaceDescent(
@@ -324,7 +322,9 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
     if (leg == kExecutePick && c.pick_approach_back > 0.0) {
       // the hook grasp's approach is already level with the goal: fly straight in
       traj = transitionLeg(v, transition, opts, from, goal);
-    } else if (c.trim_settle_s > 0.0 && side > kTrimFirstMin) {
+    } else if (c.trim_settle_s > 0.0 && side > c.trim_first_min) {
+      // (a trim at or below trim_first_min is flown in the descent itself --
+      // the whole-body law's, 1-7 mm, with the default 5 mm)
       // TRIM FIRST: sideways at the hover height, settle, then straight down
       RestSpec above = from;
       above.x_b.head<2>() = goal.x_b.head<2>();

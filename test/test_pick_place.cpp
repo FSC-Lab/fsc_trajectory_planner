@@ -5,6 +5,7 @@
 // both ends, sweeping its band, every bound honoured, the shortest feasible
 // duration) and the whole mission dry run the Plan button performs.
 #include <gtest/gtest.h>
+#include <cstdio>
 
 #include <algorithm>
 #include <array>
@@ -317,6 +318,46 @@ TEST(PickPlace, ALargeDescentTrimIsFlownSidewaysFirstThenStraightDown)
   const auto O = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, k, above);
   const auto * s0 = dynamic_cast<const SequenceTrajectory *>(O.get());
   EXPECT_TRUE(s0 == nullptr || s0->segmentStarts().size() == 1u);
+}
+
+TEST(PickPlace, TrimFirstMinZeroGivesEveryDescentTheSameSegmentsAndDuration)
+{
+  // 2026-10-09, the simulation comparison: with the default 5 mm threshold a
+  // whole-body place trim of 4-6 mm flipped between the straight 3.2 s descent
+  // and the 8.2 s trim-first one from run to run. trim_first_min = 0 makes the
+  // descent three segments whatever the trim, so every run flies the same time.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.trim_settle_s = 2.0;
+  c.trim_first_min = 0.0;
+  const int k = kExecutePlace;
+  std::vector<double> T;
+  for (const Vec3 & trim : {Vec3(0.0005, 0.0, 0.0), Vec3(-0.0033, -0.0023, -0.0006),
+      Vec3(-0.0049, -0.0036, 0.0021), Vec3(0.031, -0.0495, 0.0052)})
+  {
+    PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+    const RestSpec above = wp.approach[k];
+    wp.goal[k].x_b += trim;
+    const auto D = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, k, above);
+    const auto * seq = dynamic_cast<const SequenceTrajectory *>(D.get());
+    ASSERT_NE(seq, nullptr);
+    ASSERT_EQ(seq->segmentStarts().size(), 3u);
+    EXPECT_LT((D->eval(D->duration()).x_cd - restReference(v->params, wp.goal[k]).x_cd).norm(), 1e-6);
+    T.push_back(D->duration());
+  }
+  for (double t : T) {EXPECT_NEAR(t, T.front(), 0.05) << "durations differ";}
+  // the default keeps the old behaviour: a 4 mm trim stays one segment
+  c.trim_first_min = 0.005;
+  PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, scene());
+  const RestSpec above = wp.approach[k];
+  wp.goal[k].x_b += Vec3(-0.0033, -0.0023, -0.0006);
+  const auto S = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, k, above);
+  const auto * s1 = dynamic_cast<const SequenceTrajectory *>(S.get());
+  EXPECT_TRUE(s1 == nullptr || s1->segmentStarts().size() == 1u);
+  std::printf("trim-first descent durations [s]: %.3f %.3f %.3f %.3f; straight %.3f\n",
+    T[0], T[1], T[2], T[3], S->duration());
 }
 
 TEST(PickPlace, TheHookGraspApproachesLevelAndThePlaceExitBacksOutFirst)

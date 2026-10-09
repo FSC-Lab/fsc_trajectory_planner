@@ -140,7 +140,7 @@ struct PickPlaceConfig
   // and its translational bounds opened just enough for it; the rotor and
   // joint-torque bounds still apply.
   double exit_t{0.0};
-  // TRIM FIRST (2026-10-03): with a descent trim larger than kTrimFirstMin, the
+  // TRIM FIRST (2026-10-03): with a descent trim larger than trim_first_min, the
   // descent becomes three segments -- the claw moves SIDEWAYS by the trim at
   // the hover height, holds there trim_settle_s, then descends STRAIGHT down.
   // 0 = the old single segment, which moves the claw sideways WHILE it
@@ -149,6 +149,12 @@ struct PickPlaceConfig
   // only 8.75 mm clear of the handle (geo_22: a finger on the handle, the claw
   // then swung +-0.1 m around it and knocked the payload off its pillar).
   double trim_settle_s{0.0};
+  // the smallest horizontal trim flown TRIM FIRST [m] (2026-10-09). Below it
+  // the trim is flown inside the single descent. 0 = trim first ALWAYS, so the
+  // descent has the same three segments -- and the same duration -- whatever
+  // the hover error (the simulation comparison: a 4-6 mm whole-body trim
+  // otherwise flips between a 3.2 s and an 8.2 s descent from run to run).
+  double trim_first_min{0.005};
   Geofence fence;
   // the execute_place leg
   ArmSweepOptions sweep;
