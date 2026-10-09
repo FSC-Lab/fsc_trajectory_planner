@@ -448,6 +448,25 @@ public:
     // ABORT (pick_place/abort): arm home and the vehicle this much higher [m],
     // x, y and heading kept -- the arm GS opens the gripper on the same press
     declare_parameter<double>("pick_place_abort_climb", 0.30);
+    // ... and the TWO-STEP ARM (2026-10-09, user design): the arm first goes to
+    // this RELEASE pose [deg] while the vehicle climbs, holds it
+    // pick_place_abort_release_hold_s, then folds home in place (the arm GS
+    // then closes the gripper). Claws pointing steeply down let a payload still
+    // hanging on the open fingers -- the hook grasp's arch -- slide off. Empty
+    // (the default) = straight home, the earlier behaviour.
+    declare_parameter<std::vector<double>>("pick_place_abort_release_pose_deg", std::vector<double>{});
+    declare_parameter<double>("pick_place_abort_release_hold_s", 2.0);
+    {
+      const auto rp = get_parameter("pick_place_abort_release_pose_deg").as_double_array();
+      if (rp.size() == 4) {
+        RCLCPP_INFO(get_logger(), "pick-and-place ABORT: arm to the release pose [%.0f, %.0f, %.0f, %.0f] deg "
+          "while climbing, hold %.1f s, then home", rp[0], rp[1], rp[2], rp[3],
+          get_parameter("pick_place_abort_release_hold_s").as_double());
+      } else if (!rp.empty()) {
+        RCLCPP_ERROR(get_logger(), "pick_place_abort_release_pose_deg has %zu values (needs 4) -- IGNORED, "
+          "the abort folds straight home", rp.size());
+      }
+    }
     // SAFETY GUARD (2026-10-03, user design): an AUTOMATIC abort -- the same
     // response as the button: the arm GS opens the gripper (it sees the
     // ABORTING status), arm home, this climb, hover -- when the body TILT
@@ -2954,6 +2973,14 @@ private:
         want(4);
       } else if (n == "pick_place_ee_offset") {
         want(3);
+      } else if (n == "pick_place_abort_release_pose_deg") {
+        // [] = straight home, else the 4 joints [deg]
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (!p.as_double_array().empty() && p.as_double_array().size() != 4))
+        {
+          r.successful = false;
+          r.reason = n + " needs [] or 4 joint angles [deg]";
+        }
       } else if (n == "pick_place_place_point") {
         // [x, y, z, yaw_deg]; a 3-value [x, y, z] (before 2026-10-03) is yaw 0
         if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
@@ -2974,7 +3001,8 @@ private:
         n != "pick_place_descent_on_request" && n != "pick_place_guard_tilt_deg" &&
         n != "pick_place_descent_trim" && n != "pick_place_descent_trim_window_s" &&
         n != "pick_place_descent_trim_max" &&
-        n != "pick_place_guard_persist_s")
+        n != "pick_place_guard_persist_s" && n != "pick_place_abort_release_pose_deg" &&
+        n != "pick_place_abort_release_hold_s")
       {
         stale = true;
       }
@@ -3401,6 +3429,8 @@ private:
     unsigned gen = 0;
     bool cut = false;
     double climb = 0.0;
+    std::optional<VecN> release;
+    double release_hold = 0.0;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !hold_.has_value()) {
@@ -3408,6 +3438,16 @@ private:
         resp->message = "not in whole-body DIRECT -- use the drone ground station";
         return;
       }
+      {
+        const auto rp = get_parameter("pick_place_abort_release_pose_deg").as_double_array();
+        if (rp.size() == static_cast<std::size_t>(kNumJoints)) {
+          VecN q;
+          for (int j = 0; j < kNumJoints; ++j) {q(j) = rp[j] * M_PI / 180.0;}
+          release = q;
+          release_hold = std::max(0.0, get_parameter("pick_place_abort_release_hold_s").as_double());
+        }
+      }
+      pp_abort_release_ = release.has_value();
       if (pp_abort_plan_) {
         resp->success = false;
         resp->message = "already aborting";
@@ -3471,14 +3511,12 @@ private:
     publishPpStatus();
     publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, from, goal, opts, gen]() {
+    worker_ = std::thread([this, from, goal, opts, gen, release, release_hold]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
-          PlanRequest req;
-          req.rest0 = from;
-          req.rest1 = goal;
-          traj = planner_->plan(*vehicle_, req, opts);
+          traj = planPickPlaceAbort(*vehicle_, *planner_, opts, from, goal,
+            release.has_value() ? &*release : nullptr, release_hold);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -3506,7 +3544,8 @@ private:
     std::ostringstream m;
     m.setf(std::ios::fixed);
     m.precision(2);
-    m << "ABORT: arm home and up " << climb << " m from " << (cut ? "the point the run was cut at" : "the hold");
+    m << "ABORT: " << (release.has_value() ? "arm to the release pose, then home," : "arm home")
+      << " and up " << climb << " m from " << (cut ? "the point the run was cut at" : "the hold");
     if (climb < get_parameter("pick_place_abort_climb").as_double() - 1e-9) {
       m << " (clipped at the fence ceiling " << get_parameter("pick_place_fence_max_z").as_double() << " m)";
     }
@@ -3943,7 +3982,8 @@ private:
         m << "NOT IN DIRECT";
       } else if (pp_aborting_ || pp_abort_plan_) {
         m << "ABORTING" << (pp_guard_tripped_ ? " (SAFETY GUARD: " + pp_guard_reason_ + ")" : std::string())
-          << " -- gripper open, arm home, climbing " << std::setprecision(2) << pp_abort_climb_ << " m";
+          << " -- gripper open, arm " << (pp_abort_release_ ? "to the release pose then home" : "home")
+          << ", climbing " << std::setprecision(2) << pp_abort_climb_ << " m";
       } else if (pp_planning_) {
         m << "PLANNING";
       } else if (pp_flying_.has_value() && pp_phase_ == kPpWait) {
@@ -5397,6 +5437,7 @@ private:
   bool pp_within_{false};                       // the claw inside the tolerance (dwell not yet done)
   bool pp_timed_out_{false};                    // pp_error_ is a wait timeout, not a refusal
   double pp_abort_climb_{0.0};                  // the (fence-clipped) climb of the abort in flight
+  bool pp_abort_release_{false};                // that abort goes through the release pose
   std::shared_ptr<Trajectory> pp_abort_plan_;   // the abort transition in flight
   bool pp_guard_armed_{true};                    // the tilt guard may fire (re-armed below limit - 5 deg)
   bool pp_guard_tripped_{false};                 // the abort in flight / held was the guard's

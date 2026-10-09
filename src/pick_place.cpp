@@ -343,6 +343,33 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
   return traj;
 }
 
+std::unique_ptr<Trajectory> planPickPlaceAbort(
+  const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
+  const RestSpec & from, const RestSpec & goal, const VecN * release_q, double hold_s)
+{
+  if (release_q == nullptr) {
+    return transitionLeg(v, transition, opts, from, goal);
+  }
+  // the climbed point, arm in the release pose
+  RestSpec release = goal;
+  release.q = *release_q;
+  std::vector<std::shared_ptr<const Trajectory>> segs;
+  try {
+    segs.push_back(transitionLeg(v, transition, opts, from, release));
+  } catch (const std::exception & e) {
+    throw std::runtime_error(std::string("to the release pose: ") + e.what());
+  }
+  if (hold_s > 0.0) {
+    segs.push_back(std::make_shared<PauseTrajectory>(v.params, release, hold_s));
+  }
+  try {
+    segs.push_back(transitionLeg(v, transition, opts, release, goal));
+  } catch (const std::exception & e) {
+    throw std::runtime_error(std::string("release pose to home: ") + e.what());
+  }
+  return std::make_unique<SequenceTrajectory>(std::move(segs));
+}
+
 std::unique_ptr<Trajectory> planPickPlaceExit(
   const VehicleModel & v, const TrajectoryPlanner & transition,
   const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from)

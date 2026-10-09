@@ -360,6 +360,44 @@ TEST(PickPlace, TrimFirstMinZeroGivesEveryDescentTheSameSegmentsAndDuration)
     T[0], T[1], T[2], T[3], S->duration());
 }
 
+TEST(PickPlace, TheAbortGoesThroughTheReleasePoseThenHome)
+{
+  // 2026-10-09 (user design): with the hook grasp an OPEN gripper still carries
+  // the hanger's arch, so the abort first points the claws steeply down (the
+  // release pose, while the vehicle climbs), holds there, then folds home
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const double d = M_PI / 180.0;
+  RestSpec from;
+  from.x_b = Vec3(1.0, 0.9, 1.35);
+  from.phi = 0.3;
+  from.q << 12 * d, 38 * d, 42 * d, 0.0;            // the carry pose
+  RestSpec goal = from;
+  goal.x_b(2) += 0.30;
+  goal.q << 0.0, 40 * d, 40 * d, 0.0;               // home
+  VecN rel;
+  rel << 0.0, 0.0, 30 * d, 0.0;                     // claws 60 deg down
+  const auto A = planPickPlaceAbort(*v, *planner, PlanOptions{}, from, goal, &rel, 2.0);
+  const auto * seq = dynamic_cast<const SequenceTrajectory *>(A.get());
+  ASSERT_NE(seq, nullptr);
+  ASSERT_EQ(seq->segmentStarts().size(), 3u);
+  const double t1 = seq->segmentStarts()[1], t2 = seq->segmentStarts()[2];
+  EXPECT_NEAR(t2 - t1, 2.0, 1e-9);                   // the hold
+  // the climb is done by the end of the first segment, with the arm in the release pose
+  const WbReference r1 = A->eval(t1), rT = A->eval(A->duration());
+  EXPECT_LT((r1.q_d - rel).norm(), 1e-6);
+  EXPECT_LT((rT.q_d - goal.q).norm(), 1e-6);
+  EXPECT_LT((rT.x_cd - restReference(v->params, goal).x_cd).norm(), 1e-6);
+  EXPECT_LT((A->eval(0.0).x_cd - restReference(v->params, from).x_cd).norm(), 1e-6);
+  // no release pose: one move straight home
+  const auto B = planPickPlaceAbort(*v, *planner, PlanOptions{}, from, goal, nullptr, 2.0);
+  const auto * sb = dynamic_cast<const SequenceTrajectory *>(B.get());
+  EXPECT_TRUE(sb == nullptr || sb->segmentStarts().size() == 1u);
+  EXPECT_LT((B->eval(B->duration()).q_d - goal.q).norm(), 1e-6);
+  std::printf("abort durations [s]: two-step %.2f (release by %.2f, home from %.2f); straight %.2f\n",
+    A->duration(), t1, t2, B->duration());
+}
+
 TEST(PickPlace, TheHookGraspApproachesLevelAndThePlaceExitBacksOutFirst)
 {
   // the box payload (2026-10-07): a hanger whose arch rests on the two closed

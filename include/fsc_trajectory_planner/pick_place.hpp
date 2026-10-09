@@ -224,6 +224,18 @@ std::unique_ptr<Trajectory> planPickPlaceExit(
   const VehicleModel & v, const TrajectoryPlanner & transition,
   const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from);
 
+// ABORT (the arm GS's Abort button and the tilt guard; 2026-10-09: the TWO-STEP
+// arm). From `from` -- the hold, or the point a run was cut at -- to `goal`, the
+// climbed point with the arm home. With `release_q` (non-null) the arm first
+// goes to that RELEASE pose while the vehicle climbs, holds it `hold_s` there,
+// then folds home in place: a payload still hanging on the open fingers (the
+// hook grasp's hanger: open fingers carry its arch) slides off claws that point
+// steeply down. Null = one move straight to `goal` (the earlier behaviour).
+// Throws on an infeasible segment.
+std::unique_ptr<Trajectory> planPickPlaceAbort(
+  const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
+  const RestSpec & from, const RestSpec & goal, const VecN * release_q, double hold_s);
+
 // Throws "<what>: the path leaves the geofence ..." when a sample of the body
 // origin along `traj` is outside `fence` -- or, for a bound the start itself
 // violates (a leg starting outside), further outside than the start.
