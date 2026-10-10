@@ -84,6 +84,13 @@
     # its yaw -- the SAME reference as the captured obj_0 pose (the box CG on its
     # pick pillar), since one EE offset serves both
     pick_place_place_point: [0.6, -1.6, 0.66, 0.0]
+    # (2026-10-10) pick_place/get_place measures it with the payload itself:
+    # the PICK body (obj_0) standing on the place platform -> x, y, z here, the
+    # yaw kept; the operator then lowers z by the release gap (0.02) by hand.
+    # The PICK pose has a parameter too, pick_place_pick_point: [] (not set
+    # here) until capture_pick has measured obj_0, then [x, y, z, yaw_deg] --
+    # the planner's pick capture, both ways (capture_pick writes it; a set from
+    # the GS's Pick boxes or a script sets the capture; [] clears it).
     # Arm poses [deg]. [0, 0, 0, 0] = upper arm straight down, forearm out
     # along the nose, claw straight down (grasp point 0.155 m ahead of and
     # 0.340 m below the body origin). It is the bottom of the arm's reach:
@@ -151,6 +158,11 @@
     pick_place_land_topic: ""
     pick_place_capture_window: 0.5     # a capture averages this many seconds [s]
     pick_place_capture_max_spread: 0.02  # ... and is refused above this scatter [m]
+    # ... or (pick / place bodies) when its yaw samples disagree by more than
+    # this [deg] (<= 0: off): an orientation flipping between two solutions
+    # (2026-10-10).
+    # A window of bit-identical positions (a frozen, untracked body) is refused too.
+    pick_place_capture_max_yaw_spread_deg: 10.0
 
     # Topic layout (relative to the vehicle namespace).
     topic_prefix: "whole_body_planner"

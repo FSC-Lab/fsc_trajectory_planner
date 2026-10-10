@@ -134,7 +134,7 @@ class Rig(Node):
         self.cli = {}
         for name in LEGS + ["adjust", "plan", "reset", "capture_pick", "capture_place",
                             "capture_land", "capture_start", "abort", "exit_pick", "exit_place",
-                            "descend_pick", "descend_place"]:
+                            "descend_pick", "descend_place", "get_place"]:
             self.cli[name] = self.create_client(Trigger, f"whole_body_planner/pick_place/{name}")
         self.params = self.create_client(SetParameters, "whole_body_trajectory_planner/set_parameters")
         self.getp = self.create_client(GetParameters, "whole_body_trajectory_planner/get_parameters")
@@ -161,12 +161,17 @@ class Rig(Node):
         j.position = list(map(float, self.q))
         j.velocity = [0.0] * 4
         self.js.publish(j)
-        for pub, p in self.mocap.values():
-            m = Mocap()
-            noisy = p + self.rng.normal(0.0, 0.0005, 3)   # 0.5 mm mocap jitter
-            m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, noisy)
-            m.pose.orientation.w = 1.0
-            pub.publish(m)
+        for topic, (pub, p) in list(self.mocap.items()):
+            pub.publish(self.mocap_msg(topic, p))
+
+    def mocap_msg(self, topic, p):
+        """One mocap sample of the body at p (test_pick_place_get_loopback.py
+        overrides this to freeze the feed or flip its yaw)."""
+        m = Mocap()
+        noisy = p + self.rng.normal(0.0, 0.0005, 3)   # 0.5 mm mocap jitter
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, noisy)
+        m.pose.orientation.w = 1.0
+        return m
 
     def goal(self, leg):
         """(base xyz, actual yaw rad, claw xyz) of a leg's planned goal."""
@@ -384,6 +389,10 @@ def main():
         assert r.successful, r.reason
         wait(lambda: rig.info[56 + 4 * 1 + 3] == 1.0, 5, "pick captured")
         assert np.linalg.norm(rig.info[60:63] - OBJ) < 1e-3, rig.info[60:63]
+        # the capture's parameter twin (2026-10-10): [x, y, z, yaw_deg]
+        pick_param = get_param(rig, "pick_place_pick_point")
+        assert pick_param.shape == (4,) and np.allclose(pick_param[:3], rig.info[60:63], atol=1e-12) \
+            and abs(pick_param[3] - rig.info[80]) < 1e-9, pick_param
         wait(lambda: rig.pp_status == "NOT PLANNED: press Plan", 5, "NOT PLANNED")
         print("[3] pick / land captured; place typed in; bad edits refused")
 

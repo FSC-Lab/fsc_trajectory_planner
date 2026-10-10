@@ -79,6 +79,7 @@ install(PROGRAMS
   test/test_ee_trajectory_loopback.py
   test/test_ee_trajectory_origin.py
   test/test_pick_place_loopback.py
+  test/test_pick_place_get_loopback.py
   test/test_teleop_loopback.py
   test/ee_trajectory_sim_driver.py
   test/ee_trajectory_sim_cycle.sh

@@ -461,7 +461,9 @@ PLACEHOLDERS in the yaml. **Adjust** (`pick_place/adjust`, works in SAFETY too):
 with the vehicle on the physical start mark, `measured - nominal start` (x, y;
 z / yaw only with `pick_place_adjust_z` / `_yaw`) becomes the offset every
 nominal pose is shifted by -- the mocap centring changes between sessions.
-**Typed points (2026-10-02, user decision).** Only the PICK point is measured;
+**Typed points (2026-10-02, user decision).** Only the PICK point is measured
+(since 2026-10-10 the place point can be too, with the payload itself: see
+MEASURED POINTS below);
 start, place_start, land_start, land (`[x, y, z, yaw_deg]`) and the place
 point `pick_place_place_point` (`[x, y, z]`) are typed in -- the arm GS's
 Pick & Place tab writes these parameters live. **Adjust WRITES its shift into
@@ -554,6 +556,59 @@ pose is used) -- set one to measure
 that pose's x, y from a marker (z and yaw stay nominal, no offset applied).
 Mocap and odometry share the ENU world frame (the indoor bridge passes mocap
 through); an EKF2-fused stack must keep its local origin on the mocap origin.
+
+**MEASURED POINTS: `pick_place_pick_point`, `get_place`, two capture gates
+(2026-10-10, operator request after the first hardware pick-and-place
+flights).** Until then the operator stood the payload on the place platform,
+pressed the Pick row's Get, and typed its numbers into the Place row by hand.
+- **`pick_place_pick_point`** (double array, default `[]` = not captured, else
+  `[x, y, z, yaw_deg]`) is the pick capture AS A PARAMETER, both ways:
+  `capture_pick` writes its result into it (`set_parameters` from the service
+  callback, as `onPpAdjust` does), and a set from outside -- the arm GS's Pick
+  boxes, a script, a launch file -- sets `pp_capture_[kExecutePick]` + its yaw
+  (`onPpParams` -> `ppSetPickCapture`, applied once every parameter of the set
+  is accepted) and makes the plan stale; `[]` clears the capture; any other
+  length or a non-finite value is refused; refused while a leg is in flight.
+  The internal capture state and `pick_place/info` [60..63], [80] are unchanged
+  and follow it. A typed yaw is NOT wrapped (like the place pose's). `Reset`
+  keeps the capture and therefore the parameter. `onPpParams` is the LAST
+  on-set callback to run (rclcpp calls them in reverse registration order), so
+  nothing can refuse a set after the capture was applied -- keep it registered
+  first. From the CLI `ros2 param set ... "[]"` does NOT clear it (ros2cli types
+  an empty list as a bool array); use a parameter client.
+- **`pick_place/get_place`** (Trigger): averages the PICK body (the
+  `pick_place_pick_topic` subscription, obj_0 = the payload) exactly like a
+  capture and writes x, y, z into `pick_place_place_point`, KEEPING its yaw
+  (index 3; a 3-value point reads as yaw 0) -- the place yaw is the drone's
+  heading there, not the payload's. Nothing is subtracted from z: the operator
+  lowers it by the release gap (0.02 m) by hand. The pick capture is not
+  touched; the plan goes stale through `onPpParams`; refused while a leg is in
+  flight. (A `capture_place` capture, if a place topic is set, still wins over
+  the parameter -- the response says so.)
+- **`ppAverageBody`** is the averaging + validation both use (factored out of
+  `onPpCapture`; every `capture_<point>` goes through it). Beside the empty
+  window and the scatter gate it REFUSES (a) a FROZEN feed -- every position
+  sample in the window bit-identical: a mocap processor republishing the last
+  pose of an untracked body with fresh stamps (one flight recorded 11 423
+  identical obj_0 samples); (b) a FLIPPING yaw -- the samples' yaw spread
+  (about the first sample, wrapped, so a steady yaw at +-180 deg reads small)
+  above `pick_place_capture_max_yaw_spread_deg` (10; <= 0 off; does not make
+  the plan stale): obj_0's solved orientation flipped ~180 deg several times a
+  second in two flights and the circular mean of that is garbage. (b) applies
+  to the pick / place bodies only (capture_pick, capture_place, get_place): a
+  base point's capture uses x, y alone. **(a) needs
+  jitter on a simulated body**: the three Isaac pick-and-place sim yamls and
+  the 4-D mirror set `sim_feedback_pos_noise_m` 0.0005, which the emulator
+  applies to obj_0 too; a stack WITHOUT position noise (the `_sim_robustness`
+  yamls, the geometric `_sim.yaml`) and a resting (sleeping) payload would
+  publish identical poses and be refused as frozen -- NOT checked in Isaac.
+- Test: `test/test_pick_place_get_loopback.py` (run it on `ROS_DOMAIN_ID=77`;
+  it imports the rig of `test_pick_place_loopback.py`, whose `mocap_msg` hook
+  it overrides to freeze / turn / flip the payload): the parameter both ways,
+  stale + re-plan onto the edited point, get_place (yaw kept, z untouched,
+  pick untouched, mid-move scatter refused), frozen and flipping feeds refused
+  by both services, the gate off, a steady +-180 deg yaw accepted, in-flight
+  refusals, Reset keeps / `[]` clears.
 
 **Plan** (`pick_place/plan`, DIRECT only) dry-runs the whole mission on a
 worker thread (leg 0 from the hold, each later leg from the previous goal) and

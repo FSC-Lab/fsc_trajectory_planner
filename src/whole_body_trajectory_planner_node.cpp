@@ -319,6 +319,29 @@ public:
     // body and capture_place was called.
     declare_parameter<std::vector<double>>(
       "pick_place_place_point", std::vector<double>{0.6, -1.6, 0.66, 0.0});
+    // The PICK pose as a parameter (2026-10-10, operator request after the
+    // first hardware pick-and-place flights: the arm GS's Pick row became
+    // editable boxes). It MIRRORS the pick capture both ways: [] = not
+    // captured, else [x, y, z, yaw_deg], world [m] -- capture_pick writes its
+    // result here, and a set from outside (the GS's boxes, a script) sets the
+    // capture itself (onPpParams -> ppSetPickCapture); [] clears it. Like the
+    // place point it is a mocap reading and is never shifted by Adjust.
+    declare_parameter<std::vector<double>>("pick_place_pick_point", std::vector<double>{});
+    {
+      // a value from the launch file: the on-set callback is not registered yet
+      const auto pk = get_parameter("pick_place_pick_point").as_double_array();
+      std::string why;
+      if (ppPickPointOk(pk, &why)) {
+        ppSetPickCapture(pk);
+        if (!pk.empty()) {
+          RCLCPP_INFO(get_logger(), "pick-and-place: pick point from the parameters: "
+            "[%.3f, %.3f, %.3f] m, yaw %.1f deg (not measured)", pk[0], pk[1], pk[2], pk[3]);
+        }
+      } else {
+        RCLCPP_ERROR(get_logger(), "%s -- IGNORED, the pick point is not captured", why.c_str());
+        set_parameter(rclcpp::Parameter("pick_place_pick_point", std::vector<double>{}));
+      }
+    }
     // THE EE offset [m], ONE for both claw legs (2026-10-03, user decision:
     // the same payload on the same pillars, so the claw goes to the same place
     // relative to the box at both): box CG -> grasp point in the captured
@@ -486,6 +509,19 @@ public:
     // moving / mis-tracked body must never become a goal [m]
     declare_parameter<double>("pick_place_capture_window", 0.5);
     declare_parameter<double>("pick_place_capture_max_spread", 0.02);
+    // ... and (the pick / place bodies) when the body's YAW samples in the
+    // window disagree by more than this [deg] (<= 0 disables). 2026-10-10,
+    // from the first hardware flights:
+    // obj_0's solved orientation flipped by ~180 deg several times a second
+    // (a near-symmetric marker layout has two solutions), and the circular
+    // mean of a flipping yaw is garbage -- the frame the EE offset is applied
+    // in. A capture is also refused when every position sample in the window
+    // is bit-identical: a mocap processor republishing the FROZEN last pose of
+    // an untracked body with fresh stamps (11 423 identical obj_0 samples in
+    // one flight). A real tracked body always jitters; a simulated one must
+    // carry some position noise (the Isaac emulator's position_noise_std,
+    // 0.5 mm in the pick-and-place sim yamls) or a resting payload is refused.
+    declare_parameter<double>("pick_place_capture_max_yaw_spread_deg", 10.0);
 
     // --- push-and-pull mode (push_pull.hpp) --------------------------------
     // The box: a mocap body (CG + yaw), captured by capture_box (the arm GS's
@@ -791,6 +827,9 @@ public:
       [this](Trigger::Response::SharedPtr r) {onPpExit(kExecutePick, r);});
     trigger(prefix + "/pick_place/exit_place",
       [this](Trigger::Response::SharedPtr r) {onPpExit(kExecutePlace, r);});
+    // the PLACE point measured with the payload itself (2026-10-10): the PICK
+    // body's pose -> pick_place_place_point x, y, z (the arm GS's Place-row Get)
+    trigger(prefix + "/pick_place/get_place", [this](Trigger::Response::SharedPtr r) {onPpGetPlace(r);});
     anchor_cli_ = create_client<SetBool>(get_parameter("pick_place_anchor_service").as_string());
     for (int k = 0; k < kNumPickPlaceLegs; ++k) {
       trigger(
@@ -2944,6 +2983,9 @@ private:
     rcl_interfaces::msg::SetParametersResult r;
     r.successful = true;
     bool stale = false;
+    // a new pick point: applied at the end, once every parameter of this set
+    // is accepted (this callback runs BEFORE the value is stored)
+    const rclcpp::Parameter * pick_point = nullptr;
     for (const auto & p : ps) {
       const std::string & n = p.get_name();
       if (n.rfind("pick_place_", 0) != 0) {continue;}
@@ -2989,11 +3031,22 @@ private:
           r.successful = false;
           r.reason = n + " needs [x, y, z, yaw_deg]";
         }
+      } else if (n == "pick_place_pick_point") {
+        // [] = not captured, else [x, y, z, yaw_deg], all finite (2026-10-10)
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
+          r.successful = false;
+          r.reason = n + " needs [x, y, z, yaw_deg], or [] for not captured";
+        } else if (ppPickPointOk(p.as_double_array(), &r.reason)) {
+          pick_point = &p;
+        } else {
+          r.successful = false;
+        }
       }
       if (!r.successful) {return r;}
       // what only gates or reports leaves the plan valid
       if (n != "pick_place_arrival_tol" && n != "pick_place_capture_window" &&
-        n != "pick_place_capture_max_spread" && n != "pick_place_adjust_z" &&
+        n != "pick_place_capture_max_spread" && n != "pick_place_capture_max_yaw_spread_deg" &&
+        n != "pick_place_adjust_z" &&
         n != "pick_place_adjust_yaw" && n != "pick_place_settle_s" &&
         n != "pick_place_approach_wait_max" && n != "pick_place_leg_start_tol" &&
         n != "pick_place_adjust_max" && n != "pick_place_abort_climb" &&
@@ -3017,10 +3070,45 @@ private:
       if (pp_wp_.has_value() || pp_planning_) {
         RCLCPP_INFO(get_logger(), "pick-and-place: parameters changed -- the plan is stale, press Plan");
       }
+      // the pick point IS the pick capture (2026-10-10). Nothing can refuse
+      // the set after this: rclcpp runs the on-set callbacks newest first and
+      // this one was registered first, so it is the last to run.
+      if (pick_point != nullptr) {ppSetPickCapture(pick_point->as_double_array());}
       ppInvalidate();
       pp_params_dirty_ = true;   // published from the 10 Hz timer, once the values are set
     }
     return r;
+  }
+
+  // pick_place_pick_point: [] (not captured) or [x, y, z, yaw_deg], finite.
+  static bool ppPickPointOk(const std::vector<double> & v, std::string * why)
+  {
+    if (!v.empty() && v.size() != 4) {
+      *why = "pick_place_pick_point needs [x, y, z, yaw_deg], or [] for not captured (got " +
+        std::to_string(v.size()) + " numbers)";
+      return false;
+    }
+    for (double x : v) {
+      if (!std::isfinite(x)) {
+        *why = "pick_place_pick_point has a non-finite value";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // The pick capture from a (checked) pick_place_pick_point value. Called
+  // under the lock (or from the constructor). The yaw is taken as typed, not
+  // wrapped -- like the place pose's (a typed turn keeps its direction).
+  void ppSetPickCapture(const std::vector<double> & v)
+  {
+    if (v.size() == 4) {
+      pp_capture_[kExecutePick] = Vec3{v[0], v[1], v[2]};
+      pp_capture_yaw_[kExecutePick] = v[3] * M_PI / 180.0;
+    } else {
+      pp_capture_[kExecutePick].reset();
+      pp_capture_yaw_[kExecutePick].reset();
+    }
   }
 
   void onPpMocap(int k, const Mocap & msg)
@@ -3049,6 +3137,120 @@ private:
     ++pp_gen_;
   }
 
+  // "/obj_0/mocap" -> "obj_0": the body as the operator knows it
+  std::string ppBody(int k) const
+  {
+    std::string b = pp_topic_[k];
+    const std::string tail = "/mocap";
+    if (b.size() > tail.size() && b.compare(b.size() - tail.size(), tail.size(), tail) == 0) {
+      b.erase(b.size() - tail.size());
+    }
+    if (!b.empty() && b.front() == '/') {b.erase(0, 1);}
+    return b;
+  }
+
+  // A mocap body averaged over the capture window.
+  struct PpAverage
+  {
+    Vec3 mean{Vec3::Zero()};
+    double yaw{0.0};       // circular mean [rad]: no wrap at +-180 deg
+    size_t n{0};
+    double spread{0.0};    // max |sample - mean| [m]
+  };
+
+  // Average point k's mocap body over pick_place_capture_window -- what
+  // capture_<point> and get_place both measure (factored out of onPpCapture,
+  // 2026-10-10). REFUSES (false; *why names what to look at, ending in
+  // `verdict` when samples were there but must not become a goal): no sample,
+  // a FROZEN pose, scattered positions, a FLIPPING yaw. Called under the lock.
+  bool ppAverageBody(int k, const char * verdict, PpAverage * out, std::string * why) const
+  {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    const double window = get_parameter("pick_place_capture_window").as_double();
+    Vec3 sum = Vec3::Zero();
+    std::vector<Vec3> pts;
+    std::vector<double> yaws;
+    double ys = 0.0, yc = 0.0;
+    for (const auto & s : pp_mocap_[k]) {
+      if (secondsSince(s.t) <= window) {
+        pts.push_back(s.p);
+        yaws.push_back(s.yaw);
+        ys += std::sin(s.yaw);
+        yc += std::cos(s.yaw);
+      }
+    }
+    if (pts.empty()) {
+      m.precision(2);
+      m << "no sample on " << pp_topic_[k] << " in the last " << window
+        << " s -- is the body tracked and broadcast?";
+      *why = m.str();
+      return false;
+    }
+    const auto refuse = [&]() {
+        m << " -- " << verdict;
+        *why = m.str();
+        RCLCPP_WARN(get_logger(), "pick-and-place capture refused: %s", why->c_str());
+        return false;
+      };
+    // FROZEN (2026-10-10, the first hardware pick-and-place flights): every
+    // position in the window bit-identical. A tracked body jitters by tens of
+    // micrometres at least; identical samples are the mocap processor
+    // republishing the last pose of a body it no longer tracks, with fresh
+    // stamps (11 423 identical obj_0 samples in one flight).
+    if (pts.size() >= 2 &&
+      std::all_of(pts.begin() + 1, pts.end(), [&pts](const Vec3 & p) {return p == pts.front();}))
+    {
+      m.precision(2);
+      m << ppBody(k) << "'s pose is frozen -- the body is not tracked (" << pts.size()
+        << " identical samples from " << pp_topic_[k] << " in " << window
+        << " s: the mocap processor is republishing its last pose)";
+      return refuse();
+    }
+    for (const Vec3 & p : pts) {sum += p;}
+    const Vec3 mean = sum / static_cast<double>(pts.size());
+    double spread = 0.0;
+    for (const Vec3 & p : pts) {spread = std::max(spread, (p - mean).norm());}
+    const double max_spread = get_parameter("pick_place_capture_max_spread").as_double();
+    if (spread > max_spread) {
+      m.precision(1);
+      m << pts.size() << " samples from " << pp_topic_[k] << " in " << window
+        << " s scatter " << spread * 1e3 << " mm (> " << max_spread * 1e3
+        << " mm): more than one publisher on the topic, or the body is moving or "
+           "mis-tracked";
+      return refuse();
+    }
+    // FLIPPING YAW (2026-10-10, same flights): obj_0's solved orientation
+    // jumped by ~180 deg several times a second, and the circular mean of two
+    // opposite headings is garbage. The spread is taken about the first sample
+    // (wrapped), so a steady yaw near +-180 deg reads small. Only the two CLAW
+    // points' bodies: a base point's capture uses x, y alone, and a floor mark
+    // may be a single marker with no orientation to speak of.
+    const bool claw_body = k == kExecutePick || k == kExecutePlace;
+    const double max_yaw =
+      claw_body ? get_parameter("pick_place_capture_max_yaw_spread_deg").as_double() : 0.0;
+    double lo = 0.0, hi = 0.0;
+    for (double y : yaws) {
+      const double d = wrapPi(y - yaws.front());
+      lo = std::min(lo, d);
+      hi = std::max(hi, d);
+    }
+    const double yaw_spread = (hi - lo) * 180.0 / M_PI;
+    if (max_yaw > 0.0 && yaw_spread > max_yaw) {
+      m.precision(0);
+      m << ppBody(k) << "'s yaw varies by " << yaw_spread << " deg (> " << max_yaw << " deg) over "
+        << pts.size() << " samples from " << pp_topic_[k]
+        << ": its orientation is flipping between two solutions (or the body is turning) -- "
+           "make the marker layout asymmetric, or press Get again";
+      return refuse();
+    }
+    out->mean = mean;
+    out->yaw = std::atan2(ys, yc);
+    out->n = pts.size();
+    out->spread = spread;
+    return true;
+  }
+
   void onPpCapture(int k, Trigger::Response::SharedPtr resp)
   {
     std::ostringstream m;
@@ -3066,52 +3268,96 @@ private:
           kPpPoint[k] + "_topic (the nominal pick_place_" + kPpPoint[k] + " is used meanwhile)";
         return;
       }
-      const double window = get_parameter("pick_place_capture_window").as_double();
-      Vec3 sum = Vec3::Zero();
-      std::vector<Vec3> pts;
-      double ys = 0.0, yc = 0.0;
-      for (const auto & s : pp_mocap_[k]) {
-        if (secondsSince(s.t) <= window) {
-          pts.push_back(s.p);
-          ys += std::sin(s.yaw);
-          yc += std::cos(s.yaw);
-        }
-      }
-      if (pts.empty()) {
-        m.precision(2);
-        m << "no sample on " << pp_topic_[k] << " in the last " << window
-          << " s -- is the body tracked and broadcast?";
+      PpAverage a;
+      if (!ppAverageBody(k, "NOT captured", &a, &resp->message)) {
         resp->success = false;
-        resp->message = m.str();
-        return;
-      }
-      for (const Vec3 & p : pts) {sum += p;}
-      const Vec3 mean = sum / static_cast<double>(pts.size());
-      double spread = 0.0;
-      for (const Vec3 & p : pts) {spread = std::max(spread, (p - mean).norm());}
-      const double max_spread = get_parameter("pick_place_capture_max_spread").as_double();
-      if (spread > max_spread) {
-        m.precision(1);
-        m << pts.size() << " samples from " << pp_topic_[k] << " in " << window
-          << " s scatter " << spread * 1e3 << " mm (> " << max_spread * 1e3
-          << " mm): more than one publisher on the topic, or the body is moving or "
-             "mis-tracked -- NOT captured";
-        resp->success = false;
-        resp->message = m.str();
-        RCLCPP_WARN(get_logger(), "pick-and-place capture refused: %s", resp->message.c_str());
         return;
       }
       const bool was_planned = pp_wp_.has_value();
-      const double yaw = std::atan2(ys, yc);   // circular mean: no wrap at +-180 deg
-      pp_capture_[k] = mean;
-      pp_capture_yaw_[k] = yaw;
+      if (k == kExecutePick) {
+        // the pick capture has a parameter twin (2026-10-10): write it, as
+        // onPpAdjust writes the drone points -- onPpParams sets the capture
+        // from it and makes the plan stale, and the arm GS's Pick boxes follow
+        // the parameter event
+        const auto res = set_parameters({rclcpp::Parameter("pick_place_pick_point",
+              std::vector<double>{a.mean(0), a.mean(1), a.mean(2), a.yaw * 180.0 / M_PI})});
+        if (res.empty() || !res.front().successful) {
+          resp->success = false;
+          resp->message = "pick NOT captured: pick_place_pick_point not set" +
+            (res.empty() ? std::string() : ": " + res.front().reason);
+          return;
+        }
+      }
+      pp_capture_[k] = a.mean;
+      pp_capture_yaw_[k] = a.yaw;
       ppInvalidate();
       m.precision(3);
-      m << "captured " << kPpPoint[k] << " at [" << mean(0) << ", " << mean(1) << ", " << mean(2)
-        << "] m, yaw " << std::setprecision(1) << yaw * 180.0 / M_PI << " deg from " << pp_topic_[k]
-        << " (" << pts.size() << " samples, spread " << spread * 1e3 << " mm)";
+      m << "captured " << kPpPoint[k] << " at [" << a.mean(0) << ", " << a.mean(1) << ", " << a.mean(2)
+        << "] m, yaw " << std::setprecision(1) << a.yaw * 180.0 / M_PI << " deg from " << pp_topic_[k]
+        << " (" << a.n << " samples, spread " << a.spread * 1e3 << " mm)";
       if (k == kExecutePick) {m << "; the EE offset is applied in this object frame";}
       if (k != kExecutePick && k != kExecutePlace) {m << "; x, y replace the nominal pose";}
+      if (was_planned) {m << " -- the plan is stale, press Plan";}
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
+    publishPpStatus();
+    publishPpInfo();
+    publishPpPaths(nullptr);
+  }
+
+  // GET PLACE (2026-10-10, operator request after the first hardware
+  // pick-and-place flights). The place pose was measured by standing the
+  // payload on the place platform, pressing the PICK row's Get and typing its
+  // numbers into the Place row by hand. This does that copy: the PICK body
+  // (obj_0, the payload) averaged exactly like a capture ->
+  // pick_place_place_point x, y, z. The yaw is KEPT -- it is the drone's
+  // heading at the place (typed, -180), not the payload's -- and z is the
+  // payload's RESTING height: the operator lowers it by the release gap
+  // (0.02 m) by hand, nothing is subtracted here. The pick capture is not
+  // touched.
+  void onPpGetPlace(Trigger::Response::SharedPtr resp)
+  {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pp_flying_.has_value()) {
+        resp->success = false;
+        resp->message = "a pick-and-place leg is in flight -- get the place point once it holds";
+        return;
+      }
+      const int k = kExecutePick;   // the payload's body
+      if (pp_topic_[k].empty()) {
+        resp->success = false;
+        resp->message = "no mocap body for the payload -- set pick_place_pick_topic";
+        return;
+      }
+      PpAverage a;
+      if (!ppAverageBody(k, "Place NOT changed", &a, &resp->message)) {
+        resp->success = false;
+        return;
+      }
+      const auto old = get_parameter("pick_place_place_point").as_double_array();
+      const double yaw_deg = old.size() == 4 ? old[3] : 0.0;   // a 3-value point is yaw 0
+      const bool was_planned = pp_wp_.has_value();
+      const auto res = set_parameters({rclcpp::Parameter("pick_place_place_point",
+            std::vector<double>{a.mean(0), a.mean(1), a.mean(2), yaw_deg})});   // onPpParams: plan made stale
+      if (res.empty() || !res.front().successful) {
+        resp->success = false;
+        resp->message = "Place NOT changed: pick_place_place_point not set" +
+          (res.empty() ? std::string() : ": " + res.front().reason);
+        return;
+      }
+      m.precision(3);
+      m << "place point set to [" << a.mean(0) << ", " << a.mean(1) << ", " << a.mean(2)
+        << "] m from " << pp_topic_[k] << " (" << a.n << " samples, spread "
+        << std::setprecision(1) << a.spread * 1e3 << " mm); yaw kept at " << yaw_deg
+        << " deg; z is the payload's RESTING height -- lower it by 0.02 m for the release";
+      if (pp_capture_[kExecutePlace].has_value()) {
+        m << "; NOTE a capture_place capture is active and wins over this point";
+      }
       if (was_planned) {m << " -- the plan is stale, press Plan";}
     }
     resp->success = true;
@@ -4055,7 +4301,8 @@ private:
   // [goal base x, y, z, actual yaw deg, claw x, y, z], [56..79] per point
   // (start, pick, place_start, place, land_start, land) [captured x, y, z,
   // valid], [80] the captured pick object's yaw [deg] (2026-10-03; the frame
-  // pick_place_ee_offset is applied in), [81] / [82] exit_pick / exit_place
+  // pick_place_ee_offset is applied in; [60..63] and [80] are also the
+  // parameter pick_place_pick_point since 2026-10-10), [81] / [82] exit_pick / exit_place
   // planned duration [s], [83] / [84] exit_pick / exit_place flown (0 / 1),
   // [85] holding on a claw target (0 / 1), [86] the exit in flight (1 pick,
   // 3 place, -1 none), [87] the claw leg's phase (0 none, 1 to the point
