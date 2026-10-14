@@ -45,6 +45,15 @@ TEST(QuadrotorPlanner, RegistryKnowsT650AndRejectsUnknown)
   EXPECT_THROW(makeQuadrotorModel("x999"), std::runtime_error);
 }
 
+TEST(QuadrotorPlanner, RegistryKnowsX650)
+{
+  const auto m = makeQuadrotorModel("x650");
+  EXPECT_NEAR(m.mass, 2.9, 1e-12);
+  EXPECT_NEAR(m.inertia(0, 0), 0.05777498, 1e-12);
+  EXPECT_NEAR(m.inertia(0, 1), 0.0, 1e-12);
+  EXPECT_NEAR(m.rotor_time_constant, 0.0951, 1e-12);
+}
+
 // Python (CCM_quad planners/planner_quad_torque.py) produced these samples;
 // the C++ reference must match them to numerical precision.
 TEST(QuadrotorPlanner, MatchesPythonPlanner)

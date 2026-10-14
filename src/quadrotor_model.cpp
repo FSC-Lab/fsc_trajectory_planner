@@ -31,6 +31,22 @@ QuadrotorModel makeT650()
   return m;
 }
 
+// FSC X650 (MN4014 + 15x5), flown from 2026-10 on: weighed total mass 2.9 kg;
+// inertia = the X650 sim's (fsc_PegasusSimulator x650_params.py INERTIA_DIAG),
+// a placeholder until identified from flight data. MUST match the model the
+// RCCM was trained for (CCM_quad configs/config_quad_torque.py VEHICLE 'x650').
+QuadrotorModel makeX650()
+{
+  QuadrotorModel m;
+  m.name = "x650";
+  m.mass = 2.9;
+  m.inertia = Eigen::Vector3d(0.05777498, 0.06408172, 0.065004565).asDiagonal();
+  m.gravity = 9.81;
+  // MN4014 rotor lag, lambda = 10.51 1/s (MN_4014_15x5 bench report, x650_params.py ROTOR_LAMBDA).
+  m.rotor_time_constant = 0.0951;
+  return m;
+}
+
 // The 1 kg reference quad of CCM_quad's 'generic' vehicle.
 QuadrotorModel makeGeneric()
 {
@@ -76,6 +92,7 @@ const std::map<std::string, QuadrotorFactory> & quadrotorModelFactories()
 {
   static const std::map<std::string, QuadrotorFactory> factories{
     {"t650", makeT650},
+    {"x650", makeX650},
     {"generic", makeGeneric},
   };
   return factories;

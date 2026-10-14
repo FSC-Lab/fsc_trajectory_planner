@@ -1,0 +1,63 @@
+# quadrotor_ccm_planner for the X650 ROTOR-THRUST (R)CCM stack
+# (fsc_autopilot_ros2 single_drone_ccm_rotor_actuation + torch_model_loader
+# CCM_rotor_direct with quad_rotor_{act,sat}_x650_rccm). Started with ros2 run
+# --params-file by the X650 stack scripts (scripts/isaacsim/start_ccm_rotor_*_x650_stack.sh,
+# scripts/indoor_exp/start_ccm_rotor_*_stack_x650.sh) and driven from the ground
+# station's "CCM Trajectory" tab. Identical to quadrotor_ccm_planner_t650.yaml except
+# the vehicle model (x650: 2.9 kg, MN4014 rotor lag 0.0951 s) and the rotor node's
+# mode / disturbance topics.
+#
+# Shapes are placed by their CENTRE (`center`, at `height`, or at the hover
+# height when height < 0) and started from their start point after a
+# 'Fly to start' move. Default indoor sizes at time scale 1.0:
+#   circle  R = 1.0 m, 8 s/lap -> 0.79 m/s, 0.62 m/s^2; start = centre + (R, 0)
+#   figure8 a = 1.0 m (y +-0.5 m), 8 s/lap -> <= 1.1 m/s, 1.3 m/s^2; start = centre
+# The time scale multiplies the lap speed (x1.5: 1.18 m/s circle, 1.67 m/s figure-8,
+# accelerations x2.25); a start is refused above max_speed / max_accel.
+/**/quadrotor_ccm_planner:
+  ros__parameters:
+    vehicle: "x650"                 # quadrotor_model.cpp registry: t650 | x650 | generic
+    rotor_time_constant: -1.0       # < 0: the model's (X650 0.0951 s)
+    trajectory: "circle"            # hover | circle | figure8 (also <prefix>/select)
+    circle_radius: 1.0
+    fig8_a: 1.0
+    lap_time: 8.0
+    laps: 2
+    ramp_time: 3.0
+    ccw: true
+    time_scale: 1.0                 # initial value of the GUI's time-scale bar
+    time_scale_min: 0.25
+    time_scale_max: 1.5
+    center: [0.0, 0.0]              # shape centre, world ENU [m]
+    height: -1.0                    # < 0: the hover height captured by hold / fly-to-start
+    transition_speed: 0.4           # peak speed of fly-to-start / back-to-hover moves [m/s]
+    transition_min_time: 3.0
+    max_transition_distance: 4.0    # refuse a fly-to-start further than this [m]
+    start_tolerance: 0.05           # 'start' needs the hold within this of the start point [m]
+    max_speed: 2.0                  # start refused above these cruise peaks
+    max_accel: 3.0
+    # *_tangent shapes (yaw along the path): start refused above these peaks, which bound the
+    # reference body rate / yaw torque inside the CCM's certified box. figure8_tangent needs
+    # time_scale <= ~0.6 at the default lap (2.5 rad/s, 4.2 rad/s^2 at 1.0); circle_tangent 0.79 rad/s.
+    max_yaw_rate: 1.5               # [rad/s]
+    max_yaw_accel: 2.0              # [rad/s^2]
+    transition_yaw_rate: 0.5        # peak yaw rate of fly-to-start / back-to-hover turns [rad/s]
+    start_yaw_tolerance: 0.05       # 'start' needs the held heading within this of the start yaw [rad]
+    stream_rate: 100.0
+    # The SAFETY baseline follows the planner (position_controller/reference) after a hold /
+    # fly-to-start / start, until the flight node leaves CCM or `release` is called; then the
+    # operator's position commands (GUI Move ENU, landing) are no longer overridden.
+    publish_position_reference: true
+    use_disturbance_estimate: true  # fold the flight node's UDE estimate into the flatness map (on since 2026-09-30)
+    max_disturbance_accel: 3.0
+    # "ude": the SAFETY baseline's linear UDE (position_controller/ude, linear only);
+    # "ccm": the CCM node's velocity-based estimator (<node>/disturbance: linear + angular).
+    # Default since 2026-10-02 (user decision): the CCM node's linear + angular estimator. Under injected
+    # drag in Isaac it beat "ude" by 7-28 % RMS (runbook section 5). Not yet flown on hardware.
+    disturbance_source: "ccm"
+    use_angular_disturbance: true  # with "ccm": also fold J*d_w into the reference torque
+    max_disturbance_angular_accel: 3.0
+    disturbance_topic: "fsc_autopilot_ros2/ccm_rotor_actuation/disturbance"
+    ccm_mode_topic: "fsc_autopilot_ros2/ccm_rotor_actuation/mode"
+    hold_on_ccm_exit: true
+    topic_prefix: "quadrotor_planner"
