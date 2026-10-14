@@ -419,6 +419,32 @@ public:
     // climbs [m]. 0 = the vertical approach / exit (see PickPlaceConfig).
     declare_parameter<double>("pick_place_pick_approach_back", 0.0);
     declare_parameter<double>("pick_place_place_exit_back", 0.0);
+    // DROP PLACE (2026-10-14, user design; see PickPlaceConfig::place_drop):
+    // true = Ready To Place flies the claw straight to drop_height [m] above the
+    // place claw target and the leg ends there; the arm GS's Place opens the
+    // gripper (the payload drops into the container), Exit To Place backs off
+    // and climbs. false = the set-down place (descent on request), unchanged.
+    // drop_height 0 (default) = the place point IS the release point (the
+    // user's workflow: Get on the container's cover, z + 0.05).
+    declare_parameter<bool>("pick_place_place_drop", false);
+    declare_parameter<double>("pick_place_drop_height", 0.0);
+    // THE DROP PHASE AT ONE ALTITUDE + THE DROP EXIT (2026-10-14, user design;
+    // see PickPlaceConfig::drop_altitude / drop_exit): the drop rest's BASE
+    // altitude [m] (0 = the drop at the release point itself), and Exit To
+    // Place flying level out of the place region to the DROP EXIT ([] = the
+    // back-off-and-climb exit). The exit is an OFFSET [dx, dy, yaw_deg] from the
+    // place point's x, y in the room frame (2026-10-14, user: fixed relative to
+    // the place pillar): it follows the place point -- the pillar, read off
+    // mocap by Get -- and Adjust does NOT move it. yaw is the heading there;
+    // the height is the drop altitude.
+    declare_parameter<double>("pick_place_drop_altitude", 0.0);
+    // the fraction of Ready To Place over which a Place Start at another
+    // altitude climbs (or descends) to it, in one smooth curve [0.2, 1]
+    declare_parameter<double>("pick_place_drop_climb_lead", 0.5);
+    declare_parameter<std::vector<double>>("pick_place_drop_exit_offset", std::vector<double>{});
+    // ... and how far Exit To Place first climbs straight up from the drop point
+    // before the level move [m] (user 2026-10-14: "climb up a little bit higher")
+    declare_parameter<double>("pick_place_drop_exit_climb", 0.10);
     declare_parameter<double>("pick_place_approach_wait_max", 60.0);
     // true (2026-10-03, user design: Ready -> Pick -> Exit): a claw leg ends
     // HOLDING above its target; the descent waits for descend_pick /
@@ -2898,6 +2924,30 @@ private:
     c->trim_first_min = get_parameter("pick_place_descent_trim_first_min").as_double();
     c->pick_approach_back = get_parameter("pick_place_pick_approach_back").as_double();
     c->place_exit_back = get_parameter("pick_place_place_exit_back").as_double();
+    c->place_drop = get_parameter("pick_place_place_drop").as_bool();
+    c->drop_height = get_parameter("pick_place_drop_height").as_double();
+    c->drop_altitude = get_parameter("pick_place_drop_altitude").as_double();
+    c->drop_climb_lead = get_parameter("pick_place_drop_climb_lead").as_double();
+    {
+      // the drop exit = the place point (x, y) + this offset, room frame; never
+      // shifted by Adjust (the place point is not either)
+      const auto de = get_parameter("pick_place_drop_exit_offset").as_double_array();
+      if (!de.empty() && de.size() != 3) {
+        *err = "pick_place_drop_exit_offset needs [] or [dx, dy, yaw_deg]";
+        return false;
+      }
+      c->drop_exit_set = de.size() == 3;
+      c->drop_exit_climb = get_parameter("pick_place_drop_exit_climb").as_double();
+      if (c->drop_exit_set) {
+        const auto pp = get_parameter("pick_place_place_point").as_double_array();
+        if (pp.size() != 3 && pp.size() != 4) {
+          *err = "pick_place_drop_exit_offset is relative to pick_place_place_point, which needs [x, y, z, yaw_deg]";
+          return false;
+        }
+        c->drop_exit.p = Vec3{pp[0] + de[0], pp[1] + de[1], 0.0};   // z: the drop altitude
+        c->drop_exit.yaw = de[2] * M_PI / 180.0;
+      }
+    }
     c->fence.min_z = get_parameter("pick_place_fence_min_z").as_double();
     c->fence.max_z = get_parameter("pick_place_fence_max_z").as_double();
     const auto xy = get_parameter("pick_place_fence_xy").as_double_array();
@@ -3015,6 +3065,14 @@ private:
         want(4);
       } else if (n == "pick_place_ee_offset") {
         want(3);
+      } else if (n == "pick_place_drop_exit_offset") {
+        // [] = the back-off-and-climb exit, else [dx, dy, yaw_deg] from the place point
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (!p.as_double_array().empty() && p.as_double_array().size() != 3))
+        {
+          r.successful = false;
+          r.reason = n + " needs [] or [dx, dy, yaw_deg]";
+        }
       } else if (n == "pick_place_abort_release_pose_deg") {
         // [] = straight home, else the 4 joints [deg]
         if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
@@ -3420,6 +3478,7 @@ private:
       // what the legs fly to, and a second Adjust with the vehicle unmoved
       // measures ~0 against the moved Start. Place is never moved.
       std::vector<rclcpp::Parameter> moved;
+      // (the drop exit is an offset from the place point: not moved either)
       for (const char * name : {"pick_place_start", "pick_place_place_start",
           "pick_place_land_start", "pick_place_land"})
       {
@@ -3448,7 +3507,7 @@ private:
       ppInvalidate();
       m << "drone points moved by [" << off(0) << ", " << off(1) << ", " << off(2) << "] m, yaw "
         << std::setprecision(1) << yoff * 180.0 / M_PI
-        << " deg (written into Start, Place Start, Land Start, Land; Place not moved); press Plan";
+        << " deg (written into Start, Place Start, Land Start, Land; Place and the drop exit not moved); press Plan";
     }
     resp->success = true;
     resp->message = m.str();
@@ -3890,10 +3949,23 @@ private:
         publishVizPath(traj.get());
       });
     resp->success = true;
+    if (leg == kExecutePlace && cfg.place_drop && cfg.drop_exit_set) {
+      std::ostringstream dm;
+      dm.setf(std::ios::fixed);
+      dm.precision(2);
+      dm << ppExitName(leg) << ": climbing " << cfg.drop_exit_climb << " m, then flying level out of "
+         << "the place region to the drop exit [" << cfg.drop_exit.p(0) << ", " << cfg.drop_exit.p(1)
+         << "] m, heading " << std::setprecision(0) << cfg.drop_exit.yaw * 180.0 / M_PI
+         << " deg (the arm folds on the way to Land Start)";
+      resp->message = dm.str();
+      RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
+      return;
+    }
     const bool back_out = leg == kExecutePlace && cfg.place_exit_back > 0.0;
     resp->message = std::string(ppExitName(leg)) + ": " +
       (back_out ? "backing out " + std::to_string(static_cast<int>(std::lround(cfg.place_exit_back * 100.0))) +
-       " cm (out from under the arch), then " : std::string()) + "climbing " +
+       (cfg.place_drop ? " cm (away from the drop point), then " : " cm (out from under the arch), then ")
+       : std::string()) + "climbing " +
       std::to_string(static_cast<int>(std::lround(cfg.approach_dz * 100.0))) +
       " cm straight up to the clearance point";
     RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
@@ -3940,6 +4012,9 @@ private:
       const double tol = get_parameter("pick_place_arrival_tol").as_double();
       if (!mode_direct_ || !hold_.has_value()) {
         err = "not in whole-body DIRECT";
+      } else if (leg == kExecutePlace && get_parameter("pick_place_place_drop").as_bool()) {
+        err = "drop place (pick_place_place_drop): no descent -- Ready To Place ends on the drop "
+          "point, Place opens the gripper there";
       } else if (!get_parameter("pick_place_descent_on_request").as_bool()) {
         err = "the descent starts by itself (pick_place_descent_on_request is false)";
       } else if (!pp_flying_.has_value() || *pp_flying_ != leg || pp_phase_ != kPpWait ||

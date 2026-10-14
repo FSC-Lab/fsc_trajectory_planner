@@ -58,6 +58,12 @@ struct ArmSweepOptions
   VecN phase{(VecN() << 0.0, 90.0, 0.0, 0.0).finished() * (M_PI / 180.0)};
   int cycles{2};
   double ramp_frac{0.2};       // window ramp-in and ramp-out, each, as a fraction of T
+  // The CoM's VERTICAL channel completes its change over z_lead * T (its own
+  // nonic phase, then held) while x, y, yaw and the arm take the whole T: a
+  // smooth curve that climbs (or descends) early and finishes level -- the
+  // drop's Ready To Place from a low Place Start (2026-10-14, user: smooth, not
+  // a step). 1 = the straight line. Zero velocity through snap at the join.
+  double z_lead{1.0};
   // bounds (the node fills these from its own transition bounds)
   double v_max{0.30}, a_max{0.15}, w_max{0.30};
   double qdot_max{0.5};        // [rad/s]

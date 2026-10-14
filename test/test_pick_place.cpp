@@ -461,6 +461,81 @@ TEST(PickPlace, TheHookGraspApproachesLevelAndThePlaceExitBacksOutFirst)
   EXPECT_EQ(legs.size(), static_cast<size_t>(kNumPickPlaceLegs));
 }
 
+TEST(PickPlace, ADropPlaceEndsOnTheDropPointWithNoDescentAndBacksOut)
+{
+  // the drop place (2026-10-14, user design): Ready To Place flies straight to
+  // the drop point -- the place claw target raised by drop_height -- and ends
+  // there; there is no descent; the exit backs off, then climbs
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.pick_approach_back = 0.10;
+  c.place_exit_back = 0.10;
+  c.ee_offset << -0.02, 0.0, 0.16;
+  const PickPlaceTargets t = scene();
+  const PickPlaceWaypoints set_down = pickPlaceWaypoints(*v, c, t);
+  c.place_drop = true;
+  c.drop_height = 0.25;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  const int kl = kExecutePlace;
+  // the drop point: the set-down claw target 0.25 m higher, same heading and arm
+  EXPECT_LT((wp.ee[kl] - (set_down.ee[kl] + Vec3(0.0, 0.0, 0.25))).norm(), 1e-9);
+  EXPECT_NEAR(wp.goal[kl].phi, set_down.goal[kl].phi, 1e-12);
+  EXPECT_LT((wp.goal[kl].q - set_down.goal[kl].q).norm(), 1e-12);
+  // no approach above it: the leg flies to the goal itself (the node then
+  // completes the leg there instead of waiting for a descent)
+  EXPECT_LT((wp.approach[kl].x_b - wp.goal[kl].x_b).norm(), 1e-12);
+  EXPECT_LT((wp.approach_ee[kl] - wp.ee[kl]).norm(), 1e-12);
+  // the pick is untouched (still the hook's level approach)
+  EXPECT_LT((wp.ee[kExecutePick] - set_down.ee[kExecutePick]).norm(), 1e-12);
+  EXPECT_LT((wp.approach[kExecutePick].x_b - set_down.approach[kExecutePick].x_b).norm(), 1e-12);
+  // no descent at the place
+  EXPECT_THROW(planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, kl, wp.approach[kl]),
+    std::runtime_error);
+  // the leg ends AT REST on the drop point
+  const auto L = planPickPlaceLeg(*v, *planner, PlanOptions{}, c, wp, kl, wp.goal[kGoToPlaceStart], false);
+  const WbReference e = L->eval(L->duration());
+  EXPECT_LT((e.r_ed - wp.ee[kl]).norm(), 1e-6);
+  EXPECT_LT(e.x_cd_dot.norm(), 1e-6);
+  // the exit from the drop point: back 0.10 m level, then up 0.20 m
+  const auto EX = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl]);
+  const auto * se = dynamic_cast<const SequenceTrajectory *>(EX.get());
+  ASSERT_NE(se, nullptr);
+  ASSERT_EQ(se->segmentStarts().size(), 2u);
+  const Vec3 n{-std::sin(wp.goal[kl].phi), std::cos(wp.goal[kl].phi), 0.0};
+  const WbReference e0 = EX->eval(0.0), e1 = EX->eval(se->segmentStarts()[1]),
+    eT = EX->eval(EX->duration());
+  EXPECT_LT((e0.r_ed - wp.ee[kl]).norm(), 1e-6);
+  EXPECT_LT((e1.r_ed - e0.r_ed + 0.10 * n).norm(), 1e-6);
+  EXPECT_LT((eT.r_ed - e1.r_ed - Vec3(0.0, 0.0, 0.20)).norm(), 1e-6);
+  // the mission dry run: six legs, the place ONE segment (no descent) ending
+  // on the drop point, the leg after its exit starting at the clearance point
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> exits;
+  const auto legs = planPickPlaceMission(*v, *planner, PlanOptions{}, c, wp, wp.goal[kGoToStart], &exits);
+  ASSERT_EQ(legs.size(), static_cast<size_t>(kNumPickPlaceLegs));
+  EXPECT_LT((legs[kl]->eval(legs[kl]->duration()).r_ed - wp.ee[kl]).norm(), 1e-6);
+  ASSERT_TRUE(exits[kl]);
+  EXPECT_LT((legs[kl + 1]->eval(0.0).r_ed - exits[kl]->eval(exits[kl]->duration()).r_ed).norm(), 1e-6);
+  // drop height 0 = the place point IS the release point: the claw ends on the
+  // place claw target itself, still with no descent (2026-10-14)
+  PickPlaceConfig zero = c;
+  zero.drop_height = 0.0;
+  const auto wz = pickPlaceWaypoints(*v, zero, t);
+  EXPECT_LT((wz.ee[kl] - set_down.ee[kl]).norm(), 1e-9);
+  EXPECT_LT((wz.approach_ee[kl] - wz.ee[kl]).norm(), 1e-12);
+  EXPECT_LT((wz.approach[kl].x_b - wz.goal[kl].x_b).norm(), 1e-12);
+  // a NEGATIVE drop height is refused, naming the leg
+  PickPlaceConfig neg = c;
+  neg.drop_height = -0.01;
+  try {
+    pickPlaceWaypoints(*v, neg, t);
+    FAIL() << "a negative drop height was accepted";
+  } catch (const std::runtime_error & err) {
+    EXPECT_NE(std::string(err.what()).find("execute_place"), std::string::npos) << err.what();
+  }
+}
+
 TEST(PickPlace, APlanCanBeEvaluatedFromTwoThreadsAtOnce)
 {
   // The node's stream tick evaluates the plan near t = 0 while its worker
@@ -981,4 +1056,80 @@ TEST(ClawHeading, IkWithThePublishedHeadingLeavesTheArmWhereItIs)
     ASSERT_TRUE(ik.ok) << ik.reason;
     EXPECT_LT((ik.q - r.q).cwiseAbs().maxCoeff(), 1e-6) << "q " << (r.q / kDeg).transpose();
   }
+}
+
+TEST(PickPlace, ADropHoldsOneAltitudeAndExitsLevelToTheDropExit)
+{
+  // 2026-10-14 (user design): the drop phase at ONE altitude -- the drop rest
+  // at drop_altitude, the typed release point as its floor -- and
+  // Exit To Place flying level to a drone pose out of the place region, the
+  // arm folding home on the way
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.place_exit_back = 0.10;
+  c.ee_offset << -0.02, 0.0, 0.16;
+  c.place_drop = true;
+  c.drop_height = 0.0;
+  PickPlaceTargets t = scene();
+  const PickPlaceWaypoints low = pickPlaceWaypoints(*v, c, t);   // drop at the release point
+  c.drop_altitude = low.goal[kExecutePlace].x_b(2) + 0.25;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  const int kl = kExecutePlace;
+  // the drop rest: straight above the release point, the base at drop_altitude
+  EXPECT_NEAR(wp.goal[kl].x_b(2), c.drop_altitude, 1e-12);
+  EXPECT_LT((wp.goal[kl].x_b.head<2>() - low.goal[kl].x_b.head<2>()).norm(), 1e-12);
+  EXPECT_NEAR(wp.ee[kl](2) - low.ee[kl](2), 0.25, 1e-9);
+  EXPECT_LT((wp.approach[kl].x_b - wp.goal[kl].x_b).norm(), 1e-12);   // still no approach above it
+  // a drop altitude below the release point is refused, naming the leg
+  PickPlaceConfig c_low = c;
+  c_low.drop_altitude = low.goal[kl].x_b(2) - 0.05;
+  try {
+    pickPlaceWaypoints(*v, c_low, t);
+    FAIL() << "a drop altitude below the release point was accepted";
+  } catch (const std::runtime_error & err) {
+    EXPECT_NE(std::string(err.what()).find("raise pick_place_drop_altitude"), std::string::npos) << err.what();
+  }
+  // the drop exit: a little straight up, then level (its z is ignored) to its
+  // x / y and yaw, the arm unchanged (it folds on the way to Land Start)
+  c.drop_exit_set = true;
+  c.drop_exit_climb = 0.10;
+  c.drop_exit.p << 0.8, -0.2, 9.9;
+  c.drop_exit.yaw = 0.5 * M_PI;
+  const auto EX = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl]);
+  const RestSpec end = EX->goalRest();
+  EXPECT_NEAR(end.x_b(2), wp.goal[kl].x_b(2) + 0.10, 1e-9);
+  EXPECT_LT((end.x_b.head<2>() - c.drop_exit.p.head<2>()).norm(), 1e-9);
+  EXPECT_NEAR(end.phi, c.drop_exit.yaw - 0.5 * M_PI, 1e-9);
+  EXPECT_LT((end.q - wp.goal[kl].q).norm(), 1e-12);
+  const auto * sx = dynamic_cast<const SequenceTrajectory *>(EX.get());
+  ASSERT_NE(sx, nullptr);
+  ASSERT_EQ(sx->segmentStarts().size(), 2u);
+  const WbReference e0 = EX->eval(0.0), e1 = EX->eval(sx->segmentStarts()[1]),
+    eT = EX->eval(EX->duration());
+  EXPECT_LT((e0.r_ed - wp.ee[kl]).norm(), 1e-6);
+  EXPECT_LT((e1.x_cd.head<2>() - e0.x_cd.head<2>()).norm(), 1e-6);   // the climb is vertical
+  EXPECT_NEAR(e1.x_cd(2) - e0.x_cd(2), 0.10, 1e-6);
+  EXPECT_LT(eT.x_cd_dot.norm(), 1e-6);
+  // Ready To Place from a LOW Place Start: ONE smooth curve whose climb is done
+  // in the first half of the leg, the CoM never stopping on the way
+  PickPlaceTargets t_up = t;
+  t_up.place_start.p(2) = c.drop_altitude - 0.40;
+  c.drop_climb_lead = 0.5;
+  const PickPlaceWaypoints wq = pickPlaceWaypoints(*v, c, t_up);
+  const auto L = planPickPlaceLeg(*v, *planner, PlanOptions{}, c, wq, kl, wq.goal[kGoToPlaceStart], false);
+  const double T = L->duration();
+  const WbReference l0 = L->eval(0.0), lh = L->eval(0.5 * T), lT = L->eval(T);
+  EXPECT_NEAR(lh.x_cd(2), lT.x_cd(2), 1e-6);                       // the climb is done at half time
+  EXPECT_NEAR((lh.x_cd.head<2>() - l0.x_cd.head<2>()).norm(),      // ... while xy is halfway
+    0.5 * (lT.x_cd.head<2>() - l0.x_cd.head<2>()).norm(), 1e-6);
+  double min_speed = 1e9;
+  for (int i = 5; i <= 15; ++i) {min_speed = std::min(min_speed, L->eval(T * i / 20.0).x_cd_dot.norm());}
+  EXPECT_GT(min_speed, 0.02);                                       // no stop in the middle (25-75 %)
+  EXPECT_LT((lT.r_ed - wq.ee[kl]).norm(), 1e-6);
+  // without the exit pose the old back-off-and-climb exit is unchanged
+  c.drop_exit_set = false;
+  const auto EX2 = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl]);
+  EXPECT_NEAR(EX2->goalRest().x_b(2), wp.goal[kl].x_b(2) + c.approach_dz, 1e-9);
 }

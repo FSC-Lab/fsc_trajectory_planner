@@ -171,10 +171,32 @@ PickPlaceWaypoints pickPlaceWaypoints(
     v, c.pick_pose, t.pick + Rz(t.pick_yaw) * c.ee_offset, wp.goal[kGoToStart].x_b, face,
     c.align_yaw ? t.pick_yaw - 0.5 * M_PI : wp.goal[kGoToStart].phi);
   wp.goal[kGoToPlaceStart] = baseRest(t.place_start, c.carry);
-  // the place: the same offset, in the typed (or captured) place pose's frame
+  // the place: the same offset, in the typed (or captured) place pose's frame;
+  // a DROP place ends drop_height above that (0 = on it), where the gripper opens
+  if (c.place_drop && !(c.drop_height >= 0.0)) {
+    throw std::runtime_error(std::string(pickPlaceLegName(kExecutePlace)) +
+      ": the drop height is negative (pick_place_drop_height)");
+  }
+  const Vec3 drop_up{0.0, 0.0, c.place_drop ? c.drop_height : 0.0};
   wp.goal[kExecutePlace] = clawRest(
-    v, c.place_pose, t.place + Rz(t.place_yaw) * c.ee_offset, wp.goal[kGoToPlaceStart].x_b,
+    v, c.place_pose, t.place + Rz(t.place_yaw) * c.ee_offset + drop_up, wp.goal[kGoToPlaceStart].x_b,
     face, c.align_yaw ? t.place_yaw - 0.5 * M_PI : wp.goal[kGoToPlaceStart].phi);
+  if (c.place_drop && c.drop_altitude > 0.0) {
+    // the drop phase at ONE altitude: the drop rest's base is raised to
+    // drop_altitude; the release point (place point + EE offset + drop height)
+    // is only its floor -- a release point above it is refused
+    const double dz = c.drop_altitude - wp.goal[kExecutePlace].x_b(2);
+    if (dz < -1e-9) {
+      std::ostringstream m;
+      m.setf(std::ios::fixed);
+      m.precision(3);
+      m << pickPlaceLegName(kExecutePlace) << ": the drop altitude " << c.drop_altitude
+        << " m puts the drop " << -dz << " m below the release point (place point + EE offset + drop "
+        << "height) -- raise pick_place_drop_altitude";
+      throw std::runtime_error(m.str());
+    }
+    wp.goal[kExecutePlace].x_b(2) += dz;
+  }
   wp.goal[kGoToLandStart] = baseRest(t.land_start, c.home);
   wp.goal[kExecuteLand] = baseRest(t.land, c.home);
   for (int k = 0; k < kNumPickPlaceLegs; ++k) {
@@ -184,6 +206,9 @@ PickPlaceWaypoints pickPlaceWaypoints(
       // the hook grasp: behind the target at its own height (model +y = the nose)
       const double phi = wp.goal[k].phi;
       wp.approach[k].x_b -= c.pick_approach_back * Vec3{-std::sin(phi), std::cos(phi), 0.0};
+    } else if (k == kExecutePlace && c.place_drop) {
+      // the drop: flown straight to the drop point (approach == goal), so the
+      // leg completes there with no wait and no descent
     } else if (pickPlaceLegIsClaw(k)) {
       wp.approach[k].x_b(2) += c.approach_dz;
     }
@@ -262,7 +287,15 @@ std::unique_ptr<Trajectory> planPickPlaceLeg(
       segs.push_back(transitionLeg(v, transition, turn, from, via));
       start = via;
     }
-    if (leg == kExecutePlace) {
+    if (leg == kExecutePlace && c.place_drop && c.drop_altitude > 0.0 &&
+      std::abs(target.x_b(2) - start.x_b(2)) > 0.01)
+    {
+      // the DROP from a Place Start at another altitude: ONE smooth curve whose
+      // altitude change is done in the first drop_climb_lead of the leg
+      ArmSweepOptions o = c.sweep;
+      o.z_lead = std::min(1.0, std::max(0.2, c.drop_climb_lead));
+      segs.push_back(ArmSweepPlanner::plan(v, start, target, o));
+    } else if (leg == kExecutePlace) {
       segs.push_back(ArmSweepPlanner::plan(v, start, target, c.sweep));
     } else {
       segs.push_back(transitionLeg(v, transition, turn, start, target));
@@ -314,6 +347,9 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
 {
   const std::string what = std::string(pickPlaceLegName(leg)) + " descent";
   if (!pickPlaceLegIsClaw(leg)) {throw std::runtime_error(what + ": not a claw leg");}
+  if (leg == kExecutePlace && c.place_drop) {
+    throw std::runtime_error(what + ": a drop place has no descent (the gripper opens on the drop point)");
+  }
   // the goal carries the descent trim; from is the hold above the target
   const RestSpec & goal = wp.goal[leg];
   const double side = (goal.x_b - from.x_b).head<2>().norm();
@@ -376,6 +412,31 @@ std::unique_ptr<Trajectory> planPickPlaceExit(
 {
   const std::string what = std::string(pickPlaceLegName(leg)) + " exit";
   if (!pickPlaceLegIsClaw(leg)) {throw std::runtime_error(what + ": not a claw leg");}
+  if (leg == kExecutePlace && c.place_drop && c.drop_exit_set) {
+    // the DROP EXIT: a little straight up from the drop point, then LEVEL out
+    // of the place region to the exit pose; the arm keeps its place pose
+    RestSpec up = from;
+    up.x_b(2) += std::max(0.0, c.drop_exit_climb);
+    RestSpec to = baseRest(c.drop_exit, from.q);
+    to.x_b(2) = up.x_b(2);
+    for (const RestSpec * r : {&up, &to}) {
+      const std::string why_r = c.fence.violation(r->x_b);
+      if (!why_r.empty()) {throw std::runtime_error(what + " (drop exit): " + why_r);}
+    }
+    PlanOptions turn = opts;
+    turn.heading_as_given = true;
+    std::unique_ptr<Trajectory> traj;
+    try {
+      std::vector<std::shared_ptr<const Trajectory>> segs;
+      if (up.x_b(2) - from.x_b(2) > 1e-3) {segs.push_back(transitionLeg(v, transition, opts, from, up));}
+      segs.push_back(transitionLeg(v, transition, turn, up.x_b(2) - from.x_b(2) > 1e-3 ? up : from, to));
+      traj = std::make_unique<SequenceTrajectory>(std::move(segs));
+    } catch (const std::exception & e) {
+      throw std::runtime_error(what + " (drop exit): " + e.what());
+    }
+    checkPathInFence(v, *traj, c.fence, what);
+    return traj;
+  }
   if (!(c.approach_dz > 0.0)) {throw std::runtime_error(what + ": the vertical margin is 0");}
   RestSpec up = from;
   up.x_b(2) += c.approach_dz;
@@ -426,8 +487,8 @@ std::vector<std::shared_ptr<const Trajectory>> planPickPlaceMission(
     std::shared_ptr<const Trajectory> leg =
       planPickPlaceLeg(v, transition, opts, c, wp, k, r, pickPlaceLegRetreats(k) && !exited);
     exited = false;
-    if (pickPlaceLegIsClaw(k)) {
-      // approach, then the descent from the approach rest
+    if (pickPlaceLegIsClaw(k) && !(k == kExecutePlace && c.place_drop)) {
+      // approach, then the descent from the approach rest (a drop place has none)
       std::vector<std::shared_ptr<const Trajectory>> segs{
         leg, std::shared_ptr<const Trajectory>(
           planPickPlaceDescent(v, transition, opts, c, wp, k, wp.approach[k]))};

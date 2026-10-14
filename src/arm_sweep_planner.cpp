@@ -88,6 +88,17 @@ public:
       xc->row(k) = (k == 0 ? Vec3(xc0_ + dx * s[0]) : Vec3(dx * (s[k] / scale))).transpose();
       scale *= T_;
     }
+    if (o_.z_lead < 1.0) {
+      // the vertical channel on its own, shorter nonic phase (held after it)
+      const double Tz = std::max(1e-3, o_.z_lead) * T_;
+      double sz[5];
+      nonicPhase(tt / Tz, sz);
+      double sc = 1.0;
+      for (int k = 0; k < 5; ++k) {
+        (*xc)(k, 2) = k == 0 ? xc0_(2) + dx(2) * sz[0] : (tt < Tz ? dx(2) * sz[k] / sc : 0.0);
+        sc *= Tz;
+      }
+    }
     const double dphi = phi1_ - phi0_;
     *psi = Vec3(phi0_ + dphi * s[0], dphi * s[1] / T_, dphi * s[2] / (T_ * T_));
 

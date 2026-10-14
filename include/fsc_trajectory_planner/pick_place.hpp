@@ -155,6 +155,47 @@ struct PickPlaceConfig
   // the hover error (the simulation comparison: a 4-6 mm whole-body trim
   // otherwise flips between a 3.2 s and an 8.2 s descent from run to run).
   double trim_first_min{0.005};
+  // DROP PLACE (2026-10-14, user design): the payload is DROPPED into a
+  // container standing on the place platform instead of being set down.
+  // true: execute_place flies straight to the DROP point -- the place claw
+  // target (the place point + ee_offset) raised by drop_height -- and ends
+  // there: no vertical approach, no descent, so the leg completes holding on
+  // the drop point. The arm GS's Place then only opens the gripper, and Exit
+  // To Place backs off place_exit_back (when > 0) and climbs approach_dz, away
+  // from the container. drop_height 0 (the default, user's workflow
+  // 2026-10-14) = the place point IS the RELEASE point: the operator Gets the
+  // payload sitting on the container's cover and types z + 0.05, so the claw
+  // opens with the payload's bottom 5 cm above the rim. A positive drop_height
+  // raises it further (the place point then where the payload rests inside).
+  // false = the set-down place, unchanged.
+  bool place_drop{false};
+  double drop_height{0.0};
+  // THE DROP PHASE AT ONE ALTITUDE (2026-10-14, user design: "during the whole
+  // drop phase there is no need to change the z altitude"): with place_drop and
+  // drop_altitude > 0, the drop rest is raised straight up until the BASE is at
+  // drop_altitude [m]. Ready To Place flies the altitude change from Place
+  // Start EARLY in one smooth curve (drop_climb_lead below), so the carried
+  // payload never crosses the container's wall on a climbing diagonal (user
+  // 2026-10-14: Place Start low, then climb -- smoothly, not as a step).
+  // The typed place point (+ ee_offset + drop_height) is the LOWEST release
+  // point allowed: a drop_altitude below it is refused. <= 0: off.
+  double drop_altitude{0.0};
+  // ... and the fraction of Ready To Place over which that altitude change is
+  // flown (ArmSweepOptions::z_lead): ONE smooth curve, the climb finished well
+  // before the payload reaches the container (it crosses the wall at ~65 % of
+  // the leg). 1 = the straight diagonal.
+  double drop_climb_lead{0.5};
+  // THE DROP EXIT (2026-10-14, user design): with place_drop and
+  // drop_exit_set, Exit To Place first CLIMBS drop_exit_climb [m] straight up
+  // from the drop point, then flies LEVEL to this drone pose -- out of the
+  // place region -- turning to its yaw (flown as typed); its z is not used. The
+  // arm keeps its place pose (it folds home on the way to Land Start). Unset:
+  // the exit backs off place_exit_back and climbs approach_dz as before. The
+  // node builds it as the place point (x, y) + pick_place_drop_exit_offset,
+  // so it stays fixed relative to the place pillar and Adjust never moves it.
+  BasePose drop_exit;
+  bool drop_exit_set{false};
+  double drop_exit_climb{0.10};
   Geofence fence;
   // the execute_place leg
   ArmSweepOptions sweep;
@@ -210,7 +251,8 @@ std::unique_ptr<Trajectory> planPickPlaceLeg(
   const PickPlaceWaypoints & wp, int leg, const RestSpec & from, bool from_table);
 
 // A claw leg's DESCENT: from `from` (the approach hold) vertically onto the
-// goal. Throws std::runtime_error "<leg> descent: <reason>".
+// goal. Throws std::runtime_error "<leg> descent: <reason>" -- also for the
+// place of a drop mission, which has none.
 std::unique_ptr<Trajectory> planPickPlaceDescent(
   const VehicleModel & v, const TrajectoryPlanner & transition,
   const PlanOptions & opts, const PickPlaceConfig & c,
