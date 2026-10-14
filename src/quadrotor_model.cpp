@@ -31,7 +31,7 @@ QuadrotorModel makeT650()
   return m;
 }
 
-// FSC X650 (MN4014 + 15x5), flown from 2026-10 on: weighed total mass 2.9 kg;
+// FSC X650 (MN4014 + 15x5), flown from 2026-10 on: total mass 3.25 kg with battery;
 // inertia = the X650 sim's (fsc_PegasusSimulator x650_params.py INERTIA_DIAG),
 // a placeholder until identified from flight data. MUST match the model the
 // RCCM was trained for (CCM_quad configs/config_quad_torque.py VEHICLE 'x650').
@@ -39,7 +39,7 @@ QuadrotorModel makeX650()
 {
   QuadrotorModel m;
   m.name = "x650";
-  m.mass = 2.9;
+  m.mass = 3.25;
   m.inertia = Eigen::Vector3d(0.05777498, 0.06408172, 0.065004565).asDiagonal();
   m.gravity = 9.81;
   // MN4014 rotor lag, lambda = 10.51 1/s (MN_4014_15x5 bench report, x650_params.py ROTOR_LAMBDA).

@@ -4,7 +4,7 @@
 # --params-file by the X650 stack scripts (scripts/isaacsim/start_ccm_rotor_*_x650_stack.sh,
 # scripts/indoor_exp/start_ccm_rotor_*_stack_x650.sh) and driven from the ground
 # station's "CCM Trajectory" tab. Identical to quadrotor_ccm_planner_t650.yaml except
-# the vehicle model (x650: 2.9 kg, MN4014 rotor lag 0.0951 s) and the rotor node's
+# the vehicle model (x650: 3.25 kg, MN4014 rotor lag 0.0951 s) and the rotor node's
 # mode / disturbance topics.
 #
 # Shapes are placed by their CENTRE (`center`, at `height`, or at the hover
