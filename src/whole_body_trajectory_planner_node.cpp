@@ -424,19 +424,22 @@ public:
     // place claw target and the leg ends there; the arm GS's Place opens the
     // gripper (the payload drops into the container), Exit To Place backs off
     // and climbs. false = the set-down place (descent on request), unchanged.
-    // drop_height 0 (default) = the place point IS the release point (the
-    // user's workflow: Get on the container's cover, z + 0.05).
+    // drop_height = THE DROP MARGIN (2026-10-15, the arm GS's Pick & Drop
+    // box): the place point is the payload standing on the container's cover
+    // (Get), and the gripper opens with the payload's centre this far above it
+    // [m]. 0 (default) = at the place point itself.
     declare_parameter<bool>("pick_place_place_drop", false);
     declare_parameter<double>("pick_place_drop_height", 0.0);
     // THE DROP PHASE AT ONE ALTITUDE + THE DROP EXIT (2026-10-14, user design;
     // see PickPlaceConfig::drop_altitude / drop_exit): the drop rest's BASE
-    // altitude [m] (0 = the drop at the release point itself), and Exit To
+    // altitude [m] (0 = the drop at the release point itself -- every yaml
+    // since 2026-10-15: the drop margin sets the height), and Exit To
     // Place flying level out of the place region to the DROP EXIT ([] = the
     // back-off-and-climb exit). The exit is an OFFSET [dx, dy, yaw_deg] from the
     // place point's x, y in the room frame (2026-10-14, user: fixed relative to
     // the place pillar): it follows the place point -- the pillar, read off
     // mocap by Get -- and Adjust does NOT move it. yaw is the heading there;
-    // the height is the drop altitude.
+    // the height is the drop's own + pick_place_drop_exit_climb.
     declare_parameter<double>("pick_place_drop_altitude", 0.0);
     // the fraction of Ready To Place over which a Place Start at another
     // altitude climbs (or descends) to it, in one smooth curve [0.2, 1]
@@ -445,6 +448,16 @@ public:
     // ... and how far Exit To Place first climbs straight up from the drop point
     // before the level move [m] (user 2026-10-14: "climb up a little bit higher")
     declare_parameter<double>("pick_place_drop_exit_climb", 0.10);
+    // EXIT STRAIGHT ON TO LAND START (2026-10-15, user design; see
+    // PickPlaceConfig::drop_exit_to_land_start): with the drop place, Exit To
+    // Place climbs pick_place_drop_exit_climb, then flies on to Land Start (the
+    // arm folding home) and Go To Land Start is done. Overrides the drop exit.
+    declare_parameter<bool>("pick_place_drop_exit_to_land_start", false);
+    // THE BACK MARGIN (2026-10-15, user design; PickPlaceConfig::drop_exit_back):
+    // with the drop place, Exit To Place backs out this far before it climbs
+    // the Vertical Margin -- the arm GS's Pick & Drop "Back Margin" box. < 0 =
+    // unset: it backs out pick_place_place_exit_back (the Side Margin).
+    declare_parameter<double>("pick_place_drop_exit_back", -1.0);
     declare_parameter<double>("pick_place_approach_wait_max", 60.0);
     // true (2026-10-03, user design: Ready -> Pick -> Exit): a claw leg ends
     // HOLDING above its target; the descent waits for descend_pick /
@@ -2026,7 +2039,14 @@ private:
           pp_exited_[*pp_exiting_] = true;
           pp_at_table_ = false;   // back at the clearance point: the next leg needs no retreat
           RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", ppExitName(*pp_exiting_));
+          if (pp_exit_to_land_) {
+            // the drop's exit flew on to Land Start: Go To Land Start is done
+            pp_completed_ = kGoToLandStart;
+            RCLCPP_INFO(get_logger(), "pick-and-place: %s ended on Land Start -- %s done.",
+              ppExitName(*pp_exiting_), pickPlaceLegName(kGoToLandStart));
+          }
         }
+        if (pp_exit_plan_ && pp_exit_plan_ == plan_) {pp_exit_to_land_ = false;}
         pp_exit_plan_.reset();
         pp_exiting_.reset();
         if (pp_flying_.has_value() && pp_exec_plan_ && pp_exec_plan_ == plan_) {
@@ -2938,6 +2958,8 @@ private:
       }
       c->drop_exit_set = de.size() == 3;
       c->drop_exit_climb = get_parameter("pick_place_drop_exit_climb").as_double();
+      c->drop_exit_to_land_start = get_parameter("pick_place_drop_exit_to_land_start").as_bool();
+      c->drop_exit_back = get_parameter("pick_place_drop_exit_back").as_double();
       if (c->drop_exit_set) {
         const auto pp = get_parameter("pick_place_place_point").as_double_array();
         if (pp.size() != 3 && pp.size() != 4) {
@@ -3869,6 +3891,8 @@ private:
     RestSpec from;
     PickPlaceConfig cfg;
     PlanOptions opts;
+    std::optional<PickPlaceWaypoints> wp;
+    double drop_shift = -1.0;   // the drop's exit: the vehicle's offset from the hold [m]
     unsigned gen = 0;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
@@ -3890,12 +3914,26 @@ private:
         err = "no fresh odometry -- a climb must not start blind";
       }
       if (err.empty()) {ppConfig(&cfg, &err);}
+      if (err.empty() && pickPlaceExitEndsAtLandStart(cfg, leg) && !pp_wp_.has_value()) {
+        err = "no plan -- press Plan (the exit flies on to Land Start)";
+      }
       if (!err.empty()) {
         resp->success = false;
         resp->message = std::string(ppExitName(leg)) + ": " + err;
         return;
       }
+      if (pp_wp_.has_value()) {wp = *pp_wp_;}
+      pp_exit_to_land_ = pickPlaceExitEndsAtLandStart(cfg, leg);
       from = *hold_;
+      // THE DROP'S EXIT STARTS WHERE THE VEHICLE IS (2026-10-15, user: the claw
+      // must not come back over the container): releasing the payload throws
+      // the vehicle back 0.1-0.15 m (measured in Isaac), and an exit planned
+      // from the hold would first pull it back to the release point. Heading
+      // and arm stay the hold's; odometry is fresh (checked above).
+      if (cfg.place_drop && leg == kExecutePlace && odom_p_.has_value()) {
+        drop_shift = (*odom_p_ - from.x_b).norm();
+        from.x_b = *odom_p_;
+      }
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -3917,11 +3955,11 @@ private:
     publishPpStatus();
     publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, leg, from, cfg, opts, gen]() {
+    worker_ = std::thread([this, leg, from, cfg, opts, gen, wp]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
-          traj = planPickPlaceExit(*vehicle_, *planner_, opts, cfg, leg, from);
+          traj = planPickPlaceExit(*vehicle_, *planner_, opts, cfg, leg, from, wp ? &*wp : nullptr);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -3933,6 +3971,7 @@ private:
             infeasible_reason_ = err;
             pp_error_ = err;
             pp_exiting_.reset();
+            pp_exit_to_land_ = false;
             RCLCPP_WARN(get_logger(), "pick-and-place exit refused: %s", err.c_str());
           } else {
             plan_ = traj;
@@ -3949,6 +3988,18 @@ private:
         publishVizPath(traj.get());
       });
     resp->success = true;
+    if (pickPlaceExitEndsAtLandStart(cfg, leg)) {
+      std::ostringstream dm;
+      dm.setf(std::ios::fixed);
+      dm.precision(2);
+      const Vec3 & ls = wp->goal[kGoToLandStart].x_b;
+      dm << ppExitName(leg) << ": climbing " << cfg.drop_exit_climb << " m, then flying straight on to "
+         << "Land Start [" << ls(0) << ", " << ls(1) << ", " << ls(2) << "] m, the arm folding home -- "
+         << pickPlaceLegName(kGoToLandStart) << " is then done";
+      resp->message = dm.str();
+      RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
+      return;
+    }
     if (leg == kExecutePlace && cfg.place_drop && cfg.drop_exit_set) {
       std::ostringstream dm;
       dm.setf(std::ios::fixed);
@@ -3961,9 +4012,13 @@ private:
       RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
       return;
     }
-    const bool back_out = leg == kExecutePlace && cfg.place_exit_back > 0.0;
+    const double back_d = pickPlaceExitBack(cfg);
+    const bool back_out = leg == kExecutePlace && back_d > 0.0;
     resp->message = std::string(ppExitName(leg)) + ": " +
-      (back_out ? "backing out " + std::to_string(static_cast<int>(std::lround(cfg.place_exit_back * 100.0))) +
+      (drop_shift >= 0.0 ? "from where the vehicle is now (" +
+       std::to_string(static_cast<int>(std::lround(drop_shift * 1000.0))) +
+       " mm from the release hold), " : std::string()) +
+      (back_out ? "backing out " + std::to_string(static_cast<int>(std::lround(back_d * 100.0))) +
        (cfg.place_drop ? " cm (away from the drop point), then " : " cm (out from under the arch), then ")
        : std::string()) + "climbing " +
       std::to_string(static_cast<int>(std::lround(cfg.approach_dz * 100.0))) +
@@ -4323,7 +4378,8 @@ private:
         }
         if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
       } else if (pp_exiting_.has_value()) {
-        m << "FLYING " << ppExitName(*pp_exiting_) << " (up the vertical margin)";
+        m << "FLYING " << ppExitName(*pp_exiting_) <<
+          (pp_exit_to_land_ ? " (take-off, then on to Land Start)" : " (up the vertical margin)");
         if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
       } else if (!pp_error_.empty()) {
         m << (pp_timed_out_ ? "INCOMPLETE: " : "INFEASIBLE: ") << pp_error_;
@@ -5766,6 +5822,7 @@ private:
   std::optional<Clock::time_point> pp_guard_since_;   // tilt above the limit since
   std::string pp_guard_reason_;
   std::optional<int> pp_exiting_;                // the claw leg whose exit is planning / flying
+  bool pp_exit_to_land_{false};                  // ... and it ends on Land Start (the drop's)
   std::shared_ptr<Trajectory> pp_exit_plan_;     // ... and its climb
   std::array<bool, kNumPickPlaceLegs> pp_exited_{};   // a claw leg's exit flown
   std::array<double, kNumPickPlaceLegs> pp_exit_T_{}; // planned exit durations (Plan) [s]

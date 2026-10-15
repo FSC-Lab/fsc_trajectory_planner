@@ -162,28 +162,27 @@ struct PickPlaceConfig
   // there: no vertical approach, no descent, so the leg completes holding on
   // the drop point. The arm GS's Place then only opens the gripper, and Exit
   // To Place backs off place_exit_back (when > 0) and climbs approach_dz, away
-  // from the container. drop_height 0 (the default, user's workflow
-  // 2026-10-14) = the place point IS the RELEASE point: the operator Gets the
-  // payload sitting on the container's cover and types z + 0.05, so the claw
-  // opens with the payload's bottom 5 cm above the rim. A positive drop_height
-  // raises it further (the place point then where the payload rests inside).
+  // from the container. THE DROP MARGIN (2026-10-15, user design): the
+  // place point is where the payload STANDS ON THE CONTAINER'S COVER (the arm
+  // GS's Drop row Get, no hand correction), and drop_height -- the arm GS's
+  // "Drop Margin" box -- is how far above that the payload's centre is when
+  // the gripper opens. It alone sets the drop's height (drop_altitude 0). Until
+  // 2026-10-15 the operator typed z + 0.05 after Get with drop_height 0.
   // false = the set-down place, unchanged.
   bool place_drop{false};
   double drop_height{0.0};
-  // THE DROP PHASE AT ONE ALTITUDE (2026-10-14, user design: "during the whole
-  // drop phase there is no need to change the z altitude"): with place_drop and
-  // drop_altitude > 0, the drop rest is raised straight up until the BASE is at
-  // drop_altitude [m]. Ready To Place flies the altitude change from Place
-  // Start EARLY in one smooth curve (drop_climb_lead below), so the carried
-  // payload never crosses the container's wall on a climbing diagonal (user
-  // 2026-10-14: Place Start low, then climb -- smoothly, not as a step).
-  // The typed place point (+ ee_offset + drop_height) is the LOWEST release
-  // point allowed: a drop_altitude below it is refused. <= 0: off.
+  // LEGACY (2026-10-14; 0 in every yaml since 2026-10-15, when the release
+  // offset took over): with place_drop and drop_altitude > 0, the drop rest is
+  // raised straight up until the BASE is at drop_altitude [m]; the release
+  // point (place point + ee_offset + drop_height) is its floor -- a
+  // drop_altitude below it is refused. <= 0: off.
   double drop_altitude{0.0};
-  // ... and the fraction of Ready To Place over which that altitude change is
-  // flown (ArmSweepOptions::z_lead): ONE smooth curve, the climb finished well
+  // The fraction of Ready To Place over which a Place Start at another
+  // altitude climbs (or descends) to the drop's height
+  // (ArmSweepOptions::z_lead): ONE smooth curve, the climb finished well
   // before the payload reaches the container (it crosses the wall at ~65 % of
-  // the leg). 1 = the straight diagonal.
+  // the leg; user 2026-10-14: Place Start low, then climb -- smoothly, not as
+  // a step). 1 = the straight diagonal.
   double drop_climb_lead{0.5};
   // THE DROP EXIT (2026-10-14, user design): with place_drop and
   // drop_exit_set, Exit To Place first CLIMBS drop_exit_climb [m] straight up
@@ -196,6 +195,21 @@ struct PickPlaceConfig
   BasePose drop_exit;
   bool drop_exit_set{false};
   double drop_exit_climb{0.10};
+  // EXIT STRAIGHT ON TO LAND START (2026-10-15, user design: "let the drone take
+  // off and directly continue flying to the land start point; we don't need the
+  // drop exit hovering point"): with place_drop, Exit To Place climbs
+  // drop_exit_climb straight up from the drop point, then flies to the Land
+  // Start waypoint itself -- Go To Land Start's goal: its pose and heading, the
+  // arm folding HOME on the way -- and Go To Land Start is then done. Takes
+  // precedence over drop_exit. Needs the waypoints (planPickPlaceExit's wp).
+  bool drop_exit_to_land_start{false};
+  // THE BACK MARGIN (2026-10-15, user design): with place_drop, Exit To Place
+  // backs out THIS far (along -nose, from where the drone is) before it climbs
+  // approach_dz -- the drop's own horizontal clearance, the arm GS's "Back
+  // Margin" box on the Pick & Drop tab, independent of the hook grasp's Side
+  // Margin (pick_approach_back / place_exit_back). 0 = climb straight up.
+  // < 0 (the default) = unset: the drop backs out place_exit_back, as before.
+  double drop_exit_back{-1.0};
   Geofence fence;
   // the execute_place leg
   ArmSweepOptions sweep;
@@ -262,9 +276,20 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
 // `from` (the hold on the target, gripper just closed / opened) straight UP by
 // approach_dz -- the safety margin -- heading and arm unchanged, back to the
 // clearance point. Throws "<leg> exit: <reason>".
+// With c.place_drop and c.drop_exit_to_land_start the place exit instead climbs
+// drop_exit_climb and flies on to wp->goal[kGoToLandStart] (wp required).
 std::unique_ptr<Trajectory> planPickPlaceExit(
   const VehicleModel & v, const TrajectoryPlanner & transition,
-  const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from);
+  const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from,
+  const PickPlaceWaypoints * wp = nullptr);
+
+// How far Exit To Place backs out before it climbs [m]: the Back Margin
+// (drop_exit_back) on a drop when it is set (>= 0), else place_exit_back.
+double pickPlaceExitBack(const PickPlaceConfig & c);
+
+// The drop's exit ends on Land Start (c.place_drop && c.drop_exit_to_land_start):
+// Go To Land Start has nothing left to fly.
+bool pickPlaceExitEndsAtLandStart(const PickPlaceConfig & c, int leg);
 
 // ABORT (the arm GS's Abort button and the tilt guard; 2026-10-09: the TWO-STEP
 // arm). From `from` -- the hold, or the point a run was cut at -- to `goal`, the

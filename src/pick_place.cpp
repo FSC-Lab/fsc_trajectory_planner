@@ -175,7 +175,7 @@ PickPlaceWaypoints pickPlaceWaypoints(
   // a DROP place ends drop_height above that (0 = on it), where the gripper opens
   if (c.place_drop && !(c.drop_height >= 0.0)) {
     throw std::runtime_error(std::string(pickPlaceLegName(kExecutePlace)) +
-      ": the drop height is negative (pick_place_drop_height)");
+      ": the drop margin is negative (pick_place_drop_height, the arm GS's Drop Margin)");
   }
   const Vec3 drop_up{0.0, 0.0, c.place_drop ? c.drop_height : 0.0};
   wp.goal[kExecutePlace] = clawRest(
@@ -287,11 +287,12 @@ std::unique_ptr<Trajectory> planPickPlaceLeg(
       segs.push_back(transitionLeg(v, transition, turn, from, via));
       start = via;
     }
-    if (leg == kExecutePlace && c.place_drop && c.drop_altitude > 0.0 &&
-      std::abs(target.x_b(2) - start.x_b(2)) > 0.01)
-    {
+    if (leg == kExecutePlace && c.place_drop && std::abs(target.x_b(2) - start.x_b(2)) > 0.01) {
       // the DROP from a Place Start at another altitude: ONE smooth curve whose
-      // altitude change is done in the first drop_climb_lead of the leg
+      // altitude change is done in the first drop_climb_lead of the leg --
+      // whatever sets the drop's height (the drop margin, 2026-10-15, or a
+      // legacy drop_altitude), so the payload never crosses the container's
+      // wall on a climbing diagonal
       ArmSweepOptions o = c.sweep;
       o.z_lead = std::min(1.0, std::max(0.2, c.drop_climb_lead));
       segs.push_back(ArmSweepPlanner::plan(v, start, target, o));
@@ -406,12 +407,52 @@ std::unique_ptr<Trajectory> planPickPlaceAbort(
   return std::make_unique<SequenceTrajectory>(std::move(segs));
 }
 
+double pickPlaceExitBack(const PickPlaceConfig & c)
+{
+  return c.place_drop && c.drop_exit_back >= 0.0 ? c.drop_exit_back : c.place_exit_back;
+}
+
+bool pickPlaceExitEndsAtLandStart(const PickPlaceConfig & c, int leg)
+{
+  return leg == kExecutePlace && c.place_drop && c.drop_exit_to_land_start;
+}
+
 std::unique_ptr<Trajectory> planPickPlaceExit(
   const VehicleModel & v, const TrajectoryPlanner & transition,
-  const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from)
+  const PlanOptions & opts, const PickPlaceConfig & c, int leg, const RestSpec & from,
+  const PickPlaceWaypoints * wp)
 {
   const std::string what = std::string(pickPlaceLegName(leg)) + " exit";
   if (!pickPlaceLegIsClaw(leg)) {throw std::runtime_error(what + ": not a claw leg");}
+  if (pickPlaceExitEndsAtLandStart(c, leg)) {
+    // the DROP's exit STRAIGHT ON TO LAND START (2026-10-15, user design): a
+    // little straight up off the drop point (the take-off), then on to Land
+    // Start -- Go To Land Start's own goal and heading, the arm folding home on
+    // the way. No hover at a drop exit point.
+    if (wp == nullptr) {throw std::runtime_error(what + " (to Land Start): no waypoints");}
+    RestSpec up = from;
+    up.x_b(2) += std::max(0.0, c.drop_exit_climb);
+    RestSpec to = wp->goal[kGoToLandStart];
+    const bool climbs = up.x_b(2) - from.x_b(2) > 1e-3;
+    to.phi = legHeading(*wp, kGoToLandStart, climbs ? up : from);
+    for (const RestSpec * r : {&up, &to}) {
+      const std::string why_r = c.fence.violation(r->x_b);
+      if (!why_r.empty()) {throw std::runtime_error(what + " (to Land Start): " + why_r);}
+    }
+    PlanOptions turn = opts;
+    turn.heading_as_given = true;
+    std::unique_ptr<Trajectory> traj;
+    try {
+      std::vector<std::shared_ptr<const Trajectory>> segs;
+      if (climbs) {segs.push_back(transitionLeg(v, transition, opts, from, up));}
+      segs.push_back(transitionLeg(v, transition, turn, climbs ? up : from, to));
+      traj = std::make_unique<SequenceTrajectory>(std::move(segs));
+    } catch (const std::exception & e) {
+      throw std::runtime_error(what + " (to Land Start): " + e.what());
+    }
+    checkPathInFence(v, *traj, c.fence, what);
+    return traj;
+  }
   if (leg == kExecutePlace && c.place_drop && c.drop_exit_set) {
     // the DROP EXIT: a little straight up from the drop point, then LEVEL out
     // of the place region to the exit pose; the arm keeps its place pose
@@ -453,10 +494,12 @@ std::unique_ptr<Trajectory> planPickPlaceExit(
   }
   std::unique_ptr<Trajectory> traj;
   try {
-    if (leg == kExecutePlace && c.place_exit_back > 0.0) {
-      // the hook grasp: slide the fingers out from under the arch, then climb
+    const double back_d = pickPlaceExitBack(c);
+    if (leg == kExecutePlace && back_d > 0.0) {
+      // the hook grasp: slide the fingers out from under the arch, then climb;
+      // a drop: back out the Back Margin, out of the container's downwash
       RestSpec back = from;
-      back.x_b -= c.place_exit_back * Vec3{-std::sin(from.phi), std::cos(from.phi), 0.0};
+      back.x_b -= back_d * Vec3{-std::sin(from.phi), std::cos(from.phi), 0.0};
       up.x_b.head<2>() = back.x_b.head<2>();
       const std::string why_back = c.fence.violation(up.x_b);
       if (!why_back.empty()) {throw std::runtime_error(why_back);}
@@ -497,10 +540,16 @@ std::vector<std::shared_ptr<const Trajectory>> planPickPlaceMission(
     legs.push_back(leg);
     r = wp.goal[k];
     if (exits != nullptr && pickPlaceLegIsClaw(k)) {
-      std::shared_ptr<const Trajectory> ex = planPickPlaceExit(v, transition, opts, c, k, r);
+      std::shared_ptr<const Trajectory> ex = planPickPlaceExit(v, transition, opts, c, k, r, &wp);
       r = ex->goalRest();
       (*exits)[k] = std::move(ex);
       exited = true;
+      if (pickPlaceExitEndsAtLandStart(c, k)) {
+        // the exit already flew Go To Land Start: that leg is a 0 s hold there
+        legs.push_back(std::make_shared<PauseTrajectory>(v.params, r, 0.0));
+        ++k;
+        exited = false;
+      }
     }
   }
   return legs;

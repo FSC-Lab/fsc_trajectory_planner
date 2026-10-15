@@ -533,6 +533,9 @@ TEST(PickPlace, ADropPlaceEndsOnTheDropPointWithNoDescentAndBacksOut)
     FAIL() << "a negative drop height was accepted";
   } catch (const std::runtime_error & err) {
     EXPECT_NE(std::string(err.what()).find("execute_place"), std::string::npos) << err.what();
+    // the hardware stacks probe this text: a planner without it flies the
+    // drop-margin yaml (drop_altitude 0) as a straight climbing diagonal
+    EXPECT_NE(std::string(err.what()).find("drop margin is negative"), std::string::npos) << err.what();
   }
 }
 
@@ -1132,4 +1135,150 @@ TEST(PickPlace, ADropHoldsOneAltitudeAndExitsLevelToTheDropExit)
   c.drop_exit_set = false;
   const auto EX2 = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl]);
   EXPECT_NEAR(EX2->goalRest().x_b(2), wp.goal[kl].x_b(2) + c.approach_dz, 1e-9);
+}
+
+TEST(PickPlace, TheDropMarginSetsTheDropHeightAndKeepsTheSmoothClimb)
+{
+  // 2026-10-15 (user design): the place point is the payload standing on the
+  // container's cover (Get) and the arm GS's Drop Margin (drop_height) alone
+  // sets how high above it the gripper opens -- no prescribed drop_altitude.
+  // Ready To Place from a low Place Start still climbs early, in ONE curve.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.ee_offset << -0.02, 0.0, 0.16;
+  c.place_drop = true;
+  c.drop_altitude = 0.0;
+  c.drop_height = 0.0;
+  PickPlaceTargets t = scene();
+  const PickPlaceWaypoints on_cover = pickPlaceWaypoints(*v, c, t);
+  c.drop_height = 0.10;
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  const int kl = kExecutePlace;
+  // the claw (and the body) exactly the drop margin higher, straight up
+  EXPECT_NEAR(wp.ee[kl](2) - on_cover.ee[kl](2), 0.10, 1e-9);
+  EXPECT_LT((wp.ee[kl].head<2>() - on_cover.ee[kl].head<2>()).norm(), 1e-9);
+  EXPECT_NEAR(wp.goal[kl].x_b(2) - on_cover.goal[kl].x_b(2), 0.10, 1e-9);
+  // the claw target = the place point + the EE offset turned by the place yaw + the offset
+  const Vec3 claw = t.place + Rz(t.place_yaw) * c.ee_offset + Vec3{0.0, 0.0, 0.10};
+  EXPECT_LT((wp.ee[kl] - claw).norm(), 1e-6);
+  // from a Place Start 0.40 m lower: the climb is done at half the leg (z_lead
+  // 0.5), xy halfway -- the same curve the legacy drop_altitude flew
+  PickPlaceTargets t_up = t;
+  t_up.place_start.p(2) = wp.goal[kl].x_b(2) - 0.40;
+  c.drop_climb_lead = 0.5;
+  const PickPlaceWaypoints wq = pickPlaceWaypoints(*v, c, t_up);
+  const auto L = planPickPlaceLeg(*v, *planner, PlanOptions{}, c, wq, kl, wq.goal[kGoToPlaceStart], false);
+  const double T = L->duration();
+  const WbReference l0 = L->eval(0.0), lh = L->eval(0.5 * T), lT = L->eval(T);
+  EXPECT_GT(lT.x_cd(2) - l0.x_cd(2), 0.35);
+  EXPECT_NEAR(lh.x_cd(2), lT.x_cd(2), 1e-6);
+  EXPECT_NEAR((lh.x_cd.head<2>() - l0.x_cd.head<2>()).norm(),
+    0.5 * (lT.x_cd.head<2>() - l0.x_cd.head<2>()).norm(), 1e-6);
+  EXPECT_LT((lT.r_ed - wq.ee[kl]).norm(), 1e-6);
+}
+
+TEST(PickPlace, TheDropExitTakesOffAndFliesStraightOnToLandStart)
+{
+  // 2026-10-15 (user design): after the drop, Exit To Place climbs a little (the
+  // take-off) and flies on to Land Start itself -- no drop-exit hover point -- the
+  // arm folding home on the way; Go To Land Start then has nothing left to fly
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.ee_offset << -0.02, 0.0, 0.16;
+  c.place_drop = true;
+  c.drop_height = 0.10;
+  c.drop_exit_climb = 0.10;
+  c.drop_exit_to_land_start = true;
+  const PickPlaceTargets t = scene();
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  const int kl = kExecutePlace;
+  EXPECT_TRUE(pickPlaceExitEndsAtLandStart(c, kl));
+  EXPECT_FALSE(pickPlaceExitEndsAtLandStart(c, kExecutePick));
+  // it needs the waypoints (Land Start)
+  EXPECT_THROW(planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl]), std::runtime_error);
+  const auto EX = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl], &wp);
+  const RestSpec end = EX->goalRest();
+  const RestSpec & ls = wp.goal[kGoToLandStart];
+  EXPECT_LT((end.x_b - ls.x_b).norm(), 1e-9);          // ends ON Land Start
+  EXPECT_LT((end.q - ls.q).norm(), 1e-9);              // the arm folded home
+  EXPECT_NEAR(std::cos(end.phi - ls.phi), 1.0, 1e-9);  // at Land Start's heading
+  const auto * sx = dynamic_cast<const SequenceTrajectory *>(EX.get());
+  ASSERT_NE(sx, nullptr);
+  ASSERT_EQ(sx->segmentStarts().size(), 2u);
+  const WbReference e0 = EX->eval(0.0), e1 = EX->eval(sx->segmentStarts()[1]);
+  EXPECT_LT((e1.x_cd.head<2>() - e0.x_cd.head<2>()).norm(), 1e-6);   // the take-off is vertical
+  EXPECT_NEAR(e1.x_cd(2) - e0.x_cd(2), 0.10, 1e-6);
+  EXPECT_LT(EX->eval(EX->duration()).x_cd_dot.norm(), 1e-6);
+  // the dry-run mission: the exit ends on Land Start, Go To Land Start is a 0 s
+  // hold there, Execute To Land starts from Land Start
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> exits{};
+  const auto legs = planPickPlaceMission(*v, *planner, PlanOptions{}, c, wp, wp.goal[kGoToStart], &exits);
+  ASSERT_EQ(legs.size(), static_cast<size_t>(kNumPickPlaceLegs));
+  ASSERT_TRUE(exits[kl]);
+  EXPECT_LT((exits[kl]->goalRest().x_b - ls.x_b).norm(), 1e-9);
+  EXPECT_NEAR(legs[kGoToLandStart]->duration(), 0.0, 1e-12);
+  EXPECT_LT((legs[kGoToLandStart + 1]->eval(0.0).x_cd - EX->eval(EX->duration()).x_cd).norm(), 1e-6);
+  // switched off: the old exit (no Land Start)
+  c.drop_exit_to_land_start = false;
+  const auto EX2 = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl], &wp);
+  EXPECT_GT((EX2->goalRest().x_b - ls.x_b).norm(), 0.1);
+}
+
+TEST(PickPlace, TheBackMarginSetsTheDropsBackOutIndependentlyOfTheSideMargin)
+{
+  // THE BACK MARGIN (2026-10-15, user design): on a drop, Exit To Place backs
+  // out drop_exit_back, then climbs approach_dz; the hook's Side Margin
+  // (place_exit_back) keeps its meaning for the set-down place. Unset (< 0) =
+  // the old behaviour, the drop backs out place_exit_back.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.pick_approach_back = 0.10;
+  c.place_exit_back = 0.10;
+  c.ee_offset << -0.02, 0.0, 0.16;
+  c.place_drop = true;
+  c.drop_height = 0.20;
+  const PickPlaceTargets t = scene();
+  const PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  const int kl = kExecutePlace;
+  const Vec3 n{-std::sin(wp.goal[kl].phi), std::cos(wp.goal[kl].phi), 0.0};
+  // backed out (level), then climbed: the two segments' displacements
+  const auto backOut = [&](const PickPlaceConfig & cc, double back) {
+      const auto EX = planPickPlaceExit(*v, *planner, PlanOptions{}, cc, kl, wp.goal[kl]);
+      const WbReference e0 = EX->eval(0.0), eT = EX->eval(EX->duration());
+      const auto * se = dynamic_cast<const SequenceTrajectory *>(EX.get());
+      if (back > 0.0) {
+        EXPECT_NE(se, nullptr);
+        if (se == nullptr) {return;}
+        ASSERT_EQ(se->segmentStarts().size(), 2u);
+        const WbReference e1 = EX->eval(se->segmentStarts()[1]);
+        EXPECT_LT((e1.r_ed - e0.r_ed + back * n).norm(), 1e-6);
+        EXPECT_LT((eT.r_ed - e1.r_ed - Vec3(0.0, 0.0, 0.20)).norm(), 1e-6);
+      } else {
+        EXPECT_TRUE(se == nullptr || se->segmentStarts().size() == 1u);
+        EXPECT_LT((eT.r_ed - e0.r_ed - Vec3(0.0, 0.0, 0.20)).norm(), 1e-6);
+      }
+    };
+  // unset: the Side Margin (0.10), as before 2026-10-15
+  EXPECT_NEAR(pickPlaceExitBack(c), 0.10, 1e-12);
+  backOut(c, 0.10);
+  // set: the Back Margin (0.20), whatever the Side Margin
+  PickPlaceConfig b = c;
+  b.drop_exit_back = 0.20;
+  EXPECT_NEAR(pickPlaceExitBack(b), 0.20, 1e-12);
+  backOut(b, 0.20);
+  // 0: straight up off the drop point
+  PickPlaceConfig z = c;
+  z.drop_exit_back = 0.0;
+  EXPECT_NEAR(pickPlaceExitBack(z), 0.0, 1e-12);
+  backOut(z, 0.0);
+  // the set-down place ignores it: the hook's Side Margin
+  PickPlaceConfig s = b;
+  s.place_drop = false;
+  EXPECT_NEAR(pickPlaceExitBack(s), 0.10, 1e-12);
 }
