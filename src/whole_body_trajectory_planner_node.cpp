@@ -58,6 +58,8 @@
 // Every topic and service is RELATIVE, so `--ros-args -r __ns:=/uav_N` (the
 // launch file's uav_prefix) namespaces the whole interface per vehicle.
 
+#include <Eigen/Geometry>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -458,6 +460,60 @@ public:
     // the Vertical Margin -- the arm GS's Pick & Drop "Back Margin" box. < 0 =
     // unset: it backs out pick_place_place_exit_back (the Side Margin).
     declare_parameter<double>("pick_place_drop_exit_back", -1.0);
+    // THE AUTONOMOUS DROP (2026-10-16, user design after the 10-15 hardware
+    // flights, where the Drop click came 0.67 s after the leg ended, with the
+    // claw still ringing 46-48 mm off and the basket swinging on the wrist).
+    // With the drop place, once Ready To Place has ended on the drop point the
+    // planner releases the payload BY ITSELF when, for drop_auto_dwell_s, ALL of
+    // these hold (publishPpArrival, 10 Hz):
+    //   - at least drop_auto_wait_s since the leg ended (the arrival swing);
+    //   - the claw within drop_auto_claw_tol of its drop target and moving
+    //     slower than drop_auto_claw_speed [m/s];
+    //   - the payload's OWN mocap body (pick_place_pick_topic, obj_0) tracked
+    //     (fresh, not frozen, not a 180 deg flipped solve), horizontally within
+    //     drop_auto_payload_tol of the drop point (pick_place_place_point x, y)
+    //     and moving slower than drop_auto_payload_speed [m/s];
+    //   - the wrist roll q4 within drop_auto_q4_tol_deg of the place pose's q4,
+    //     so the payload hangs level.
+    // It then publishes pick_place/drop_now (once per drop hold); the arm GS's
+    // Pick & Drop tab opens the gripper on it exactly as its Drop button does
+    // (the button stays the manual override). It never releases on a timer: a
+    // gate that does not pass keeps it holding, and the status names the gate.
+    // false (node default) = the Drop button only.
+    declare_parameter<bool>("pick_place_drop_auto", false);
+    declare_parameter<double>("pick_place_drop_auto_wait_s", 2.0);
+    declare_parameter<double>("pick_place_drop_auto_dwell_s", 0.5);
+    declare_parameter<double>("pick_place_drop_auto_claw_tol", 0.020);
+    declare_parameter<double>("pick_place_drop_auto_claw_speed", 0.03);
+    declare_parameter<double>("pick_place_drop_auto_payload_tol", 0.025);
+    declare_parameter<double>("pick_place_drop_auto_payload_speed", 0.04);
+    declare_parameter<double>("pick_place_drop_auto_q4_tol_deg", 3.0);
+    // AIM THE DROP AT THE BASKET (2026-10-16, user decision after the 10-15
+    // replay). The drop's claw target is place point + Rz(yaw)*ee_offset: a
+    // MODEL of where the basket sits relative to the claw. On 10-15 D-1 the
+    // basket hung 17 mm further back and 17 mm further right than that (the
+    // hang, and the jaws closing ~20 mm off obj_0's origin), so with the claw on
+    // target the basket was ~24 mm off the drop point. With this set, the
+    // basket - claw offset is MEASURED (obj_0 - FK claw, in the vehicle frame)
+    // while hovering at Drop Start with the arm at the drop pose, averaged over
+    // the last _window_s, and Ready To Drop shifts the drop rest so that the
+    // measured basket lands on the drop point. Refused (the model is used, and
+    // the leg says why) with under _min_s of samples or a shift above
+    // _max_shift. Sampling starts _settle_s after the hover began (the turn to
+    // Drop Start excites the wrist swing: 10-15 D-1 broke loose at its end).
+    // The window spans two periods of the ~0.5 Hz basket swing seen on 10-15
+    // (+-40 mm), the minimum one: a part-period average of that swing is off by
+    // up to ~10 mm, so HOVER >= _settle_s + _window_s (6 s) AT DROP START before
+    // Ready To Drop (under _settle_s + _min_s, 4 s, it is not aimed). When
+    // applied, the autonomous drop gates position on the basket only (the claw
+    // keeps its stillness gate). Drop only (pick_place_place_drop); false
+    // (default) = the model, as before. All read at Ready To Drop: setting one
+    // live leaves the plan valid.
+    declare_parameter<bool>("pick_place_drop_aim_payload", false);
+    declare_parameter<double>("pick_place_drop_aim_window_s", 4.0);
+    declare_parameter<double>("pick_place_drop_aim_min_s", 2.0);
+    declare_parameter<double>("pick_place_drop_aim_max_shift", 0.06);
+    declare_parameter<double>("pick_place_drop_aim_settle_s", 2.0);
     declare_parameter<double>("pick_place_approach_wait_max", 60.0);
     // true (2026-10-03, user design: Ready -> Pick -> Exit): a claw leg ends
     // HOLDING above its target; the descent waits for descend_pick /
@@ -841,6 +897,9 @@ public:
     pp_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/path", latched);
     pp_drone_path_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/drone_path", latched);
     pp_arrival_pub_ = create_publisher<Float64MultiArray>(prefix + "/pick_place/arrival_error", 10);
+    // the autonomous drop's release signal (pick_place_drop_auto): once per drop
+    // hold, the gate values as text; the arm GS's Pick & Drop tab opens the gripper
+    pp_drop_now_pub_ = create_publisher<String>(prefix + "/pick_place/drop_now", 10);
     const auto trigger = [this](const std::string & name, std::function<void(Trigger::Response::SharedPtr)> fn) {
         pp_srvs_.push_back(create_service<Trigger>(
           name, [fn](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {fn(r);}));
@@ -1108,6 +1167,7 @@ private:
         // the calibration and the progress stay (they are measurements and
         // the operator's bookkeeping), so a re-Plan resumes the mission
         pp_wp_.reset();
+        clearDropAim();
         pp_flying_.reset();
         pp_phase_ = kPpNone;
         pp_exec_plan_.reset();
@@ -1350,6 +1410,7 @@ private:
     if (!q.allFinite() || !qd.allFinite()) {return;}
     std::lock_guard<std::recursive_mutex> lk(lock_);
     q_meas_ = joint_sign_.cwiseProduct(q);
+    q_meas_time_ = Clock::now();
     qdot_meas_ = joint_sign_.cwiseProduct(qd);
   }
 
@@ -2075,6 +2136,11 @@ private:
             pp_flying_.reset();
             pp_phase_ = kPpNone;
             pp_at_table_ = pickPlaceLegIsClaw(leg);
+            if (leg == kExecutePlace) {
+              // the drop hold starts here (the autonomous drop's wait counts from now)
+              pp_drop_hold_t0_ = Clock::now();
+              resetDropAuto();
+            }
             RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", pickPlaceLegName(leg));
           }
         } else {
@@ -3085,6 +3151,16 @@ private:
         want(4);
       } else if (n == "pick_place_fence_xy") {
         want(4);
+      } else if (n == "pick_place_drop_aim_window_s" || n == "pick_place_drop_aim_min_s" ||
+        n == "pick_place_drop_aim_max_shift" || n == "pick_place_drop_aim_settle_s")
+      {
+        const bool settle = n == "pick_place_drop_aim_settle_s";
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
+          !std::isfinite(p.as_double()) || (settle ? p.as_double() < 0.0 : !(p.as_double() > 0.0)))
+        {
+          r.successful = false;
+          r.reason = n + (settle ? " needs a number >= 0 (a double)" : " needs a number > 0 (a double)");
+        }
       } else if (n == "pick_place_ee_offset") {
         want(3);
       } else if (n == "pick_place_drop_exit_offset") {
@@ -3135,7 +3211,10 @@ private:
         n != "pick_place_descent_trim" && n != "pick_place_descent_trim_window_s" &&
         n != "pick_place_descent_trim_max" &&
         n != "pick_place_guard_persist_s" && n != "pick_place_abort_release_pose_deg" &&
-        n != "pick_place_abort_release_hold_s")
+        n != "pick_place_abort_release_hold_s" &&
+        // the autonomous drop's gates and the basket aim are read at the
+        // drop hold / at Ready To Drop, never baked into the plan
+        n.rfind("pick_place_drop_auto", 0) != 0 && n.rfind("pick_place_drop_aim_", 0) != 0)
       {
         stale = true;
       }
@@ -3198,9 +3277,13 @@ private:
     // the body's yaw (ENU): the pick object's heading, which pick_place_ee_offset follows
     const auto & o = msg.pose.orientation;
     const double yaw = std::atan2(2.0 * (o.w * o.z + o.x * o.y), 1.0 - 2.0 * (o.y * o.y + o.z * o.z));
+    // the body's tilt (angle of its z axis from the vertical): a 180 deg flipped
+    // solve reads > 90 deg (the autonomous drop skips those samples)
+    const double cz = 1.0 - 2.0 * (o.x * o.x + o.y * o.y);
+    const double tilt = std::acos(std::clamp(cz, -1.0, 1.0));
     std::lock_guard<std::recursive_mutex> lk(lock_);
     auto & d = pp_mocap_[k];
-    d.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0});
+    d.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0, std::isfinite(tilt) ? tilt : M_PI});
     while (d.size() > 1 && (secondsSince(d.front().t) > 2.0 || d.size() > 2000)) {
       d.pop_front();
     }
@@ -3211,6 +3294,7 @@ private:
   void ppInvalidate()
   {
     pp_wp_.reset();
+    clearDropAim();
     pp_planning_ = false;
     pp_error_.clear();
     pp_timed_out_ = false;
@@ -3609,6 +3693,7 @@ private:
             RCLCPP_WARN(get_logger(), "pick-and-place plan refused: %s", err.c_str());
           } else {
             pp_wp_ = wp;
+            clearDropAim();               // the fresh plan's drop rest is the model's
             for (int k = 0; k < kNumPickPlaceLegs; ++k) {
               pp_leg_T_[k] = legs[k]->duration();
               pp_exit_T_[k] = exits[k] ? exits[k]->duration() : 0.0;
@@ -3635,6 +3720,7 @@ private:
     PickPlaceConfig cfg;
     PlanOptions opts;
     unsigned gen = 0;
+    std::string aim;          // the drop's aim at the basket, for the reply
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       std::string err;
@@ -3677,6 +3763,10 @@ private:
         return;
       }
       from = *hold_;
+      if (leg == kExecutePlace) {         // aim the drop rest at the measured basket
+        applyDropAim();
+        aim = pp_aim_text_;
+      }
       wp = *pp_wp_;
       opts = planOptions();
       gen = ++plan_gen_;
@@ -3690,6 +3780,8 @@ private:
       pp_flying_ = leg;
       pp_phase_ = kPpTravel;
       pp_exited_[leg] = false;
+      if (leg == kExecutePlace) {pp_drop_hold_t0_.reset();}
+      resetDropAuto();
       pp_exec_plan_.reset();
       pp_error_.clear();
       pp_timed_out_ = false;
@@ -3738,6 +3830,7 @@ private:
     resp->success = true;
     resp->message = std::string("planning ") + pickPlaceLegName(leg) +
       " from the current hold; it executes as soon as it is planned";
+    if (!aim.empty()) {resp->message += " -- " + aim;}
     RCLCPP_INFO(get_logger(), "pick-and-place: %s", resp->message.c_str());
   }
 
@@ -4158,6 +4251,8 @@ private:
       pp_guard_tripped_ = false;
       pp_at_table_ = false;
       pp_exited_.fill(false);
+      pp_drop_hold_t0_.reset();
+      resetDropAuto();
       ppInvalidate();
       restoreAnchor();
     }
@@ -4183,6 +4278,7 @@ private:
     }
     Float64MultiArray m;
     bool gate_changed = false, descend = false, timed_out = false;
+    std::string drop_now;     // the autonomous drop's release message, published below
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !pp_wp_.has_value()) {return;}
@@ -4191,6 +4287,7 @@ private:
       Vec3 x_b;
       Mat3 r0;
       if (!odomPair(&x_b, &r0) || odomAge() > kOdomFreshS || !q_meas_.has_value()) {return;}
+      sampleDropAim(x_b, r0);          // the basket - claw offset, while holding at Drop Start
       const bool claw = pickPlaceLegIsClaw(leg);
       // before / while waiting the claw's target is the point ABOVE the object
       const bool above = pp_flying_.has_value() && (pp_phase_ == kPpTravel || pp_phase_ == kPpWait);
@@ -4227,6 +4324,7 @@ private:
         secondsSince(pp_within_since_) >= get_parameter("pick_place_settle_s").as_double();
       const bool settled = dwelt && !pp_flying_.has_value() && state_ == "HOLD";
       pp_last_err_ = e.norm();
+      if (claw && evalDropAuto(meas, e, &drop_now)) {gate_changed = true;}
       if (pp_phase_ == kPpWait && state_ == "HOLD" &&
         !get_parameter("pick_place_descent_on_request").as_bool())
       {
@@ -4262,9 +4360,336 @@ private:
       }
     }
     pp_arrival_pub_->publish(m);
+    if (!drop_now.empty()) {
+      String d;
+      d.data = drop_now;
+      pp_drop_now_pub_->publish(d);
+    }
     if (descend) {startPpDescent();}
     if (gate_changed) {publishPpStatus();}
     if (timed_out) {publishPpInfo();}
+  }
+
+  // Called under the lock: a new drop hold (or none) -- nothing released yet.
+  void resetDropAuto()
+  {
+    pp_drop_ok_since_.reset();
+    pp_drop_fired_ = false;
+    pp_drop_claw_prev_.reset();
+    pp_drop_last_eval_.reset();
+    pp_drop_text_.clear();
+  }
+
+  // ── AIM THE DROP AT THE BASKET (pick_place_drop_aim_payload) ───────────────
+  // Forget any applied shift WITHOUT touching pp_wp_: called where pp_wp_ is
+  // reset or replaced by a fresh plan, whose drop rest is the model's.
+  void clearDropAim()
+  {
+    pp_aim_shift_.setZero();
+    pp_aim_active_ = false;
+    pp_aim_text_.clear();
+    pp_aim_buf_.clear();
+    pp_aim_hold_since_.reset();
+  }
+
+  // The newest tracked sample of a mocap body: un-flipped (tilt < 90 deg),
+  // under 0.25 s old and not frozen (>= 3 bit-identical positions in 0.3 s)
+  // -- the autonomous drop's own tests: its position, or none.
+  std::optional<Vec3> ppFreshSample(int k) const
+  {
+    const auto & d = pp_mocap_[k];
+    const PpSample * last = nullptr;
+    for (auto it = d.rbegin(); it != d.rend(); ++it) {
+      if (it->tilt < 0.5 * M_PI) {last = &*it; break;}
+    }
+    if (last == nullptr || secondsSince(last->t) > 0.25) {return std::nullopt;}
+    size_t n_recent = 0;
+    bool frozen = true;
+    for (auto it = d.rbegin(); it != d.rend(); ++it) {
+      if (it->tilt >= 0.5 * M_PI) {continue;}
+      if (std::chrono::duration<double>(last->t - it->t).count() > 0.3) {break;}
+      ++n_recent;
+      if (!(it->p == last->p)) {frozen = false;}
+    }
+    if (n_recent >= 3 && frozen) {return std::nullopt;}
+    return last->p;
+  }
+
+  // One basket - claw sample at the 10 Hz arrival tick, while HOLDING at Drop
+  // Start (go_to_place_start done, the drop not started) with the arm at the
+  // DROP pose: q1..q3 within 5 deg of the drop rest's (q4 is the swing, free).
+  // The offset is kept in the VEHICLE frame (yaw only), so it carries to the
+  // drop's heading. Outside that hover the buffer is KEPT (a re-flown Ready To
+  // Drop aims with the same window); only a new plan clears it (clearDropAim).
+  // Samples start pick_place_drop_aim_settle_s after the hover began (the turn
+  // to Drop Start excites the wrist swing); a sample needs fresh joints and a
+  // fresh, tracked, un-flipped obj_0. Called under the lock.
+  void sampleDropAim(const Vec3 & x_b, const Mat3 & r0)
+  {
+    const bool on = get_parameter("pick_place_drop_aim_payload").as_bool() &&
+      get_parameter("pick_place_place_drop").as_bool() && pp_wp_.has_value() &&
+      pp_completed_ == kGoToPlaceStart && !pp_flying_.has_value() && state_ == "HOLD" &&
+      !pp_topic_[kExecutePick].empty();
+    if (!on) {pp_aim_hold_since_.reset(); return;}
+    if (!pp_aim_hold_since_.has_value()) {pp_aim_hold_since_ = Clock::now();}
+    if (secondsSince(pp_aim_hold_since_) <
+      get_parameter("pick_place_drop_aim_settle_s").as_double())
+    {
+      return;
+    }
+    if (!q_meas_.has_value() || secondsSince(q_meas_time_) > 0.25) {return;}
+    const auto & qd = pp_wp_->goal[kExecutePlace].q;
+    for (int j = 0; j < 3; ++j) {
+      if (std::abs((*q_meas_)(j) - qd(j)) > 5.0 * M_PI / 180.0) {return;}
+    }
+    const std::optional<Vec3> obj = ppFreshSample(kExecutePick);
+    if (!obj.has_value()) {return;}
+    Vec3 r0e;
+    armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
+    const Vec3 claw = x_b + r0 * (vehicle_->r_model * r0e);
+    const double psi = std::atan2(r0(1, 0), r0(0, 0));
+    const Vec3 body = Eigen::AngleAxisd(-psi, Vec3::UnitZ()) * (*obj - claw);
+    const auto now = Clock::now();
+    pp_aim_buf_.emplace_back(now, body);
+    const double win = get_parameter("pick_place_drop_aim_window_s").as_double();
+    while (!pp_aim_buf_.empty() &&
+      std::chrono::duration<double>(now - pp_aim_buf_.front().first).count() > win)
+    {
+      pp_aim_buf_.pop_front();
+    }
+  }
+
+  // Shift a pick-and-place leg's rest (base and claw together: the arm pose
+  // does not change) by a world offset. Called under the lock.
+  void shiftLegRest(int leg, const Vec3 & d)
+  {
+    pp_wp_->goal[leg].x_b += d;
+    pp_wp_->ee[leg] += d;
+    pp_wp_->approach[leg].x_b += d;
+    pp_wp_->approach_ee[leg] += d;
+  }
+
+  // At Ready To Drop: undo the last shift, then aim the drop rest so the
+  // MEASURED basket lands on the drop point (x, y), or keep the model and say
+  // why. Sets pp_aim_text_ for the leg's reply. Called under the lock.
+  void applyDropAim()
+  {
+    shiftLegRest(kExecutePlace, -pp_aim_shift_);
+    pp_aim_shift_.setZero();
+    pp_aim_active_ = false;
+    pp_aim_text_.clear();
+    if (!get_parameter("pick_place_drop_aim_payload").as_bool() ||
+      !get_parameter("pick_place_place_drop").as_bool())
+    {
+      return;
+    }
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(0);
+    const double win = get_parameter("pick_place_drop_aim_window_s").as_double();
+    const double min_s = get_parameter("pick_place_drop_aim_min_s").as_double();
+    const double settle = get_parameter("pick_place_drop_aim_settle_s").as_double();
+    const double max_shift = get_parameter("pick_place_drop_aim_max_shift").as_double();
+    // only the hover that has just ended counts: drop what is older than the window
+    const auto now = Clock::now();
+    while (!pp_aim_buf_.empty() &&
+      std::chrono::duration<double>(now - pp_aim_buf_.front().first).count() > win)
+    {
+      pp_aim_buf_.pop_front();
+    }
+    const double span = pp_aim_buf_.size() < 2 ? 0.0 :
+      std::chrono::duration<double>(pp_aim_buf_.back().first - pp_aim_buf_.front().first).count();
+    const double newest = pp_aim_buf_.empty() ? 1e9 :
+      std::chrono::duration<double>(now - pp_aim_buf_.back().first).count();
+    // the arrival tick is 10 Hz: a full span with a hole in it is not enough
+    const double need_n = 8.0 * min_s;
+    Vec3 mean = Vec3::Zero();
+    for (const auto & s : pp_aim_buf_) {mean += s.second;}
+    if (!pp_aim_buf_.empty()) {mean /= static_cast<double>(pp_aim_buf_.size());}
+    PickPlaceTargets tg;
+    std::string terr;
+    if (!(min_s > 0.0) || !(win >= min_s) || !(max_shift > 0.0) || !(settle >= 0.0)) {
+      m.precision(2);
+      m << "NOT aimed at the basket: the aim's parameters are invalid (need min_s > 0, window_s >= "
+        "min_s, max_shift > 0, settle_s >= 0; have " << min_s << ", " << win << ", " << max_shift
+        << ", " << settle << ") -- the EE-offset model is used";
+    } else if (span < min_s || static_cast<double>(pp_aim_buf_.size()) < need_n || newest > 0.5) {
+      m.precision(1);
+      m << "NOT aimed at the basket: " << span << " s / " << pp_aim_buf_.size()
+        << " basket samples at Drop Start (need " << min_s << " s, " << need_n
+        << ", the newest under 0.5 s old: hover >= " << settle + min_s << " s with the arm at the "
+        "drop pose and " << ppBody(kExecutePick) << " tracked) -- the EE-offset model is used";
+    } else if (!mean.allFinite()) {
+      m << "NOT aimed at the basket: the measured offset is not finite -- the EE-offset model is used";
+    } else if (!ppTargets(&tg, &terr)) {
+      m << "NOT aimed at the basket: no drop point (" << terr << ")";
+    } else {
+      const double psi = pp_wp_->goal[kExecutePlace].phi + 0.5 * M_PI;   // model heading -> actual yaw
+      const Vec3 basket = pp_wp_->ee[kExecutePlace] + Eigen::AngleAxisd(psi, Vec3::UnitZ()) * mean;
+      Vec3 d = Vec3::Zero();
+      d.head<2>() = tg.place.head<2>() - basket.head<2>();
+      if (!d.allFinite()) {
+        m << "NOT aimed at the basket: the shift is not finite -- the EE-offset model is used";
+      } else if (d.norm() > max_shift) {
+        m << "NOT aimed at the basket: the measured basket would need a " << d.norm() * 1e3
+          << " mm shift (> " << max_shift * 1e3 << " mm) -- the EE-offset model is used";
+      } else {
+        shiftLegRest(kExecutePlace, d);
+        pp_aim_shift_ = d;
+        pp_aim_active_ = true;
+        m << "aimed at the basket: the drop rest moved [" << d(0) * 1e3 << ", " << d(1) * 1e3
+          << "] mm (basket measured [" << mean(0) * 1e3 << ", " << mean(1) * 1e3
+          << "] mm from the claw, vehicle frame, over " << std::setprecision(1) << span << " s)";
+      }
+    }
+    pp_aim_text_ = m.str();
+    RCLCPP_INFO(get_logger(), "pick-and-place execute_place: %s", pp_aim_text_.c_str());
+  }
+
+  // THE AUTONOMOUS DROP's gates (pick_place_drop_auto: see its parameters), at
+  // the 10 Hz arrival tick while the drop leg holds on the drop point. `claw`:
+  // the measured claw; `e`: its error to the drop target (world). Sets *fire to
+  // the release message once every gate has held for the dwell (once per drop
+  // hold). Returns true when the status text changed. Called under the lock.
+  bool evalDropAuto(const Vec3 & claw, const Vec3 & e, std::string * fire)
+  {
+    const std::string before = pp_drop_text_;
+    const bool holding = get_parameter("pick_place_drop_auto").as_bool() &&
+      get_parameter("pick_place_place_drop").as_bool() && pp_wp_.has_value() &&
+      pp_completed_ == kExecutePlace && !pp_flying_.has_value() && !pp_exiting_.has_value() &&
+      !pp_exited_[kExecutePlace] && pp_at_table_ && !pp_aborting_ && !pp_abort_plan_ &&
+      !pp_aborted_ && pp_drop_hold_t0_.has_value() && state_ == "HOLD";
+    if (!holding) {
+      pp_drop_ok_since_.reset();
+      pp_drop_claw_prev_.reset();
+      pp_drop_last_eval_.reset();
+      if (!pp_drop_fired_) {pp_drop_text_.clear();}
+      return pp_drop_text_ != before;
+    }
+    if (pp_drop_fired_) {return false;}          // released: the text stays as it was
+    const auto now = Clock::now();
+    // a gap in the 10 Hz evaluation (stale odometry / attitude / joints skip
+    // the tick) restarts the dwell and the claw speed: never release on one
+    // tick after a gap, nor on a speed averaged across it
+    if (pp_drop_last_eval_.has_value() && secondsSince(pp_drop_last_eval_) > 0.25) {
+      pp_drop_ok_since_.reset();
+      pp_drop_claw_prev_.reset();
+    }
+    pp_drop_last_eval_ = now;
+    const double wait = get_parameter("pick_place_drop_auto_wait_s").as_double();
+    const double dwell = get_parameter("pick_place_drop_auto_dwell_s").as_double();
+    const double claw_tol = get_parameter("pick_place_drop_auto_claw_tol").as_double();
+    const double claw_vmax = get_parameter("pick_place_drop_auto_claw_speed").as_double();
+    const double pay_tol = get_parameter("pick_place_drop_auto_payload_tol").as_double();
+    const double pay_vmax = get_parameter("pick_place_drop_auto_payload_speed").as_double();
+    const double q4_tol = get_parameter("pick_place_drop_auto_q4_tol_deg").as_double();
+
+    // the claw's speed, between two arrival ticks
+    double claw_v = std::numeric_limits<double>::quiet_NaN();
+    if (pp_drop_claw_prev_.has_value()) {
+      const double dt = std::chrono::duration<double>(now - pp_drop_claw_prev_->first).count();
+      if (dt > 1e-3) {claw_v = (claw - pp_drop_claw_prev_->second).norm() / dt;}
+    }
+    pp_drop_claw_prev_ = std::make_pair(now, claw);
+
+    // the payload's own mocap body: its newest UN-flipped sample, fresh, not
+    // frozen, and its speed over ~0.1 s
+    std::string pay_why;
+    double pay_err = std::numeric_limits<double>::quiet_NaN();
+    double pay_v = std::numeric_limits<double>::quiet_NaN();
+    const auto & d = pp_mocap_[kExecutePick];
+    const PpSample * last = nullptr;
+    for (auto it = d.rbegin(); it != d.rend(); ++it) {
+      if (it->tilt < 0.5 * M_PI) {last = &*it; break;}
+    }
+    PickPlaceTargets tg;
+    std::string terr;
+    if (pp_topic_[kExecutePick].empty()) {
+      pay_why = "no payload body (pick_place_pick_topic is empty)";
+    } else if (last == nullptr || secondsSince(last->t) > 0.25) {
+      pay_why = ppBody(kExecutePick) + " not tracked (no fresh sample)";
+    } else if (!ppTargets(&tg, &terr)) {
+      pay_why = "no drop point: " + terr;
+    } else {
+      const PpSample * old = nullptr;
+      size_t n_recent = 0;
+      bool frozen = true;
+      for (auto it = d.rbegin(); it != d.rend(); ++it) {
+        if (it->tilt >= 0.5 * M_PI) {continue;}
+        const double age = std::chrono::duration<double>(last->t - it->t).count();
+        if (age <= 0.3) {
+          ++n_recent;
+          if (!(it->p == last->p)) {frozen = false;}
+        }
+        if (age >= 0.1) {old = &*it; break;}
+      }
+      if (n_recent >= 3 && frozen) {
+        pay_why = ppBody(kExecutePick) + "'s pose is frozen (not tracked)";
+      } else if (old == nullptr) {
+        pay_why = ppBody(kExecutePick) + " not tracked long enough to measure its speed";
+      } else {
+        const double dt = std::chrono::duration<double>(last->t - old->t).count();
+        pay_v = (last->p - old->p).norm() / dt;
+        pay_err = (last->p.head<2>() - tg.place.head<2>()).norm();
+      }
+    }
+    // the wrist roll against the place pose's
+    const auto place_pose = get_parameter("pick_place_place_pose_deg").as_double_array();
+    const double q4_ref = place_pose.size() == 4 ? place_pose[3] : 0.0;
+    const double q4_err = std::abs((*q_meas_)(3) * 180.0 / M_PI - q4_ref);
+
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m << "auto drop: ";
+    const double held = secondsSince(pp_drop_hold_t0_);
+    bool ok = false;
+    const double q_age = secondsSince(q_meas_time_);
+    const bool aimed = pp_aim_active_ && get_parameter("pick_place_drop_aim_payload").as_bool();
+    if (held < wait) {
+      m << std::setprecision(1) << "waiting " << held << " of " << wait << " s";
+    } else if (q_age > 0.25) {
+      m << std::setprecision(2) << "arm joint states " << q_age << " s old (the claw and q4 are unknown)";
+    } else if (!aimed && e.norm() > claw_tol) {
+      // aimed at the basket, the payload gate below IS the position gate: the
+      // claw only has to be still (its target already carries the measured hang)
+      m << std::setprecision(0) << "claw " << e.norm() * 1e3 << " mm from the drop target (gate "
+        << claw_tol * 1e3 << ")";
+    } else if (!(claw_v <= claw_vmax)) {
+      m << std::setprecision(2) << "claw moving " << claw_v << " m/s (gate " << claw_vmax << ")";
+    } else if (!pay_why.empty()) {
+      m << pay_why;
+    } else if (pay_err > pay_tol) {
+      m << std::setprecision(0) << "payload " << pay_err * 1e3 << " mm from the drop point (gate "
+        << pay_tol * 1e3 << ")";
+    } else if (!(pay_v <= pay_vmax)) {
+      m << std::setprecision(2) << "payload moving " << pay_v << " m/s (gate " << pay_vmax << ")";
+    } else if (q4_err > q4_tol) {
+      m << std::setprecision(1) << "wrist q4 " << q4_err << " deg off (gate " << q4_tol << ")";
+    } else {
+      ok = true;
+    }
+    if (!ok) {
+      pp_drop_ok_since_.reset();
+    } else {
+      if (!pp_drop_ok_since_.has_value()) {pp_drop_ok_since_ = now;}
+      const double inside = secondsSince(pp_drop_ok_since_);
+      if (inside + 1e-9 < dwell) {
+        m << std::setprecision(1) << "all gates OK for " << inside << " of " << dwell << " s";
+      } else {
+        std::ostringstream r;
+        r.setf(std::ios::fixed);
+        r << std::setprecision(0) << "claw " << e.norm() * 1e3 << " mm, payload " << pay_err * 1e3
+          << " mm from the drop point, " << std::setprecision(2) << "claw " << claw_v
+          << " m/s, payload " << pay_v << " m/s, " << std::setprecision(1) << "q4 " << q4_err
+          << " deg off, " << held << " s after the leg";
+        *fire = r.str();
+        pp_drop_fired_ = true;
+        m << "RELEASE signalled (" << r.str() << ") -- the arm GS opens the gripper";
+        RCLCPP_INFO(get_logger(), "pick-and-place: AUTO DROP -- %s", r.str().c_str());
+      }
+    }
+    pp_drop_text_ = m.str();
+    return pp_drop_text_ != before;
   }
 
   // The claw leg's vertical descent from the approach hold onto the target,
@@ -4417,6 +4842,7 @@ private:
           m << (pp_settled_ ? " -- claw within tolerance: fine correction OK"
                 : pp_within_ ? " -- claw inside tolerance, settling"
                              : " -- claw outside tolerance");
+          if (!pp_drop_text_.empty()) {m << " -- " << pp_drop_text_;}
         }
       }
       s = m.str();
@@ -4643,7 +5069,7 @@ private:
     const auto & o = msg.pose.orientation;
     const double yaw = std::atan2(2.0 * (o.w * o.z + o.x * o.y), 1.0 - 2.0 * (o.y * o.y + o.z * o.z));
     std::lock_guard<std::recursive_mutex> lk(lock_);
-    pl_mocap_.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0});
+    pl_mocap_.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0, 0.0});
     while (pl_mocap_.size() > 1 &&
       (secondsSince(pl_mocap_.front().t) > 2.0 || pl_mocap_.size() > 2000))
     {
@@ -5775,7 +6201,7 @@ private:
   double pp_yaw_offset_{0.0};
   std::array<std::optional<Vec3>, kNumPickPlaceLegs> pp_capture_;
   std::array<std::optional<double>, kNumPickPlaceLegs> pp_capture_yaw_;   // [rad], with each capture
-  struct PpSample {Clock::time_point t; Vec3 p; double yaw;};               // a mocap sample
+  struct PpSample {Clock::time_point t; Vec3 p; double yaw; double tilt;};  // a mocap sample
   std::array<std::deque<PpSample>, kNumPickPlaceLegs> pp_mocap_;
   std::optional<PickPlaceWaypoints> pp_wp_;                       // set by Plan
   std::array<double, kNumPickPlaceLegs> pp_leg_T_{};
@@ -5811,6 +6237,25 @@ private:
   std::deque<std::pair<Clock::time_point, Vec3>> pp_trim_buf_;   // claw error while holding above
   Vec3 pp_descent_trim_{Vec3::Zero()};                          // the trim the last descent used
   double pp_last_err_{0.0};
+  // the autonomous drop (pick_place_drop_auto): when the drop leg ended, since
+  // when every gate has passed, whether this drop hold has already released,
+  // the claw's last position (its speed), and the status text it shows
+  std::optional<Clock::time_point> pp_drop_hold_t0_;
+  std::optional<Clock::time_point> pp_drop_ok_since_;
+  bool pp_drop_fired_{false};
+  std::optional<std::pair<Clock::time_point, Vec3>> pp_drop_claw_prev_;
+  std::optional<Clock::time_point> pp_drop_last_eval_;   // a gap restarts the dwell
+  std::string pp_drop_text_;
+  // aiming the drop at the basket (pick_place_drop_aim_payload): the basket -
+  // claw offset in the VEHICLE frame (x forward, y left) sampled at Drop Start,
+  // the world shift currently applied to the drop leg's rest (undone before a
+  // new one, and zero on a fresh plan), whether it was applied (the claw
+  // position gate stands down only then), and what was done, for the leg reply
+  std::deque<std::pair<Clock::time_point, Vec3>> pp_aim_buf_;
+  Vec3 pp_aim_shift_{Vec3::Zero()};
+  bool pp_aim_active_{false};
+  std::optional<Clock::time_point> pp_aim_hold_since_;   // the Drop Start hover began (settle)
+  std::string pp_aim_text_;
   bool pp_at_table_{false};                     // holding at a table: the next leg retreats first
   bool pp_within_{false};                       // the claw inside the tolerance (dwell not yet done)
   bool pp_timed_out_{false};                    // pp_error_ is a wait timeout, not a refusal
@@ -5876,6 +6321,7 @@ private:
   std::optional<Clock::time_point> att_time_;
   bool att_warned_{false};
   std::optional<VecN> q_meas_;
+  Clock::time_point q_meas_time_{};   // when q_meas_ arrived (the drop gates and the aim need it fresh)
   VecN qdot_meas_{VecN::Zero()};
   int viz_decim_{0};
   int viz_decim_period_{5};
@@ -5907,6 +6353,7 @@ private:
   rclcpp::Service<Trigger>::SharedPtr ee_origin_srv_;
   rclcpp::TimerBase::SharedPtr ee_err_timer_;
   rclcpp::Publisher<String>::SharedPtr pp_status_pub_;
+  rclcpp::Publisher<String>::SharedPtr pp_drop_now_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr pp_info_pub_, pp_path_pub_, pp_drone_path_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr pp_arrival_pub_, pp_ws_pub_;
   std::vector<rclcpp::Service<Trigger>::SharedPtr> pp_srvs_;
