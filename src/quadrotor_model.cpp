@@ -42,8 +42,8 @@ QuadrotorModel makeX650()
   m.mass = 3.25;
   m.inertia = Eigen::Vector3d(0.05777498, 0.06408172, 0.065004565).asDiagonal();
   m.gravity = 9.81;
-  // MN4014 rotor lag, lambda = 10.51 1/s (MN_4014_15x5 bench report, x650_params.py ROTOR_LAMBDA).
-  m.rotor_time_constant = 0.0951;
+  // Rotor lag identified from the first CCM flights (2026-10-14); the MN4014 bench report gave 0.0951 s.
+  m.rotor_time_constant = 0.115;
   return m;
 }
 

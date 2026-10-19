@@ -25,7 +25,9 @@
 //   stop           ramp a running shape out and hold where it ends
 //   release        stop streaming (IDLE)
 // Topics in: <prefix>/select (String: circle | figure8 | circle_tangent | figure8_tangent),
-// <prefix>/time_scale (Float64). The *_tangent shapes fly the same paths with the yaw along
+// <prefix>/time_scale (Float64), <prefix>/radius (Float64: the size of the selected shape --
+// circle_radius for circle / circle_tangent, fig8_a for figure8 / figure8_tangent -- clamped to
+// [radius_min, radius_max], refused while a run or move is active). The *_tangent shapes fly the same paths with the yaw along
 // the path tangent: fly-to-start also turns the vehicle to the start heading, back-to-hover
 // turns it back, and a start is refused above max_yaw_rate / max_yaw_accel.
 //
@@ -119,6 +121,8 @@ public:
     opts_.time_scale = declare_parameter<double>("time_scale", 1.0);
     ts_min_ = declare_parameter<double>("time_scale_min", 0.25);
     ts_max_ = declare_parameter<double>("time_scale_max", 1.5);
+    radius_min_ = declare_parameter<double>("radius_min", 0.25);
+    radius_max_ = declare_parameter<double>("radius_max", 2.0);
     const auto c = declare_parameter<std::vector<double>>("center", {0.0, 0.0});
     center_ = Eigen::Vector2d(c.size() > 0 ? c[0] : 0.0, c.size() > 1 ? c[1] : 0.0);
     height_ = declare_parameter<double>("height", -1.0);
@@ -219,6 +223,8 @@ public:
       prefix + "/select", 10, [this](const std_msgs::msg::String & m) {onSelect(m.data);});
     time_scale_sub_ = create_subscription<std_msgs::msg::Float64>(
       prefix + "/time_scale", 10, [this](const std_msgs::msg::Float64 & m) {onTimeScale(m.data);});
+    radius_sub_ = create_subscription<std_msgs::msg::Float64>(
+      prefix + "/radius", 10, [this](const std_msgs::msg::Float64 & m) {onRadius(m.data);});
 
     const auto srv = [this, &prefix](const std::string & name, void (QuadrotorCcmPlanner::*fn)(Trigger::Response &)) {
         return create_service<Trigger>(
@@ -364,6 +370,39 @@ private:
       RCLCPP_INFO(get_logger(), "time scale %.2f (applies at the next start)%s", opts_.time_scale,
         phase_ == CcmReference::PHASE_RUNNING ? "; the running shape keeps its speed" : "");
     }
+    publishInfo();
+  }
+
+  // Size of the selected shape: circle_radius for the circles, fig8_a (x half-width; the
+  // y half-width is a / 2) for the figure-8s. The other shape keeps its own value.
+  double * selectedSize()
+  {
+    switch (quadShapeGeometry(shape_)) {
+      case QuadShape::kCircle: return &opts_.circle_radius;
+      case QuadShape::kFigure8: return &opts_.fig8_a;
+      default: return nullptr;
+    }
+  }
+
+  void onRadius(double r)
+  {
+    {
+      std::lock_guard<std::mutex> lk(lock_);
+      if (!std::isfinite(r)) {return;}
+      if (phase_ == CcmReference::PHASE_RUNNING || phase_ == CcmReference::PHASE_TRANSITION) {
+        RCLCPP_WARN(get_logger(), "radius %.3f ignored while %s", r, phaseName(phase_));
+        return;
+      }
+      double * size = selectedSize();
+      if (size == nullptr) {
+        RCLCPP_WARN(get_logger(), "radius %.3f ignored: %s has no size", r, quadShapeName(shape_).c_str());
+        return;
+      }
+      *size = std::clamp(r, radius_min_, radius_max_);
+      RCLCPP_INFO(get_logger(), "%s %s = %.3f m (applies at the next fly-to-start / start)",
+        quadShapeName(shape_).c_str(), size == &opts_.circle_radius ? "circle_radius" : "fig8_a", *size);
+    }
+    publishList();
     publishInfo();
   }
 
@@ -643,7 +682,9 @@ private:
     std::ostringstream o;
     o << std::fixed << std::setprecision(4) << "{\"phase\": \"" << phaseName(phase_) << "\", \"selected\": \""
       << quadShapeName(shape_) << "\", \"time_scale\": " << opts_.time_scale << ", \"time_scale_min\": " << ts_min_
-      << ", \"time_scale_max\": " << ts_max_ << ", \"at_start\": " << (atStart() ? "true" : "false")
+      << ", \"time_scale_max\": " << ts_max_ << ", \"circle_radius\": " << opts_.circle_radius
+      << ", \"fig8_a\": " << opts_.fig8_a << ", \"radius_min\": " << radius_min_ << ", \"radius_max\": "
+      << radius_max_ << ", \"at_start\": " << (atStart() ? "true" : "false")
       << ", \"pos_ref\": " << ((publish_pos_ref_ && pos_ref_active_ && phase_ != CcmReference::PHASE_IDLE) ?
       "true" : "false");
     double t = 0.0, T = 0.0;
@@ -688,6 +729,7 @@ private:
 
   void publishList()
   {
+    std::lock_guard<std::mutex> lk(lock_);
     std::ostringstream o;
     o << std::fixed << std::setprecision(2) << "[{\"name\": \"circle\", \"label\": \"Circle (R " << opts_.circle_radius
       << " m)\", \"lap_time\": " << opts_.lap_time << ", \"laps\": " << opts_.laps
@@ -708,6 +750,7 @@ private:
   Eigen::Vector2d center_{Eigen::Vector2d::Zero()};
   double height_{-1.0};
   double ts_min_{0.25}, ts_max_{1.5};
+  double radius_min_{0.25}, radius_max_{2.0};
   double transition_speed_{0.4}, transition_min_time_{3.0}, max_transition_distance_{4.0}, start_tolerance_{0.05};
   double max_speed_{2.0}, max_accel_{3.0}, max_dist_{3.0}, max_dist_ang_{3.0};
   std::string dist_source_{"ccm"};
@@ -744,7 +787,7 @@ private:
   rclcpp::Subscription<UDEState>::SharedPtr ude_sub_;
   rclcpp::Subscription<geometry_msgs::msg::AccelStamped>::SharedPtr dist_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr select_sub_, mode_sub_;
-  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr time_scale_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr time_scale_sub_, radius_sub_;
   std::vector<rclcpp::Service<Trigger>::SharedPtr> services_;
   rclcpp::TimerBase::SharedPtr stream_timer_, status_timer_;
 };

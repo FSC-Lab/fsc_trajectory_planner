@@ -467,9 +467,13 @@ arm); it has its own small registry.
   Services (Trigger, the ground station's "CCM Trajectory" tab): `hold`, `go_to_start` (shape placed
   by `center` / `height`), `start` (only when holding at the start, and within `max_speed` /
   `max_accel`), `back_to_hover` (ramps a run out first), `stop`, `release`. Topics in: `select`
-  (String), `time_scale` (Float64, clamped to `time_scale_min..max`, applies at the next start).
-  Latched out: `status`, `info` (JSON incl. the selection's 128-point XY `path`),
-  `available_trajectories` (JSON, once). Leaves a run / move and re-captures a hold when the flight
+  (String), `time_scale` (Float64, clamped to `time_scale_min..max`, applies at the next start),
+  `radius` (Float64, 2026-10-19: sets `circle_radius` for circle / circle_tangent or `fig8_a` for
+  figure8 / figure8_tangent -- whichever is SELECTED -- clamped to `radius_min..max`, ignored while
+  RUNNING / TRANSITION; a new circle radius moves the start point, so fly to start again).
+  Latched out: `status`, `info` (JSON incl. the selection's 128-point XY `path`, `circle_radius`,
+  `fig8_a`, `radius_min/max`), `available_trajectories` (JSON; republished on a radius change, the
+  labels carry the sizes). Leaves a run / move and re-captures a hold when the flight
   node leaves CCM (`hold_on_ccm_exit`). Optional disturbance in the flatness map
   (`use_disturbance_estimate`), from `disturbance_source`: `"ude"` = the SAFETY baseline's linear UDE
   (`position_controller/ude`, force / mass), or `"ccm"` = the CCM flight node's velocity-based

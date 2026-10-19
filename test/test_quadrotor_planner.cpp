@@ -51,7 +51,7 @@ TEST(QuadrotorPlanner, RegistryKnowsX650)
   EXPECT_NEAR(m.mass, 3.25, 1e-12);
   EXPECT_NEAR(m.inertia(0, 0), 0.05777498, 1e-12);
   EXPECT_NEAR(m.inertia(0, 1), 0.0, 1e-12);
-  EXPECT_NEAR(m.rotor_time_constant, 0.0951, 1e-12);
+  EXPECT_NEAR(m.rotor_time_constant, 0.115, 1e-12);
 }
 
 // Python (CCM_quad planners/planner_quad_torque.py) produced these samples;

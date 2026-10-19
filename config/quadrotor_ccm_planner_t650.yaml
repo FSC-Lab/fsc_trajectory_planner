@@ -17,6 +17,9 @@
     trajectory: "circle"            # hover | circle | figure8 (also <prefix>/select)
     circle_radius: 1.0
     fig8_a: 1.0
+    # GUI "Radius" box (<prefix>/radius) limits; sets circle_radius or fig8_a of the selected shape
+    radius_min: 0.25
+    radius_max: 2.0
     lap_time: 8.0
     laps: 2
     ramp_time: 3.0
