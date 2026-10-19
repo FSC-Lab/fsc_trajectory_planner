@@ -20,6 +20,7 @@
 #ifndef FSC_TRAJECTORY_PLANNER_TRAJECTORY_HPP_
 #define FSC_TRAJECTORY_PLANNER_TRAJECTORY_HPP_
 
+#include <array>
 #include <functional>
 #include <map>
 #include <memory>
@@ -60,6 +61,17 @@ public:
   // The rest the trajectory ends on (the next hold).
   virtual RestSpec goalRest() const = 0;
   virtual const PlanDiag & diag() const = 0;
+  // PATH FOLLOWING (2026-10-18): the reference at PROGRESS tau when tau itself
+  // advances at the wall-time rates r = {dtau/dt, d2tau/dt2, d3tau/dt3,
+  // d4tau/dt4}, every derivative chained through snap. Exact only where
+  // timeScalable() says so; the default ignores r, which is right for a static
+  // segment or for r = {1, 0, 0, 0} (then evalScaled(tau, r) == eval(tau)).
+  virtual bool timeScalable() const {return false;}
+  virtual WbReference evalScaled(double tau, const std::array<double, 4> & r) const
+  {
+    (void)r;
+    return eval(tau);
+  }
 };
 
 // A static hold at one rest spec.
@@ -71,6 +83,7 @@ public:
   WbReference eval(double) const override {return ref_;}
   RestSpec goalRest() const override {return rest_;}
   const PlanDiag & diag() const override {return diag_;}
+  bool timeScalable() const override {return true;}   // static
 
 private:
   RestSpec rest_;
@@ -89,6 +102,9 @@ public:
   WbReference eval(double t) const override;
   RestSpec goalRest() const override {return segments_.back()->goalRest();}
   const PlanDiag & diag() const override {return diag_;}
+  // scalable when every segment is; tau is the sequence's own progress
+  bool timeScalable() const override;
+  WbReference evalScaled(double tau, const std::array<double, 4> & r) const override;
   // Elapsed time at which each segment starts (size = number of segments).
   const std::vector<double> & segmentStarts() const {return t0_;}
 

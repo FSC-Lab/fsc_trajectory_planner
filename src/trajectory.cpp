@@ -67,6 +67,21 @@ WbReference SequenceTrajectory::eval(double t) const
   return segments_[i]->eval(t - t0_[i]);
 }
 
+bool SequenceTrajectory::timeScalable() const
+{
+  for (const auto & s : segments_) {
+    if (!s->timeScalable()) {return false;}
+  }
+  return true;
+}
+
+WbReference SequenceTrajectory::evalScaled(double tau, const std::array<double, 4> & r) const
+{
+  size_t i = segments_.size() - 1;
+  while (i > 0 && tau < t0_[i]) {--i;}
+  return segments_[i]->evalScaled(tau - t0_[i], r);
+}
+
 const std::map<std::string, PlannerFactory> & plannerFactories()
 {
   static const std::map<std::string, PlannerFactory> table = {

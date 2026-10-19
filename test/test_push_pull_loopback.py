@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Loopback test of the PUSH-AND-PULL mode against the built
 whole_body_trajectory_planner node (no sim, no PX4), on the generated
-push-and-pull sim yaml (fsc_autopilot_ros2/config/
-params_single_aerial_manipulator_whole_body_l1_4d_direct_actuation_t650_sim_push_pull.yaml).
+box-pushing sim yaml (fsc_autopilot_ros2/config/
+params_single_aerial_manipulator_whole_body_l1_4d_direct_actuation_t650_sim_box_pushing.yaml).
 
 Rig: a PERFECT plant -- after every step it teleports its odometry, attitude
 and joints onto the step's planned goal -- plus a fake mocap box, a fake task-
@@ -21,6 +21,8 @@ set_ee_anchor_com services that record what the planner asks for.
       -- keeps the WORLD anchor (true) or returns to the CoM (false); the reference
       holds still for the settle, then slides 0.50 m along -y with the arm and
       the heading FIXED
+  [6b] release (2026-10-17): refused off the handle ([4a]); after the push the CoM
+      anchor is requested and CONTACT off, nothing moves
   [7] exit: CONTACT off; straight up the margin, then the arm home
   [8] go_to_land: the heading turns 270 deg CLOCKWISE; COMPLETE
   [9] again with the force guard: 6 N on the task-force feed while pushing ->
@@ -61,7 +63,7 @@ CONTACT_SRV = "/pl_rig/set_contact"
 ANCHOR_SRV = "/pl_rig/set_ee_anchor_com"
 YAML = os.environ.get("PL_YAML", os.path.expanduser(
     "~/ros2_ws/src/fsc_autopilot_ros2/config/"
-    "params_single_aerial_manipulator_whole_body_l1_4d_direct_actuation_t650_sim_push_pull.yaml"))
+    "params_single_aerial_manipulator_whole_body_l1_4d_direct_actuation_t650_sim_box_pushing.yaml"))
 GOV_CMD = ["ros2", "run", "fsc_trajectory_planner", "whole_body_trajectory_planner",
            "--ros-args", "-r", f"__ns:={NS}", "--params-file", YAML,
            "-p", f"push_pull_box_topic:={BOX_TOPIC}",
@@ -69,18 +71,52 @@ GOV_CMD = ["ros2", "run", "fsc_trajectory_planner", "whole_body_trajectory_plann
            "-p", f"push_pull_contact_service:={CONTACT_SRV}",
            "-p", f"pick_place_anchor_service:={ANCHOR_SRV}",
            # the rig is a PERFECT plant: no trim to measure
-           "-p", "push_pull_descent_trim:=false"]
+           "-p", "push_pull_descent_trim:=false",
+           # ... and its box is a fixed mocap pose that never moves with the claw,
+           # so the 2026-10-16 box guards (lag / tilt) would abort every push
+           # (45 mm "behind its plan"); they are covered by the gtests and Isaac
+           "-p", "push_pull_guard_box_lag:=0.0",
+           "-p", "push_pull_guard_box_tilt_deg:=0.0"]
 HOME = np.array([0.0, 0.698132, 0.698132, 0.0])
-PUSH_POSE = np.radians([0.0, -20.0, 30.0, 0.0])
+_Y = open(YAML).read()
+
+
+def _yaml_list(key):
+    m = re.search(r"^\s*" + key + r":\s*\[([^\]]*)\]", _Y, re.M)
+    return np.array([float(x) for x in m.group(1).split(",")]) if m else None
+
+
+def _yaml_num(key, default):
+    m = re.search(r"^\s*" + key + r":\s*([-+0-9.eE]+)", _Y, re.M)
+    return float(m.group(1)) if m else default
+
+
+def _yaml_bool(key, default):
+    m = re.search(r"^\s*" + key + r":\s*(true|false)", _Y, re.M)
+    return (m.group(1) == "true") if m else default
+
+
+# 2026-10-16: read from the yaml (the 10-03 constants had gone stale on 10-07)
+PUSH_POSE = np.radians(_yaml_list("push_pull_push_pose_deg"))
 LATCHED = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
-STEPS = ["go_to_start", "ready", "push", "exit", "go_to_land"]
-BOX = np.array([1.20, 0.25, 0.83])
-EE_OFFSET = np.array([0.0, 0.155, 0.065])    # the yaml's push_pull_ee_offset
-APPROACH_DZ = 0.20
-# the yaml's push_pull_world_anchor_push (2026-10-04); absent = the node default
-_m = re.search(r"^\s*push_pull_world_anchor_push:\s*(true|false)", open(YAML).read(), re.M)
-WORLD_ANCHOR_PUSH = bool(_m and _m.group(1) == "true")
+STEPS = ["go_to_start", "ready", "push", "exit", "go_to_land_start", "land"]   # six since 2026-10-16
+BOX = np.array([1.275, 0.25, 0.85])          # the scene's box, on the moved table
+EE_OFFSET = _yaml_list("push_pull_ee_offset")
+APPROACH_DZ = _yaml_num("push_pull_approach_dz", 0.20)
+APPROACH_BACK = _yaml_num("push_pull_approach_back", 0.0)
+EXIT_DZ = _yaml_num("push_pull_exit_dz", 0.0) or APPROACH_DZ
+TABLE = _yaml_list("push_pull_table")
+WORLD_ANCHOR_PUSH = _yaml_bool("push_pull_world_anchor_push", True)
+WORLD_ANCHOR_READY = _yaml_bool("push_pull_world_anchor_ready", True)
+WORLD_ANCHOR_ON_HANDLE = _yaml_bool("push_pull_world_anchor_on_handle", False)
+CONTACT_OFF_AT_PUSH_END = _yaml_bool("push_pull_contact_off_at_push_end", False)
+# the push's profile (2026-10-17): > 0 = the cruise at push_distance / (push_time - ramp)
+PUSH_TIME = _yaml_num("push_pull_push_time_s", 12.0)
+PUSH_RAMP = _yaml_num("push_pull_push_ramp_s", 0.0)
+PUSH_DIST = _yaml_num("push_pull_push_distance", 0.50)
+# push_pull/info with six steps: goals at [19 + 7k], at handle [61], contact [62], drone yaw [66]
+I_BOX_VALID, I_GOAL, I_AT_HANDLE, I_CONTACT, I_DRONE_YAW = 14, 19, 61, 62, 66
 OFFSET = np.array([0.10, -0.07])             # the start mark, as the scene spawns
 
 
@@ -114,7 +150,7 @@ class Rig(Node):
         self.create_service(SetBool, CONTACT_SRV, self.on_contact)
         self.create_service(SetBool, ANCHOR_SRV, self.on_anchor)
         self.cli = {n: self.create_client(Trigger, f"whole_body_planner/push_pull/{n}")
-                    for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort"]}
+                    for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort", "release"]}
         self.params = self.create_client(SetParameters, "whole_body_trajectory_planner/set_parameters")
         self.getp = self.create_client(GetParameters, "whole_body_trajectory_planner/get_parameters")
         self.odom_xyz = np.array([OFFSET[0], OFFSET[1], 0.0])
@@ -164,7 +200,7 @@ class Rig(Node):
         self.force_pub.publish(d)
 
     def goal(self, step):
-        g = self.info[18 + 7 * step: 25 + 7 * step]
+        g = self.info[I_GOAL + 7 * step: I_GOAL + 7 + 7 * step]
         return np.array(g[0:3]), math.radians(g[3]), np.array(g[4:7])
 
     def teleport_ref(self, ref):
@@ -251,12 +287,16 @@ def main():
 
         # [1] Adjust on the start mark (SAFETY): land and start mark move by the offset
         land0 = get_param(rig, "push_pull_land")
+        ls0 = get_param(rig, "push_pull_land_start")
         time.sleep(0.5)
         r = call(rig, "adjust")
         assert r.success, r.message
         land = get_param(rig, "push_pull_land")
         assert np.allclose(land[:2] - land0[:2], OFFSET, atol=1e-3), (land, land0)
         assert land[2] == land0[2] and land[3] == land0[3], land
+        if ls0.size == 4:   # Land Start moves with it (2026-10-16)
+            ls = get_param(rig, "push_pull_land_start")
+            assert np.allclose(ls[:2] - ls0[:2], OFFSET, atol=1e-3), (ls, ls0)
         r = call(rig, "go_to_start")
         assert not r.success and "DIRECT" in r.message, r.message
         print(f"[1] adjust: {r.message if not r.success else ''} land {land.round(3).tolist()}")
@@ -279,27 +319,37 @@ def main():
         grasp = BOX + EE_OFFSET
         assert np.linalg.norm(claw - grasp) < 2e-3, (claw, grasp)   # 0.5 mm mocap jitter, averaged
         assert abs(math.degrees(yaw) + 90.0) < 0.5, yaw
-        assert abs(rig.info[58] + 90.0) < 0.5, rig.info[58]
+        assert abs(rig.info[I_DRONE_YAW] + 90.0) < 0.5, rig.info[I_DRONE_YAW]
         _, _, claw0 = rig.goal(0)
-        assert np.linalg.norm(claw0 - (grasp + [0, 0, APPROACH_DZ])) < 2e-3, claw0
+        # the margins: APPROACH_DZ above and APPROACH_BACK behind (the nose is -y: behind = +y)
+        assert np.linalg.norm(claw0 - (grasp + [0, APPROACH_BACK, APPROACH_DZ])) < 2e-3, claw0
         _, _, claw2 = rig.goal(2)
         assert np.linalg.norm(claw2 - (grasp + [0, -0.50, 0])) < 2e-3, claw2
-        print(f"[2] planned: {rig.pl_status}; step T {rig.info[8:13].round(1).tolist()} s; "
+        print(f"[2] planned: {rig.pl_status}; step T {rig.info[8:14].round(1).tolist()} s; "
               f"grasp {claw.round(3).tolist()}, drone at the box {base.round(3).tolist()} yaw {math.degrees(yaw):.1f}")
 
         # [3] out of order
         for name, word in (("ready", "Go To Start first"), ("push", "Ready first"),
-                           ("exit", "not on the handle")):
+                           ("exit", "not on the handle"), ("land", "Go To Land Start first")):
             r = call(rig, name)
             assert not r.success and word in r.message, (name, r.message)
         print("[3] out-of-order steps refused")
 
-        # [4] go_to_start: the world anchor requested on arrival
+        # [4] go_to_start: the world anchor requested on arrival -- unless the
+        # yaml holds the claw in the world only from the handle (2026-10-07)
         T, refs, _ = fly(rig, 0)
-        assert rig.anchor_calls and rig.anchor_calls[-1] is False, rig.anchor_calls
+        if WORLD_ANCHOR_READY:
+            assert rig.anchor_calls and rig.anchor_calls[-1] is False, rig.anchor_calls
+        else:
+            assert not rig.anchor_calls or rig.anchor_calls[-1] is True, rig.anchor_calls
         assert abs(heading_deg(refs[-1]) - (-180.0)) < 0.5 or abs(heading_deg(refs[-1]) - 180.0) < 0.5
         wait(lambda: rig.pl_status.startswith("DONE go_to_start"), 5, "DONE go_to_start")
         print(f"[4] go_to_start T={T:.1f}s, anchor calls {rig.anchor_calls}; {rig.pl_status}")
+
+        # [4a] release (2026-10-17) is refused off the handle: nothing to release
+        r = call(rig, "release")
+        assert not r.success and "not on the handle" in r.message, r.message
+        print(f"[4a] release above the handle refused: {r.message}")
 
         # [5] ready: 80 mm off refused, then on
         rig.teleport(0, off=(0.08, 0.0, 0.0))
@@ -309,9 +359,15 @@ def main():
         rig.teleport(0)
         time.sleep(0.4)
         T, refs, _ = fly(rig, 1)
-        side = max(np.hypot(m.r_ed.x - grasp[0], m.r_ed.y - grasp[1]) for m in refs)
+        # straight down onto the handle, or diagonally along the nose (-y) with
+        # the side margin: never ACROSS it (x)
+        side = max(abs(m.r_ed.x - grasp[0]) for m in refs)
+        if APPROACH_BACK == 0.0:
+            side = max(side, max(abs(m.r_ed.y - grasp[1]) for m in refs))
         assert side < 3e-3, side
-        assert rig.info[53] == 1.0, "not at the handle"
+        assert rig.info[I_AT_HANDLE] == 1.0, "not at the handle"
+        if WORLD_ANCHOR_ON_HANDLE:
+            assert rig.anchor_calls and rig.anchor_calls[-1] is False, rig.anchor_calls
         wait(lambda: rig.pl_status.startswith("DONE ready next=push"), 5, "DONE ready")
         print(f"[5] ready T={T:.1f}s, claw sideways {side * 1e3:.2f} mm on the way down; {rig.pl_status}")
 
@@ -320,7 +376,8 @@ def main():
         # heading fixed
         n_c, n_a = len(rig.contact_calls), len(rig.anchor_calls)
         T, refs, msg = fly(rig, 2)
-        assert rig.contact_calls[n_c:] == [True], rig.contact_calls
+        assert rig.contact_calls[n_c:] == ([True, False] if CONTACT_OFF_AT_PUSH_END else [True]), \
+            rig.contact_calls
         want_com = not WORLD_ANCHOR_PUSH
         assert all(c is want_com for c in rig.anchor_calls[n_a:]) and (
             want_com is False or rig.anchor_calls[n_a:] == [True]), rig.anchor_calls
@@ -332,34 +389,83 @@ def main():
         assert abs((y[-1] - y[0]) + 0.50) < 2e-3, (y[0], y[-1])
         settle = [m for t_, m in zip(range(len(refs)), refs)][:100]   # the first 1.0 s at 100 Hz
         assert max(abs(m.r_ed.y - y[0]) for m in settle) < 1e-6, "moved during the settle"
-        assert rig.info[54] == 1.0
+        assert rig.info[I_CONTACT] == (0.0 if CONTACT_OFF_AT_PUSH_END else 1.0)
+        # the profile as streamed: with a ramp, the middle of the move at the
+        # constant cruise speed (the claw's, which the acceleration tilt does
+        # not touch while the speed is constant), never faster than it
+        sp = np.array([math.hypot(m.r_ed_dot.x, m.r_ed_dot.y) for m in refs])
+        prof = ""
+        if PUSH_RAMP > 0.0:
+            V = abs(PUSH_DIST) / (PUSH_TIME - PUSH_RAMP)
+            k0 = int(round((T - PUSH_TIME + PUSH_RAMP + 0.5) * 100))
+            k1 = int(round((T - PUSH_RAMP - 0.5) * 100))
+            mid = sp[k0:k1]
+            assert len(mid) > 100 and np.max(np.abs(mid - V)) < 1e-3 * V, (V, mid.min(), mid.max())
+            # the claw (not the CoM) may run a little over V in the ramps: the
+            # acceleration tilt swings it (0.13 % measured)
+            assert sp.max() < V * (1 + 1e-2), (V, sp.max())
+            prof = f", cruise {mid.mean() * 1e3:.2f} mm/s (want {V * 1e3:.2f}) for {len(mid) / 100:.1f} s"
         print(f"[6] push T={T:.1f}s: {msg}; arm dev {q_dev:.1e} rad, heading dev {h_dev:.1e} deg, "
-              f"claw y {y[0]:.3f} -> {y[-1]:.3f}; contact calls {rig.contact_calls}")
+              f"claw y {y[0]:.3f} -> {y[-1]:.3f}{prof}; contact calls {rig.contact_calls}")
+
+        # [6b] release (2026-10-17, the release-window fix): as the station opens
+        # the gripper the claw's reference goes back to the CoM anchor -- one CoM
+        # request when it was world-held -- and the contact flag OFF; nothing moves,
+        # the planner stays on the handle, and a second call is harmless
+        n_c, n_a = len(rig.contact_calls), len(rig.anchor_calls)
+        r = call(rig, "release")
+        assert r.success, r.message
+        time.sleep(0.3)
+        assert rig.contact_calls[n_c:] and all(c is False for c in rig.contact_calls[n_c:]), rig.contact_calls
+        assert rig.anchor_calls[n_a:] == ([True] if WORLD_ANCHOR_PUSH else []), rig.anchor_calls
+        assert rig.info[I_AT_HANDLE] == 1.0 and rig.status == "HOLD", (rig.info[I_AT_HANDLE], rig.status)
+        r2 = call(rig, "release")
+        assert r2.success and "already follows" in r2.message, r2.message
+        print(f"[6b] release: {r.message}; anchor calls {rig.anchor_calls[n_a:]}")
 
         # [7] exit: contact off, climb with the arm fixed, then home
         n_c = len(rig.contact_calls)
         T, refs, _ = fly(rig, 3)
-        assert rig.contact_calls[n_c:] == [False], rig.contact_calls
+        # contact off (again, when the push already ended it): only OFF requests
+        new = rig.contact_calls[n_c:]
+        assert all(c is False for c in new) and (CONTACT_OFF_AT_PUSH_END or new), rig.contact_calls
         z = [m.r_ed.z for m in refs]
         k_up = next(i for i, m in enumerate(refs) if np.max(np.abs(np.array(m.q_d) - PUSH_POSE)) > 1e-6)
-        assert z[k_up] - z[0] > APPROACH_DZ - 2e-3, (z[0], z[k_up])
+        assert z[k_up] - z[0] > EXIT_DZ - 2e-3, (z[0], z[k_up])
         assert np.allclose(refs[-1].q_d, HOME, atol=1e-6)
-        assert rig.info[53] == 0.0
+        assert rig.info[I_AT_HANDLE] == 0.0
         print(f"[7] exit T={T:.1f}s: claw up {z[k_up] - z[0]:.3f} m before the arm moved, then home")
 
-        # [8] go_to_land: 270 deg clockwise
+        # [8] go_to_land_start (2026-10-16): ONE transition to the typed Land
+        # Start, turning 270 deg clockwise, the airframe above the table top
+        # wherever it is over the table; land refused before it, then straight down
+        r = call(rig, "land")
+        assert not r.success and "Go To Land Start first" in r.message, r.message
         T, refs, _ = fly(rig, 4)
         h = [heading_deg(m) for m in refs]
-        turn = sum(((b - a + 180) % 360 - 180) for a, b in zip(h, h[1:]))
-        ccw = max(((b - a + 180) % 360 - 180) for a, b in zip(h, h[1:]))
-        assert abs(turn + 270.0) < 1.0 and ccw < 1e-3, (turn, ccw)
+        steps_h = [((b - a + 180) % 360 - 180) for a, b in zip(h, h[1:])]
+        turn = sum(steps_h)
+        assert abs(turn + 270.0) < 1.0 and max(steps_h) < 1e-3, (turn, max(steps_h))
+        over = [m.x_cd.z for m in refs
+                if TABLE[0] - 0.25 < m.x_cd.x < TABLE[1] + 0.25 and TABLE[2] - 0.25 < m.x_cd.y < TABLE[3] + 0.25]
+        z_min = min(over) if over else float("nan")
+        assert not over or z_min > TABLE[4] + 0.30, (z_min, TABLE[4])
+        wait(lambda: rig.pl_status.startswith("DONE go_to_land_start next=land"), 5, "DONE go_to_land_start")
+        print(f"[8] go_to_land_start T={T:.1f}s: one transition, turned {turn:.1f} deg (clockwise only), "
+              f"CoM >= {z_min:.2f} m near the table (top {TABLE[4]:.2f}); {rig.pl_status}")
+        T, refs, _ = fly(rig, 5)
+        xy_dev = max(np.hypot(m.x_cd.x - refs[0].x_cd.x, m.x_cd.y - refs[0].x_cd.y) for m in refs)
+        assert xy_dev < 1e-3, xy_dev
         wait(lambda: rig.pl_status.startswith("COMPLETE"), 5, "COMPLETE")
-        print(f"[8] go_to_land T={T:.1f}s: turned {turn:.1f} deg (clockwise only); {rig.pl_status}")
+        print(f"[8] land T={T:.1f}s: straight down ({refs[0].x_cd.z:.2f} -> {refs[-1].x_cd.z:.2f} m, "
+              f"{xy_dev * 1e3:.2f} mm sideways); {rig.pl_status}")
 
         # [9] the force guard mid-push
         r = call(rig, "reset")
         assert r.success, r.message
-        rig.box = BOX + np.array([0.0, -0.50, 0.0])        # where the push left it
+        # back at its start: from where the push left it a second push would end
+        # 0.25 m past the table's end, which the 2026-10-16 box-on-table check refuses
+        rig.box = BOX.copy()
         time.sleep(0.6)
         assert call(rig, "capture_box").success
         assert call(rig, "plan").success
@@ -387,7 +493,7 @@ def main():
         assert hold_s >= 0.40, hold_s
         assert np.allclose(refs[-1].q_d, HOME, atol=1e-6)
         wait(lambda: rig.pl_status.startswith("ABORTED"), 5, "ABORTED")
-        assert rig.info[4] == 0.0 and rig.info[13] == 0.0, "plan / capture kept after a touched abort"
+        assert rig.info[4] == 0.0 and rig.info[I_BOX_VALID] == 0.0, "plan / capture kept after a touched abort"
         print(f"[9] abort held {hold_s:.2f} s for the release, climbed, arm home; {rig.pl_status}")
 
         # [10] SAFETY

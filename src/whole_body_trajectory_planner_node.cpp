@@ -34,8 +34,9 @@
 //                 targets measured from mocap (obj_0 / drop_0). `plan` dry-
 //                 runs the whole mission; each leg's service re-plans it from
 //                 the CURRENT hold and executes it at once (pick_place.hpp).
-//     PUSH-AND-PULL MODE (2026-10-03): five steps (go_to_start, ready,
-//                 push, exit, go_to_land) that grasp a box on a table by a
+//     PUSH-AND-PULL MODE (2026-10-03): six steps (go_to_start, ready,
+//                 push, exit, go_to_land_start, land; five until 2026-10-16)
+//                 that grasp a box on a table by a
 //                 handle on its side and slide it along the table with the
 //                 arm held still; the law's contact phase flag is CONTACT
 //                 from the claw's arrival on the handle (end of Ready) to the
@@ -625,6 +626,28 @@ public:
     // push_pull_yaw_from_box_deg (-90: the handle on the box's +y side, the
     // push along the box's -y).
     declare_parameter<std::string>("push_pull_box_topic", "/obj_0/mocap");
+    // (2026-10-16) the box capture's PARAMETER TWIN -- the arm GS's Box row
+    // became editable boxes, as the Pick row did on 2026-10-10. It MIRRORS the
+    // capture both ways: [] = not captured, else [x, y, z, yaw_deg], world [m]
+    // -- capture_box writes its result here, and a set from outside (the GS's
+    // boxes, a script) sets the capture itself (onPlParams -> plSetBoxCapture);
+    // [] clears it. A mocap reading: never shifted by Adjust.
+    declare_parameter<std::vector<double>>("push_pull_box_point", std::vector<double>{});
+    {
+      // a value from the launch file: the on-set callback is not registered yet
+      const auto bp = get_parameter("push_pull_box_point").as_double_array();
+      std::string why;
+      if (plBoxPointOk(bp, &why)) {
+        plSetBoxCapture(bp);
+        if (!bp.empty()) {
+          RCLCPP_INFO(get_logger(), "push-and-pull: box from the parameters: "
+            "[%.3f, %.3f, %.3f] m, yaw %.1f deg (not measured)", bp[0], bp[1], bp[2], bp[3]);
+        }
+      } else {
+        RCLCPP_ERROR(get_logger(), "%s -- IGNORED, the box is not captured", why.c_str());
+        set_parameter(rclcpp::Parameter("push_pull_box_point", std::vector<double>{}));
+      }
+    }
     declare_parameter<std::vector<double>>("push_pull_ee_offset", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter<double>("push_pull_yaw_from_box_deg", -90.0);
     // the arm in the push: claw pitched 10 deg forward, 0.130 m ahead of and
@@ -654,6 +677,13 @@ public:
     declare_parameter<double>("push_pull_push_distance", 0.50);
     declare_parameter<double>("push_pull_push_time_s", 12.0);
     declare_parameter<double>("push_pull_push_settle_s", 1.5);
+    // THE CRUISE (2026-10-17, PushPullConfig::push_ramp): > 0 = the straight
+    // push speeds up over this many seconds, holds a constant speed
+    // push_pull_push_distance / (push_pull_push_time_s - this), and slows down
+    // over the same time; must be below push_pull_push_time_s / 2. 0 = the
+    // min-snap move (unchanged: its speed peaks at 2.19 x the mean). A turn
+    // ignores it.
+    declare_parameter<double>("push_pull_push_ramp_s", 0.0);
     declare_parameter<double>("push_pull_exit_time_s", 3.0);
     // THE UNLOAD (2026-10-07, see PushPullConfig::unload_time): > 0 = after the
     // slide the push holds push_pull_unload_wait_s, the hold is then re-seated
@@ -666,10 +696,25 @@ public:
     declare_parameter<double>("push_pull_unload_wait_s", 1.0);
     declare_parameter<double>("push_pull_unload_avg_s", 0.5);
     declare_parameter<double>("push_pull_unload_max", 0.03);
+    // THE TURN (2026-10-15, the valve-turning task; PushPullConfig::turn_angle):
+    // non-zero = the push step ROTATES the claw, the base and the heading
+    // together about the captured body's vertical axis (the "box" is the
+    // valve's bearing axis + the beam's yaw) by this many degrees (+ =
+    // counter-clockwise from above) over push_pull_push_time_s, the arm held;
+    // push_pull_push_distance is then ignored. The nose must be along the
+    // turn's tangent at the handle (yaw_from_box +90 for a + turn, -90 for -).
+    // 0 = the straight push (unchanged).
+    declare_parameter<double>("push_pull_turn_deg", 0.0);
     // the land hover [x, y, z, yaw_deg] (world, ACTUAL yaw, flown as typed:
     // from the push heading -90, -360 is 270 deg CLOCKWISE) and the start mark
     // Adjust measures against; Adjust writes its x, y shift into both
     declare_parameter<std::vector<double>>("push_pull_land", std::vector<double>{-0.5, 0.0, 0.8, -360.0});
+    // (2026-10-16) LAND START [x, y, z, yaw_deg] (world, ACTUAL yaw, flown as
+    // typed like the land's): go_to_land_start flies ONE transition from the
+    // exit hold to it (keep it high, clear of the table); land then flies
+    // straight down to push_pull_land. [] = the same pose as push_pull_land.
+    // Adjust shifts it too.
+    declare_parameter<std::vector<double>>("push_pull_land_start", std::vector<double>{});
     declare_parameter<std::vector<double>>("push_pull_start_mark", std::vector<double>{0.0, 0.0, 1.0, 0.0});
     declare_parameter<double>("push_pull_adjust_max", 0.5);
     // THE TABLE [x_min, x_max, y_min, y_max, z_top] (world, axis-aligned; all 0
@@ -679,10 +724,22 @@ public:
     // push_pull_table_clearance above it
     declare_parameter<std::vector<double>>(
       "push_pull_table", std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
+    // A SECOND keep-out with the table's rule (2026-10-15): the valve's swept
+    // circle, whose BEAM top stands above the table it is bolted to. Same
+    // layout, all 0 = none.
+    declare_parameter<std::vector<double>>(
+      "push_pull_obstacle", std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
     declare_parameter<double>("push_pull_table_clearance", 0.05);
     declare_parameter<double>("push_pull_table_margin_xy", 0.05);
     declare_parameter<double>("push_pull_gear_depth", 0.313);
     declare_parameter<double>("push_pull_gear_radius", 0.25);
+    // THE BOX STAYS ON THE TABLE (2026-10-16): > 0 = the box's half length
+    // along the push [m]; a plan whose pushed box would reach within
+    // push_pull_box_edge_margin of the table's edge (push_pull_table) is
+    // refused -- a box or mocap body turned 180 deg, or too long a distance.
+    // 0 = off (unchanged).
+    declare_parameter<double>("push_pull_box_half_length", 0.0);
+    declare_parameter<double>("push_pull_box_edge_margin", 0.03);
     declare_parameter<double>("push_pull_fence_min_z", 0.6);
     declare_parameter<double>("push_pull_fence_max_z", 1.8);
     declare_parameter<std::vector<double>>(
@@ -728,17 +785,103 @@ public:
     // opens), climb this far, arm home
     declare_parameter<double>("push_pull_abort_climb", 0.30);
     declare_parameter<double>("push_pull_abort_release_wait_s", 0.5);
+    // THE ABORT ON THE BOX (2026-10-16, archive/box_pushing_campaign_20261016): with the
+    // claw on the box, from_measured holds the MEASURED pose (odometry, PX4 heading,
+    // encoders) instead of the reference the push was cut at -- a jammed box leaves the
+    // planned claw 40+ mm AHEAD of the real one, and holding the cut reference drags the
+    // claw along the fin during the release and wedges it in the open jaw; abort_back
+    // [m] retreats the base that far against the push after the release wait, before
+    // the climb, so the fingers leave the fin horizontally. Isaac: without both, the
+    // open claw climbing straight up LIFTED a jammed 1 kg box 58 mm and the vehicle
+    // flipped when it dropped off. false / 0 = the cut-reference hold and the straight
+    // climb (unchanged).
+    declare_parameter<bool>("push_pull_abort_from_measured", false);
+    declare_parameter<double>("push_pull_abort_back", 0.0);
+    // THE ABORT ON A FREE HANDLE (2026-10-18, archive/valve_turning_20261015 README 14):
+    // true = when the claw is on the handle, KEEP the world-held claw through the release
+    // wait (the jaws open around a claw pinned in the room) and hand it back to the CoM
+    // anchor only when the wait ends -- the valve's exit lesson (8.9): the open jaws riding
+    // the base's drift into a fin that cannot move radially roll the wrist 30-45 deg. On a
+    // TURN the retreat (push_pull_abort_back) is along the CURRENT nose, not the grasp's
+    // (push_dir is the tangent at the grasp: mid-turn it points sideways or into the fin).
+    // false = the anchor goes back to the CoM at once (unchanged).
+    declare_parameter<bool>("push_pull_abort_release_world_held", false);
     // SAFETY GUARDS -> ABORT: the tilt (PX4 attitude) above this for that
     // long; the task force the whole-body node reads (wb_control_debug,
     // low-passed) above this for that long while in contact. 0 disables.
     declare_parameter<double>("push_pull_guard_tilt_deg", 15.0);
     declare_parameter<double>("push_pull_guard_persist_s", 0.10);
+    // THE BOX GUARDS (2026-10-16, the box-pushing campaign's worst cases,
+    // archive/box_pushing_campaign_20261016): a jammed or too-heavy box makes
+    // the arm BUCKLE -- the base keeps flying its push while the clamped claw
+    // stops, q2 runs onto its +45 stop and q3 through 0 into the elbow-singular
+    // branch in under a second -- long before the force guard sees 5 N (Isaac:
+    // the force tripped at 16.3 N, after the buckle, and the vehicle flipped).
+    // The box itself shows it a second earlier: from the box's mocap body,
+    //  - box_lag: |the box's displacement along the push - the planned claw's|
+    //    above this [m] (nominal 0..25 mm behind, never > 2 mm ahead);
+    //  - box_tilt_deg: the box tilted from its pose at the push start above this
+    //    [deg] -- tipping instead of sliding (nominal <= 0.7 deg);
+    // each for box_persist_s, while the push flies (lag) / while the claw is on
+    // the handle or pushing (tilt). box_stale_s: no box sample for this long
+    // while those are armed [s] -- the two are blind without it.
+    // q3_min_deg (> 0 enables): q3 below this while on the handle / pushing --
+    // the buckle itself, whatever caused it (nominal >= 19 deg).
+    // All 0 = off (unchanged).
+    declare_parameter<double>("push_pull_guard_box_lag", 0.0);
+    declare_parameter<double>("push_pull_guard_box_tilt_deg", 0.0);
+    declare_parameter<double>("push_pull_guard_box_persist_s", 0.20);
+    declare_parameter<double>("push_pull_guard_box_stale_s", 0.50);
+    declare_parameter<double>("push_pull_guard_q3_min_deg", 0.0);
     declare_parameter<double>("push_pull_guard_force_n", 5.0);
     declare_parameter<double>("push_pull_guard_force_persist_s", 0.30);
+    // PATH FOLLOWING FOR THE TURN (2026-10-18; push_pull_turn_deg != 0 only):
+    // true = the turn is flown at a GOVERNED PROGRESS (ProgressGovernor) in
+    // place of the wall clock -- the same rigid rotation, its schedule slowed or
+    // held while the measurements say so. Every 100 Hz stream tick the rate
+    // target is the smallest of three channel factors, each 1 at or below its
+    // [soft, hard][0], 0 at or above [1], linear between:
+    //   lead  [deg]: the PLANNED rotation of the claw about the axis minus the
+    //         MEASURED valve's (the box body's yaw) -- the reference never runs
+    //         more than `hard` ahead of the real handle (a stuck or heavy
+    //         valve: the turn waits instead of loading the arm);
+    //   tilt  [deg]: the vehicle's tilt (PX4 attitude);
+    //   wrist [deg]: |q4 - q4 planned|, the wrist roll.
+    // Isaac 2026-10-18: in all six windowed failures the valve tracked the plan
+    // to <= 6 deg up to the trip, while tilt > 7 deg and |q4| > 15 deg came 2-7 s
+    // before it; the completed headless turns never exceed 6.4 / 14.3.
+    // A channel whose feed is older than stale_s holds (factor 0); [] or
+    // hard <= soft turns a channel off. bandwidth [rad/s]: the progress
+    // filter (4 stages); recover_s: the rate climbs 0 -> 1 no faster than
+    // this; hold_timeout_s > 0: a hold (rate < 0.02) that long ABORTS (the
+    // push-and-pull abort: release, climb, fold). Read when the push starts.
+    // false = the scheduled turn (unchanged).
+    declare_parameter<bool>("push_pull_follow", false);
+    // filter_s: every channel is low-passed (first order) before its factor
+    // -- the contact phase rings at ~1 Hz (the airframe's attitude mode; the
+    // lead jitters +-4 deg, the arm swings between its stops with it), and a
+    // governor chasing that ring would modulate the turn at the ring's
+    // frequency (pf_n1, 2026-10-18); the governor answers TRENDS: a valve
+    // falling behind, a growing tilt envelope, a wrist walking away.
+    declare_parameter<double>("push_pull_follow_filter_s", 1.0);
+    declare_parameter<std::vector<double>>("push_pull_follow_lead_deg", {6.0, 12.0});
+    declare_parameter<std::vector<double>>("push_pull_follow_tilt_deg", {7.0, 10.0});
+    declare_parameter<std::vector<double>>("push_pull_follow_wrist_deg", {15.0, 25.0});
+    declare_parameter<double>("push_pull_follow_stale_s", 0.3);
+    declare_parameter<double>("push_pull_follow_bandwidth", 4.0);
+    declare_parameter<double>("push_pull_follow_recover_s", 5.0);
+    declare_parameter<double>("push_pull_follow_hold_timeout_s", 0.0);
     declare_parameter<std::string>(
       "push_pull_force_topic", "fsc_autopilot_ros2/whole_body_direct_actuation/wb_control_debug");
     declare_parameter<double>("push_pull_capture_window", 0.5);
     declare_parameter<double>("push_pull_capture_max_spread", 0.02);
+    // (2026-10-19, the hardware box push) the box capture also refuses a FROZEN
+    // feed -- every position in the window bit-identical: the mocap processor
+    // republishing the last pose of a body it no longer tracks, with fresh
+    // stamps (10-09: 11 423 identical obj_0 samples in one flight) -- and a yaw
+    // varying by more than this [deg] over the window (an orientation flipping
+    // between two solutions; the push follows the box's yaw). <= 0: no yaw check.
+    declare_parameter<double>("push_pull_capture_max_yaw_spread_deg", 10.0);
 
     // --- PS4 teleoperation (2026-09-27) -----------------------------------
     // Rates are at FULL deflection and PHYSICAL; teleop_time_scale converts
@@ -969,6 +1112,8 @@ public:
           }
           onPlAbort(r);
         });
+      // the release-window fix (2026-10-17): the station calls it as it opens the gripper
+      pl_trigger(prefix + "/push_pull/release", [this](Trigger::Response::SharedPtr r) {onPlRelease(r);});
       for (int k = 0; k < kNumPushPullSteps; ++k) {
         pl_trigger(
           prefix + "/push_pull/" + pushPullStepName(k),
@@ -1190,11 +1335,15 @@ private:
         pl_at_handle_ = false;
         pl_contact_ = false;
         pl_guard_tripped_ = false;
+        pl_abort_keep_anchor_ = false;
+        pl_abort_anchor_due_.reset();
         ++pl_gen_;
         if (teleop_) {
           RCLCPP_WARN(get_logger(), "SAFETY -- PS4 teleoperation dropped.");
         }
         teleop_.reset();
+        if (plFollowing()) {plFollowEnd("left DIRECT");}
+        pl_follow_.reset();
         RCLCPP_INFO(get_logger(), "SAFETY -- planner silent, targets dropped.");
       }
     }
@@ -2065,6 +2214,7 @@ private:
     WbReference ref;
     bool finished = false;
     bool teleop_done = false;
+    bool follow_abort = false;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_) {return;}
@@ -2075,7 +2225,16 @@ private:
         logHold("late hold capture");
       }
       bool have_ref = false;
-      if (state_ == "EXECUTING" && plan_) {
+      if (state_ == "EXECUTING" && plan_ && plFollowing()) {
+        // the governed turn (push_pull_follow): evaluated at its progress
+        const double tau = plFollowTick(&follow_abort);
+        if (tau >= plan_->duration()) {
+          finished = true;
+        } else {
+          ref = plan_->evalScaled(tau, pl_follow_->gov.rates());
+          have_ref = true;
+        }
+      } else if (state_ == "EXECUTING" && plan_) {
         const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
         if (t >= plan_->duration()) {
           finished = true;
@@ -2084,6 +2243,7 @@ private:
           have_ref = true;
         }
       }
+      if (finished && plFollowing()) {plFollowEnd("complete");}
       if (finished && plUnloadStart()) {
         // the push flew to its end: the unload leg replaced it (still the push)
         finished = false;
@@ -2192,6 +2352,14 @@ private:
       publishStatus();
       publishBaseAnchor();
       publishTeleopNote("");
+    }
+    if (follow_abort) {
+      // the governed turn held past push_pull_follow_hold_timeout_s: the
+      // abort's path, outside the lock (it joins the planning worker)
+      auto resp = std::make_shared<Trigger::Response>();
+      onPlAbort(resp);
+      RCLCPP_ERROR(get_logger(), "push-and-pull PATH FOLLOWING: %s -- %s", pl_guard_reason_.c_str(),
+        resp->message.c_str());
     }
     publishRef(ref);
     // The arm reference, from the SAME sample the law gets, at the same rate.
@@ -4921,20 +5089,22 @@ private:
   }
 
   // ================================================== push-and-pull mode
-  // Five steps (push_pull.hpp), one button each on the arm GS's "Push & Pull"
-  // tab: go_to_start (the claw the safety margin straight above the box's
+  // Six steps (push_pull.hpp; five until 2026-10-16), one button each on the
+  // arm GS's "Box Pushing" / "Valve Turning" tabs: go_to_start (the claw the safety margin straight above the box's
   // handle, the nose along the push), ready (straight down onto the handle --
   // the GS opens the gripper first), push (the GS has CLOSED the gripper on
   // the handle: the law's phase flag is CONTACT (since the end of ready), the
   // claw stays world-held (push_pull_world_anchor_push), and the base slides
   // the box push_distance along the nose
   // with the arm held still), exit (the GS has OPENED the gripper: the phase
-  // flag back to free, straight up, arm home), go_to_land (a hover over the
-  // landing spot, turning the typed way round). The box is MEASURED (Get,
-  // mocap obj_0: its CG and yaw); the land point is typed and moved by Adjust.
-  // Every step re-plans from the CURRENT hold and executes as soon as it is
-  // planned; the steps go in order (go_to_land and go_to_start whenever the
-  // claw is off the handle).
+  // flag back to free, straight up, arm home), go_to_land_start (along the
+  // nose off the table, then an arc to Land Start, turning the typed way
+  // round), land (straight to the land hover). The box is MEASURED (Get,
+  // mocap obj_0: its CG and yaw); Land Start and the land point are typed and
+  // moved by Adjust. Every step re-plans from the CURRENT hold and executes as
+  // soon as it is planned; the steps go in order (go_to_start and
+  // go_to_land_start whenever the claw is off the handle, land after
+  // go_to_land_start).
   bool plConfig(PushPullConfig * c, std::string * err) const
   {
     c->home = home_pose_;
@@ -4950,9 +5120,11 @@ private:
     c->push_distance = get_parameter("push_pull_push_distance").as_double();
     c->push_time = get_parameter("push_pull_push_time_s").as_double();
     c->push_settle = get_parameter("push_pull_push_settle_s").as_double();
+    c->push_ramp = get_parameter("push_pull_push_ramp_s").as_double();
     c->exit_time = get_parameter("push_pull_exit_time_s").as_double();
     c->unload_time = get_parameter("push_pull_unload_time_s").as_double();
     c->unload_wait = get_parameter("push_pull_unload_wait_s").as_double();
+    c->turn_angle = get_parameter("push_pull_turn_deg").as_double() * M_PI / 180.0;
     c->fence.min_z = get_parameter("push_pull_fence_min_z").as_double();
     c->fence.max_z = get_parameter("push_pull_fence_max_z").as_double();
     const auto xy = get_parameter("push_pull_fence_xy").as_double_array();
@@ -4974,18 +5146,32 @@ private:
     c->table.y_min = tb[2];
     c->table.y_max = tb[3];
     c->table.z_top = tb[4];
+    const auto ob = get_parameter("push_pull_obstacle").as_double_array();
+    if (ob.size() != 5) {
+      *err = "push_pull_obstacle needs [x_min, x_max, y_min, y_max, z_top] (all 0 = none)";
+      return false;
+    }
+    c->obstacle.x_min = ob[0];
+    c->obstacle.x_max = ob[1];
+    c->obstacle.y_min = ob[2];
+    c->obstacle.y_max = ob[3];
+    c->obstacle.z_top = ob[4];
     c->table_clearance = get_parameter("push_pull_table_clearance").as_double();
     c->table_margin_xy = get_parameter("push_pull_table_margin_xy").as_double();
     c->gear_depth = get_parameter("push_pull_gear_depth").as_double();
     c->gear_radius = get_parameter("push_pull_gear_radius").as_double();
+    c->box_half_length = get_parameter("push_pull_box_half_length").as_double();
+    c->box_edge_margin = get_parameter("push_pull_box_edge_margin").as_double();
     return true;
   }
 
   // The goals' inputs: the captured box and the typed (Adjust-shifted) land
-  // hover. Called under the lock.
+  // hover and Land Start. Called under the lock.
   bool plTargets(PushPullTargets * t, std::string * err) const
   {
     if (!ppBase("push_pull_land", &t->land, err)) {return false;}
+    t->land_start_set = !get_parameter("push_pull_land_start").as_double_array().empty();
+    if (t->land_start_set && !ppBase("push_pull_land_start", &t->land_start, err)) {return false;}
     if (!pl_box_.has_value()) {
       *err = "Get the box first (" + (pl_box_topic_.empty()
         ? std::string("no push_pull_box_topic set") : "mocap " + pl_box_topic_) + ")";
@@ -5004,18 +5190,43 @@ private:
     static const char * const kGateOnly[] = {
       "push_pull_arrival_tol", "push_pull_leg_start_tol", "push_pull_adjust_max",
       "push_pull_abort_climb", "push_pull_abort_release_wait_s", "push_pull_guard_tilt_deg",
+      "push_pull_abort_from_measured", "push_pull_abort_back", "push_pull_abort_release_world_held",
       "push_pull_guard_persist_s", "push_pull_guard_force_n", "push_pull_guard_force_persist_s",
+      "push_pull_guard_box_lag", "push_pull_guard_box_tilt_deg", "push_pull_guard_box_persist_s",
+      "push_pull_guard_box_stale_s", "push_pull_guard_q3_min_deg",
       "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
       "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
       "push_pull_world_anchor_on_handle",
       "push_pull_contact_at_ready", "push_pull_contact_off_at_push_end",
       "push_pull_capture_window",
-      "push_pull_capture_max_spread", "push_pull_start_mark",
-      "push_pull_unload_avg_s", "push_pull_unload_max"};
+      "push_pull_capture_max_spread", "push_pull_capture_max_yaw_spread_deg", "push_pull_start_mark",
+      "push_pull_unload_avg_s", "push_pull_unload_max",
+      "push_pull_follow", "push_pull_follow_filter_s", "push_pull_follow_lead_deg", "push_pull_follow_tilt_deg",
+      "push_pull_follow_wrist_deg", "push_pull_follow_stale_s", "push_pull_follow_bandwidth",
+      "push_pull_follow_recover_s", "push_pull_follow_hold_timeout_s"};
     bool stale = false;
+    const rclcpp::Parameter * box_point = nullptr;
     for (const auto & p : ps) {
       const std::string & n = p.get_name();
       if (n.rfind("push_pull_", 0) != 0) {continue;}
+      if (n == "push_pull_box_point") {
+        // [] = not captured, else [x, y, z, yaw_deg], all finite (2026-10-16)
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
+          r.successful = false;
+          r.reason = n + " needs [x, y, z, yaw_deg], or [] for not captured";
+          return r;
+        }
+        if (!plBoxPointOk(p.as_double_array(), &r.reason)) {
+          r.successful = false;
+          return r;
+        }
+        // the capture's own write-back (Get) or a clear after it was dropped:
+        // nothing changes, the plan stays
+        if (plBoxPointIsCapture(p.as_double_array())) {continue;}
+        box_point = &p;
+        stale = true;
+        continue;
+      }
       if (n == "push_pull_box_topic" || n == "push_pull_contact_service" ||
         n == "push_pull_force_topic")
       {
@@ -5024,13 +5235,23 @@ private:
         return r;
       }
       size_t len = 0;
+      if (n == "push_pull_land_start") {
+        // [] = Land Start is the land pose, else [x, y, z, yaw_deg]
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (!p.as_double_array().empty() && p.as_double_array().size() != 4))
+        {
+          r.successful = false;
+          r.reason = n + " needs [x, y, z, yaw_deg], or [] for the land pose";
+          return r;
+        }
+      }
       if (n == "push_pull_land" || n == "push_pull_start_mark" || n == "push_pull_push_pose_deg" ||
         n == "push_pull_fence_xy")
       {
         len = 4;
       } else if (n == "push_pull_ee_offset") {
         len = 3;
-      } else if (n == "push_pull_table") {
+      } else if (n == "push_pull_table" || n == "push_pull_obstacle") {
         len = 5;
       }
       if (len > 0 && (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
@@ -5053,13 +5274,76 @@ private:
         r.reason = "a push-and-pull step is in flight -- edit once it holds";
         return r;
       }
+      if (box_point != nullptr && (pl_aborting_ || pl_abort_plan_)) {
+        r.successful = false;
+        r.reason = "an abort is in flight -- edit the box once it holds";
+        return r;
+      }
+      if (box_point != nullptr && pl_at_handle_) {
+        r.successful = false;
+        r.reason = "the box is in the gripper -- edit it before Ready, or after Exit";
+        return r;
+      }
+      // (2026-10-19) ANY plan-invalidating edit while the claw is on the handle:
+      // the plan would go, and with it Exit (it needs the plan) -- Plan and Reset
+      // are refused on the handle too, so ABORT would be the only way out with
+      // the jaws on the box. Gate-only keys (guards, tolerances) still pass.
+      if (pl_at_handle_) {
+        r.successful = false;
+        r.reason = "the claw is on the handle -- this edit would drop the plan; change it after Exit";
+        return r;
+      }
       if (pl_wp_.has_value() || pl_planning_) {
         RCLCPP_INFO(get_logger(), "push-and-pull: parameters changed -- the plan is stale, press Plan");
       }
+      // the box point IS the box capture (2026-10-16)
+      if (box_point != nullptr) {plSetBoxCapture(box_point->as_double_array());}
       plInvalidate();
       pl_params_dirty_ = true;   // published from the 10 Hz timer, once the values are set
     }
     return r;
+  }
+
+  // push_pull_box_point: [] (not captured) or [x, y, z, yaw_deg], finite.
+  static bool plBoxPointOk(const std::vector<double> & v, std::string * why)
+  {
+    if (!v.empty() && v.size() != 4) {
+      *why = "push_pull_box_point needs [x, y, z, yaw_deg], or [] for not captured (got " +
+        std::to_string(v.size()) + " numbers)";
+      return false;
+    }
+    for (double x : v) {
+      if (!std::isfinite(x)) {
+        *why = "push_pull_box_point has a non-finite value";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // True when the value says what the capture already holds (both empty, or
+  // the same pose to the micrometre / 1e-6 deg).
+  bool plBoxPointIsCapture(const std::vector<double> & v)
+  {
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    if (v.empty() || !pl_box_.has_value()) {return v.empty() && !pl_box_.has_value();}
+    const Vec3 & b = *pl_box_;
+    return std::abs(v[0] - b(0)) < 1e-6 && std::abs(v[1] - b(1)) < 1e-6 &&
+      std::abs(v[2] - b(2)) < 1e-6 &&
+      std::abs(v[3] - pl_box_yaw_.value_or(0.0) * 180.0 / M_PI) < 1e-6;
+  }
+
+  // The box capture from a (checked) push_pull_box_point value. Called under
+  // the lock (or from the constructor). The yaw is taken as typed.
+  void plSetBoxCapture(const std::vector<double> & v)
+  {
+    if (v.size() == 4) {
+      pl_box_ = Vec3{v[0], v[1], v[2]};
+      pl_box_yaw_ = v[3] * M_PI / 180.0;
+    } else {
+      pl_box_.reset();
+      pl_box_yaw_.reset();
+    }
   }
 
   void onPlMocap(const Mocap & msg)
@@ -5068,13 +5352,161 @@ private:
     if (!p.allFinite()) {return;}
     const auto & o = msg.pose.orientation;
     const double yaw = std::atan2(2.0 * (o.w * o.z + o.x * o.y), 1.0 - 2.0 * (o.y * o.y + o.z * o.z));
-    std::lock_guard<std::recursive_mutex> lk(lock_);
-    pl_mocap_.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0, 0.0});
-    while (pl_mocap_.size() > 1 &&
-      (secondsSince(pl_mocap_.front().t) > 2.0 || pl_mocap_.size() > 2000))
+    bool trip = false;
     {
-      pl_mocap_.pop_front();
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      pl_mocap_.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0, 0.0});
+      while (pl_mocap_.size() > 1 &&
+        (secondsSince(pl_mocap_.front().t) > 2.0 || pl_mocap_.size() > 2000))
+      {
+        pl_mocap_.pop_front();
+      }
+      const Eigen::Quaterniond qb(o.w, o.x, o.y, o.z);
+      if (std::abs(qb.norm() - 1.0) < 0.1) {trip = plBoxGuardCheck(p, qb.normalized().toRotationMatrix());}
     }
+    if (trip) {
+      auto resp = std::make_shared<Trigger::Response>();
+      onPlAbort(resp);
+      RCLCPP_ERROR(get_logger(), "push-and-pull SAFETY GUARD: %s -- %s", pl_guard_reason_.c_str(),
+        resp->message.c_str());
+    }
+  }
+
+  // THE BOX GUARDS (push_pull_guard_box_lag / _box_tilt_deg), with lock_
+  // held, on every box mocap sample: true = abort now (2026-10-16).
+  bool plBoxGuardCheck(const Vec3 & p, const Mat3 & R)
+  {
+    const double lag_lim = get_parameter("push_pull_guard_box_lag").as_double();
+    const double tilt_lim = get_parameter("push_pull_guard_box_tilt_deg").as_double();
+    const bool pushing = pl_flying_.has_value() && *pl_flying_ == kPlPush;
+    const bool engaged = mode_direct_ && hold_.has_value() && (pl_at_handle_ || pushing) &&
+      !pl_aborting_ && !pl_abort_plan_ && pl_wp_.has_value();
+    const bool executing = pushing && state_ == "EXECUTING" && plan_ && exec_t0_.has_value();
+    if (!engaged || (!(lag_lim > 0.0) && !(tilt_lim > 0.0))) {
+      pl_bg_lag_since_.reset();
+      pl_bg_tilt_since_.reset();
+      if (!pl_at_handle_ && !pushing) {pl_bg_box0_.reset();}
+      return false;
+    }
+    // the reference pose: the box when the claw first sat on the handle (its
+    // tilt) -- re-taken for the lag when the push starts executing
+    if (!pl_bg_box0_.has_value()) {
+      pl_bg_box0_ = p;
+      pl_bg_R0_ = R;
+    }
+    const double persist = get_parameter("push_pull_guard_box_persist_s").as_double();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    // tilt: the angle between the box's z axis now and at the reference
+    const Vec3 z0 = pl_bg_R0_.col(2), z1 = R.col(2);
+    pl_bg_tilt_ = std::acos(std::clamp(z0.dot(z1), -1.0, 1.0)) * 180.0 / M_PI;
+    if (tilt_lim > 0.0 && pl_bg_tilt_ > tilt_lim) {
+      if (!pl_bg_tilt_since_.has_value()) {pl_bg_tilt_since_ = Clock::now();}
+      if (secondsSince(pl_bg_tilt_since_) >= persist) {
+        m.precision(1);
+        m << "box tilted " << pl_bg_tilt_ << " deg > " << tilt_lim << " deg (tipping, not sliding)";
+        pl_guard_reason_ = m.str();
+        pl_guard_tripped_ = true;
+        pl_bg_tilt_since_.reset();
+        return true;
+      }
+    } else {
+      pl_bg_tilt_since_.reset();
+    }
+    // lag: the box against the PLANNED claw, along the push, while it flies
+    if (!(lag_lim > 0.0) || !executing || get_parameter("push_pull_turn_deg").as_double() != 0.0) {
+      pl_bg_lag_since_.reset();
+      return false;
+    }
+    if (!pl_bg_lag0_.has_value() || pl_bg_lag_gen_ != plan_gen_) {
+      pl_bg_lag0_ = p;
+      pl_bg_lag_gen_ = plan_gen_;
+    }
+    const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
+    const Vec3 plan = plan_->eval(std::min(t, plan_->duration())).r_ed -
+      plan_->eval(0.0).r_ed;
+    const double d = get_parameter("push_pull_push_distance").as_double();
+    const Vec3 u = (d < 0.0 ? -1.0 : 1.0) * pl_wp_->push_dir;
+    pl_bg_lag_ = plan.dot(u) - (p - *pl_bg_lag0_).dot(u);
+    if (std::abs(pl_bg_lag_) > lag_lim) {
+      if (!pl_bg_lag_since_.has_value()) {pl_bg_lag_since_ = Clock::now();}
+      if (secondsSince(pl_bg_lag_since_) >= persist) {
+        m.precision(0);
+        m << "the box is " << std::abs(pl_bg_lag_) * 1e3 << " mm " << (pl_bg_lag_ > 0.0 ? "BEHIND" : "AHEAD OF")
+          << " its plan (> " << lag_lim * 1e3 << " mm: " << (pl_bg_lag_ > 0.0 ? "jammed or too heavy" : "running away")
+          << ")";
+        pl_guard_reason_ = m.str();
+        pl_guard_tripped_ = true;
+        pl_bg_lag_since_.reset();
+        return true;
+      }
+    } else {
+      pl_bg_lag_since_.reset();
+    }
+    return false;
+  }
+
+  // The box feed and the arm's buckle (push_pull_guard_box_stale_s /
+  // _q3_min_deg), with lock_ held, from the 10 Hz tick: true = abort now.
+  bool plFeedGuardCheck()
+  {
+    const bool pushing = pl_flying_.has_value() && *pl_flying_ == kPlPush;
+    const bool engaged = mode_direct_ && hold_.has_value() && (pl_at_handle_ || pushing) &&
+      !pl_aborting_ && !pl_abort_plan_;
+    if (!engaged) {
+      pl_bg_q3_since_.reset();
+      return false;
+    }
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    const bool box_armed = get_parameter("push_pull_guard_box_lag").as_double() > 0.0 ||
+      get_parameter("push_pull_guard_box_tilt_deg").as_double() > 0.0;
+    const double stale = get_parameter("push_pull_guard_box_stale_s").as_double();
+    const double age = pl_mocap_.empty() ? 1e9 : secondsSince(pl_mocap_.back().t);
+    // A FROZEN feed counts as a silent one (2026-10-19, the hardware box push):
+    // the mocap processor republishes the last pose of a body it lost with fresh
+    // stamps (10-09: 11 423 identical obj_0 samples), so the age above never
+    // grows -- the time since the pose last CHANGED does. At least three
+    // bit-identical samples: a repeated VRPN frame (pairs, 2026-10-14) is not.
+    double frozen = 0.0;
+    if (pl_mocap_.size() >= 3) {
+      const Vec3 & last = pl_mocap_.back().p;
+      size_t n = 0;
+      auto first = pl_mocap_.back().t;
+      for (auto it = pl_mocap_.rbegin(); it != pl_mocap_.rend() && it->p == last; ++it) {
+        first = it->t;
+        ++n;
+      }
+      if (n >= 3) {frozen = secondsSince(first);}
+    }
+    if (box_armed && stale > 0.0 && std::max(age, frozen) > stale) {
+      m.precision(2);
+      m << "the box's mocap (" << pl_box_topic_ << ") " << (frozen > age ? "FROZEN" : "silent")
+        << " for " << std::min(std::max(age, frozen), 99.0)
+        << " s > " << stale << " s -- the box guards are blind";
+      pl_guard_reason_ = m.str();
+      pl_guard_tripped_ = true;
+      return true;
+    }
+    const double q3_lim = get_parameter("push_pull_guard_q3_min_deg").as_double();
+    if (q3_lim > 0.0 && q_meas_.has_value() && secondsSince(q_meas_time_) < 0.25) {
+      const double q3 = (*q_meas_)(2) * 180.0 / M_PI;
+      if (q3 < q3_lim) {
+        if (!pl_bg_q3_since_.has_value()) {pl_bg_q3_since_ = Clock::now();}
+        if (secondsSince(pl_bg_q3_since_) >= get_parameter("push_pull_guard_box_persist_s").as_double()) {
+          m.precision(1);
+          m << "q3 " << q3 << " deg < " << q3_lim << " deg (the arm buckling toward its "
+            "elbow-singular branch)";
+          pl_guard_reason_ = m.str();
+          pl_guard_tripped_ = true;
+          pl_bg_q3_since_.reset();
+          return true;
+        }
+      } else {
+        pl_bg_q3_since_.reset();
+      }
+    }
+    return false;
   }
 
   // The inputs changed: a plan made from the old ones must not be flown.
@@ -5138,10 +5570,12 @@ private:
       }
       const double window = get_parameter("push_pull_capture_window").as_double();
       std::vector<Vec3> pts;
+      std::vector<double> yaws;
       double ys = 0.0, yc = 0.0;
       for (const auto & s : pl_mocap_) {
         if (secondsSince(s.t) <= window) {
           pts.push_back(s.p);
+          yaws.push_back(s.yaw);
           ys += std::sin(s.yaw);
           yc += std::cos(s.yaw);
         }
@@ -5152,6 +5586,21 @@ private:
           << " s -- is the box tracked and broadcast?";
         resp->success = false;
         resp->message = m.str();
+        return;
+      }
+      // FROZEN (2026-10-19, as the pick-and-place capture since 2026-10-10): a
+      // tracked body jitters by tens of micrometres at least; identical samples
+      // are the mocap processor republishing the last pose of a body it lost
+      if (pts.size() >= 2 &&
+        std::all_of(pts.begin() + 1, pts.end(), [&pts](const Vec3 & p) {return p == pts.front();}))
+      {
+        m.precision(2);
+        m << "the box's pose is frozen -- the box is not tracked (" << pts.size()
+          << " identical samples from " << pl_box_topic_ << " in " << window
+          << " s: the mocap processor is republishing its last pose) -- NOT captured";
+        resp->success = false;
+        resp->message = m.str();
+        RCLCPP_WARN(get_logger(), "push-and-pull capture refused: %s", resp->message.c_str());
         return;
       }
       Vec3 mean = Vec3::Zero();
@@ -5170,7 +5619,41 @@ private:
         RCLCPP_WARN(get_logger(), "push-and-pull capture refused: %s", resp->message.c_str());
         return;
       }
+      // FLIPPING YAW (2026-10-19): the push and the box-on-table check follow
+      // the box's yaw, and the circular mean of two opposite headings is
+      // garbage. Spread about the first sample, wrapped (a steady yaw near
+      // +-180 deg reads small).
+      const double max_yaw = get_parameter("push_pull_capture_max_yaw_spread_deg").as_double();
+      double lo = 0.0, hi = 0.0;
+      for (double y : yaws) {
+        const double d = wrapPi(y - yaws.front());
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+      }
+      const double yaw_spread = (hi - lo) * 180.0 / M_PI;
+      if (max_yaw > 0.0 && yaw_spread > max_yaw) {
+        m.precision(0);
+        m << "the box's yaw varies by " << yaw_spread << " deg (> " << max_yaw << " deg) over "
+          << pts.size() << " samples from " << pl_box_topic_ << ": its orientation is flipping "
+             "between two solutions (or the box is turning) -- make the marker layout asymmetric, "
+             "or press Get again -- NOT captured";
+        resp->success = false;
+        resp->message = m.str();
+        RCLCPP_WARN(get_logger(), "push-and-pull capture refused: %s", resp->message.c_str());
+        return;
+      }
       const double yaw = std::atan2(ys, yc);   // circular mean: no wrap at +-180 deg
+      // the capture has a parameter twin (2026-10-16): write it -- onPlParams
+      // sets the capture from it and makes the plan stale, and the arm GS's
+      // Box boxes follow the parameter event
+      const auto res = set_parameters({rclcpp::Parameter("push_pull_box_point",
+            std::vector<double>{mean(0), mean(1), mean(2), yaw * 180.0 / M_PI})});
+      if (res.empty() || !res.front().successful) {
+        resp->success = false;
+        resp->message = "box NOT captured: push_pull_box_point not set" +
+          (res.empty() ? std::string() : ": " + res.front().reason);
+        return;
+      }
       pl_box_ = mean;
       pl_box_yaw_ = yaw;
       plInvalidate();
@@ -5227,8 +5710,9 @@ private:
         return;
       }
       std::vector<rclcpp::Parameter> moved;
-      for (const char * name : {"push_pull_start_mark", "push_pull_land"}) {
+      for (const char * name : {"push_pull_start_mark", "push_pull_land", "push_pull_land_start"}) {
         auto v = get_parameter(name).as_double_array();
+        if (v.empty() && std::string(name) == "push_pull_land_start") {continue;}   // = the land pose
         if (v.size() != 4) {
           resp->success = false;
           resp->message = std::string(name) + " needs 4 numbers -- not adjusted";
@@ -5328,16 +5812,26 @@ private:
             RCLCPP_WARN(get_logger(), "push-and-pull plan refused: %s", err.c_str());
           } else {
             pl_wp_ = wp;
+            pl_leave_wp_.reset();
             for (int k = 0; k < kNumPushPullSteps; ++k) {
               pl_T_[k] = steps[k]->duration();
               RCLCPP_INFO(
                 get_logger(), "push-and-pull %s: %s", pushPullStepName(k),
                 steps[k]->diag().summary.c_str());
             }
-            RCLCPP_INFO(
-              get_logger(), "push-and-pull planned: %.1f s of flight in five steps; the push slides "
-              "the box %.2f m along yaw %.1f deg.", whole->duration(), cfg.push_distance,
-              wp->drone_yaw * 180.0 / M_PI);
+            if (cfg.turn_angle != 0.0) {
+              RCLCPP_INFO(
+                get_logger(), "push-and-pull planned: %.1f s of flight in six steps; the push "
+                "TURNS the handle %.0f deg about the captured axis [%.3f, %.3f] in %.1f s, the "
+                "nose along yaw %.1f deg at the handle.", whole->duration(),
+                cfg.turn_angle * 180.0 / M_PI, wp->axis(0), wp->axis(1), cfg.push_time,
+                wp->drone_yaw * 180.0 / M_PI);
+            } else {
+              RCLCPP_INFO(
+                get_logger(), "push-and-pull planned: %.1f s of flight in six steps; the push slides "
+                "the box %.2f m along yaw %.1f deg.", whole->duration(), cfg.push_distance,
+                wp->drone_yaw * 180.0 / M_PI);
+            }
           }
         }
         publishPlStatus();
@@ -5345,7 +5839,7 @@ private:
         publishPlPaths(whole.get());
       });
     resp->success = true;
-    resp->message = "planning the five steps from the current hold -- the status reads READY when done";
+    resp->message = "planning the six steps from the current hold -- the status reads READY when done";
   }
 
   // What the Ready descent gates on (lock_ held), as the pick's: the claw's
@@ -5395,7 +5889,9 @@ private:
       } else if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
         err = std::string(pl_flying_.has_value() ? pushPullStepName(*pl_flying_) : "the abort") +
           " is in flight -- wait for it, or Abort";
-      } else if (!pl_wp_.has_value()) {
+      } else if (!pl_wp_.has_value() &&
+        !((s == kPlGoToLandStart || s == kPlLand) && pl_leave_wp_.has_value()))
+      {
         err = "not planned -- Get the box and press Plan";
       } else if (teleopActive()) {
         err = "PS4 teleoperation engaged -- disengage it first";
@@ -5409,8 +5905,14 @@ private:
         w << "the body is " << (*odom_p_ - hold_->x_b).norm() * 1e3 << " mm from its hold (> "
           << get_parameter("push_pull_leg_start_tol").as_double() * 1e3 << " mm) -- wait for it to settle";
         err = w.str();
-      } else if (s == kPlGoToStart || s == kPlGoToLand) {
+      } else if (s == kPlGoToStart || s == kPlGoToLandStart) {
         if (pl_at_handle_) {err = "the claw is on the handle -- Exit first";}
+      } else if (s == kPlLand) {
+        if (pl_at_handle_) {
+          err = "the claw is on the handle -- Exit first";
+        } else if (pl_completed_ != kPlGoToLandStart) {
+          err = "not at Land Start -- fly Go To Land Start first";
+        }
       } else if (s == kPlReady) {
         const double tol = get_parameter("push_pull_arrival_tol").as_double();
         if (pl_at_handle_) {
@@ -5444,7 +5946,7 @@ private:
         return;
       }
       from = *hold_;
-      wp = *pl_wp_;
+      wp = pl_wp_.has_value() ? *pl_wp_ : *pl_leave_wp_;   // leaving the table after an abort
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -5480,6 +5982,8 @@ private:
           requestContact(true);
           pl_unloaded_ = false;
           pl_ey_buf_.clear();
+          pl_bg_box0_.reset();       // the box guards: taken when the push executes
+          pl_bg_lag_since_.reset();
           break;
         case kPlExit:
           // the gripper is open: no contact any more
@@ -5506,13 +6010,16 @@ private:
               traj = planPushPullReady(*vehicle_, *planner_, opts, cfg, wp, from, trim);
               break;
             case kPlPush:
-              traj = planPushPullPush(*vehicle_, *planner_, opts, cfg, from);
+              traj = planPushPullPush(*vehicle_, *planner_, opts, cfg, from, wp.axis);
               break;
             case kPlExit:
               traj = planPushPullExit(*vehicle_, *planner_, opts, cfg, from);
               break;
+            case kPlGoToLandStart:
+              traj = planPushPullGoToLandStart(*vehicle_, *planner_, opts, cfg, wp, from);
+              break;
             default:
-              traj = planPushPullGoToLand(*vehicle_, *planner_, opts, cfg, wp, from);
+              traj = planPushPullLand(*vehicle_, *planner_, opts, cfg, wp, from);
           }
         } catch (const std::exception & e) {
           err = e.what();
@@ -5534,6 +6041,10 @@ private:
             RCLCPP_INFO(
               get_logger(), "push-and-pull %s: executing -- %s", pushPullStepName(s),
               traj->diag().summary.c_str());
+            pl_follow_.reset();
+            if (s == kPlPush && cfg.turn_angle != 0.0 && get_parameter("push_pull_follow").as_bool()) {
+              plFollowStart(traj, wp.axis, cfg.turn_angle);
+            }
           }
         }
         publishStatus();
@@ -5549,8 +6060,18 @@ private:
       m << " (goal trimmed by [" << trim(0) * 1e3 << ", " << trim(1) * 1e3 << ", " << trim(2) * 1e3
         << "] mm, the hover error)";
     } else if (s == kPlPush) {
-      m << " -- CONTACT phase on, the push holds " << cfg.push_settle << " s, then slides "
-        << cfg.push_distance << " m";
+      m << " -- CONTACT phase on, the push holds " << cfg.push_settle << " s, then ";
+      if (cfg.turn_angle != 0.0) {
+        m << "turns " << std::setprecision(0) << cfg.turn_angle * 180.0 / M_PI
+          << " deg about the axis in " << std::setprecision(1) << cfg.push_time << " s";
+      } else if (cfg.push_ramp > 0.0 && cfg.push_time > 2.0 * cfg.push_ramp) {
+        m << "slides " << std::setprecision(2) << cfg.push_distance << " m at a constant "
+          << std::setprecision(1) << std::abs(cfg.push_distance) / (cfg.push_time - cfg.push_ramp) * 1e3
+          << " mm/s (" << cfg.push_ramp << " s ramps, " << cfg.push_time << " s)";
+      } else {
+        m << "slides " << std::setprecision(2) << cfg.push_distance << " m in "
+          << std::setprecision(1) << cfg.push_time << " s";
+      }
     }
     resp->success = true;
     resp->message = m.str();
@@ -5667,6 +6188,51 @@ private:
     RCLCPP_INFO(get_logger(), "push-and-pull: %s complete.", pushPullStepName(s));
   }
 
+  // RELEASE (2026-10-17, the release-window fix). Called by the station (and the
+  // sim driver) the moment it commands the gripper OPEN after a push, BEFORE
+  // Exit. From the Push press the claw is held in the ROOM
+  // (push_pull_world_anchor_push) -- right while the jaws clamp a box held by
+  // static friction. Once the jaws open nothing holds the claw, and a
+  // world-held open claw makes the arm absorb all of the base's post-release
+  // drift: in the 2026-10-17 results campaign the base drifted 27 mm back in
+  // 1 s, q2 reached its +45 deg stop, q3 went through 0 into the
+  // elbow-singular branch and the vehicle flipped before the q3 guard could
+  // act. Release hands the EE reference back to the CoM anchor (blended over
+  // the whole-body node's wb_ee_anchor_blend_s) and the phase flag to free. It
+  // moves nothing: Exit -- started by the station when the jaws report open --
+  // climbs and folds. Refused unless the claw is on the handle (after the push,
+  // or after Ready when the grasp found nothing) and nothing is flying -- so a
+  // station that opens the gripper only on success never opens it mid-push.
+  // Without a call, Exit switches the anchor as before.
+  void onPlRelease(Trigger::Response::SharedPtr resp)
+  {
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    std::string err;
+    if (!mode_direct_ || !hold_.has_value()) {
+      err = "not in whole-body DIRECT";
+    } else if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
+      err = std::string(pl_flying_.has_value() ? pushPullStepName(*pl_flying_) : "the abort") +
+        " is in flight -- wait for it, or Abort";
+    } else if (!pl_at_handle_) {
+      err = "nothing to release -- the claw is not on the handle";
+    }
+    if (!err.empty()) {
+      resp->success = false;
+      resp->message = "release: " + err;
+      RCLCPP_WARN(get_logger(), "push-and-pull %s", resp->message.c_str());
+      return;
+    }
+    const bool was_world = pp_anchor_world_;
+    requestContact(false);
+    restoreAnchor();
+    resp->success = true;
+    resp->message = std::string("release: ") +
+      (was_world ? "the claw's reference now follows the vehicle (CoM anchor, blended)"
+                 : "the claw's reference already follows the vehicle (CoM anchor)") +
+      " and the contact phase is free -- open the gripper; Exit when it reports open";
+    RCLCPP_INFO(get_logger(), "push-and-pull %s", resp->message.c_str());
+  }
+
   // ABORT: the GS opens the gripper on the same press; here the phase flag
   // goes back to free, the EE reference to the CoM, and the vehicle -- held
   // still push_pull_abort_release_wait_s first when the claw is on the handle,
@@ -5683,6 +6249,8 @@ private:
     unsigned gen = 0;
     bool cut = false;
     double climb = 0.0, wait = 0.0;
+    Vec3 retreat = Vec3::Zero();
+    bool measured = false;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !hold_.has_value()) {
@@ -5695,6 +6263,14 @@ private:
         resp->message = "already aborting";
         return;
       }
+      // (2026-10-19) another mode's leg in flight (a push-and-pull step cannot
+      // start under one, so nothing of this mode is engaged): its own ABORT
+      // releases its payload the right way -- this one would cut its leg here
+      if (otherModeBusy()) {
+        resp->success = false;
+        resp->message = "another mode is flying -- use that tab's ABORT";
+        return;
+      }
       std::string err;
       if (!plConfig(&cfg, &err)) {
         // an abort is never refused for a configuration error: the defaults
@@ -5705,9 +6281,12 @@ private:
       from = *hold_;
       std::optional<WbReference> cut_ref;
       if (state_ == "EXECUTING" && plan_ && exec_t0_.has_value()) {
-        const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
+        // the governed turn is cut where its PROGRESS is, not its clock
+        const double t = plFollowing() ? pl_follow_->gov.tau() :
+          std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
         cut_ref = plan_->eval(std::min(t, plan_->duration()));
       }
+      if (plFollowing()) {plFollowEnd("aborted");}
       if (cut_ref.has_value()) {
         const WbReference & ref = *cut_ref;
         from.phi = std::atan2(ref.b1_d(1), ref.b1_d(0));
@@ -5719,6 +6298,23 @@ private:
       }
       const bool touched = pl_at_handle_ ||
         (pl_flying_.has_value() && (*pl_flying_ == kPlReady || *pl_flying_ == kPlPush));
+      // on the box: hold where the vehicle IS, and retreat against the push (2026-10-16)
+      if (touched && get_parameter("push_pull_abort_from_measured").as_bool()) {
+        if (auto m = restFromMeasurements()) {
+          from = *m;
+          cut = false;
+          measured = true;
+        }
+      }
+      const bool turning = get_parameter("push_pull_turn_deg").as_double() != 0.0;
+      if (touched && pl_wp_.has_value()) {
+        const double d = get_parameter("push_pull_push_distance").as_double();
+        // a turn retreats along the nose it has NOW (the hold it aborts from)
+        // the nose at model heading phi (push_pull.cpp's noseOf: the arm's forward axis)
+        const Vec3 dir = turning ? Vec3{-std::sin(from.phi), std::cos(from.phi), 0.0} : pl_wp_->push_dir;
+        retreat = -get_parameter("push_pull_abort_back").as_double() *
+          (turning ? 1.0 : (d < 0.0 ? -1.0 : 1.0)) * dir;
+      }
       climb = std::max(0.0, std::min(
           get_parameter("push_pull_abort_climb").as_double(), cfg.fence.max_z - from.x_b(2)));
       wait = touched ? get_parameter("push_pull_abort_release_wait_s").as_double() : 0.0;
@@ -5739,23 +6335,30 @@ private:
       pl_aborted_ = true;
       pl_aborting_ = true;
       requestContact(false);
-      restoreAnchor();
+      // the free-handle abort keeps the claw world-held until the release wait ends
+      // (the worker schedules the hand-back when the abort plan starts)
+      pl_abort_keep_anchor_ = touched && wait > 0.0 && pp_anchor_world_ &&
+        get_parameter("push_pull_abort_release_world_held").as_bool();
+      pl_abort_anchor_due_.reset();
+      if (!pl_abort_keep_anchor_) {restoreAnchor();}
       if (touched) {
+        if (pl_wp_.has_value()) {pl_leave_wp_ = pl_wp_;}   // Go To Land Start stays flyable
         pl_box_.reset();
         pl_box_yaw_.reset();
         plInvalidate();
         pl_completed_ = -1;
+        pl_box_point_clear_ = true;   // its parameter twin: cleared from the 10 Hz timer
       }
     }
     publishStatus();
     publishPlStatus();
     publishPlInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, from, cfg, opts, gen, climb, wait]() {
+    worker_ = std::thread([this, from, cfg, opts, gen, climb, wait, retreat]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
-          traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait);
+          traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -5768,11 +6371,16 @@ private:
             infeasible_reason_ = "abort: " + err;
             pl_error_ = "abort refused: " + err + " -- holding where it was cut";
             RCLCPP_ERROR(get_logger(), "push-and-pull ABORT could not plan: %s", err.c_str());
+            if (pl_abort_keep_anchor_) {pl_abort_keep_anchor_ = false; restoreAnchor();}
           } else {
             plan_ = traj;
             pl_abort_plan_ = traj;
             exec_t0_ = Clock::now();
             state_ = "EXECUTING";
+            if (pl_abort_keep_anchor_) {
+              pl_abort_anchor_due_ = *exec_t0_ + std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double>(wait));
+            }
             RCLCPP_WARN(get_logger(), "push-and-pull ABORT: %s", traj->diag().summary.c_str());
           }
         }
@@ -5783,8 +6391,10 @@ private:
     std::ostringstream m;
     m.setf(std::ios::fixed);
     m.precision(2);
-    m << "ABORT: contact off, " << (wait > 0.0 ? "release " : "") << "then up " << climb << " m and the "
-      << "arm home, from " << (cut ? "the point the step was cut at" : "the hold");
+    m << "ABORT: contact off, " << (wait > 0.0 ? (pl_abort_keep_anchor_ ? "release (claw world-held) " : "release ") : "")
+      << (retreat.norm() > 1e-3 ? "back " : "") << "then up " << climb << " m and the "
+      << "arm home, from " << (measured ? "the MEASURED pose" : cut ? "the point the step was cut at" : "the hold");
+    if (retreat.norm() > 1e-3) {m << " (back " << retreat.norm() << " m against the push first)";}
     resp->success = true;
     resp->message = m.str();
     RCLCPP_WARN(get_logger(), "push-and-pull: %s", resp->message.c_str());
@@ -5815,6 +6425,188 @@ private:
     publishPlStatus();
     publishPlInfo();
     publishPlPaths(nullptr);
+  }
+
+  // ---------------------------------------------------- PATH FOLLOWING
+  // (2026-10-18, push_pull_follow). All under lock_.
+  bool plFollowing() const
+  {
+    return pl_follow_.has_value() && plan_ && pl_follow_->plan == plan_;
+  }
+
+  // The push of a TURN starts executing with push_pull_follow true.
+  void plFollowStart(const std::shared_ptr<const Trajectory> & traj, const Vec3 & axis, double angle)
+  {
+    if (!traj->timeScalable()) {
+      RCLCPP_WARN(get_logger(), "push-and-pull PATH FOLLOWING: this push cannot be time-scaled -- "
+        "the turn flies its schedule");
+      return;
+    }
+    PlFollow f;
+    f.plan = traj;
+    f.gov.setup(get_parameter("push_pull_follow_bandwidth").as_double(),
+      get_parameter("push_pull_follow_recover_s").as_double());
+    f.t0 = f.last = f.last_log = Clock::now();
+    f.axis = axis;
+    f.sign = angle >= 0.0 ? 1.0 : -1.0;
+    const WbReference r0 = traj->eval(0.0);
+    f.alpha0 = f.alpha_prev = std::atan2(r0.r_ed(1) - axis(1), r0.r_ed(0) - axis(0));
+    auto pair = [this](const char * name, double * out) {
+        const auto v = get_parameter(name).as_double_array();
+        out[0] = v.size() >= 2 ? v[0] : 0.0;
+        out[1] = v.size() >= 2 ? v[1] : 0.0;
+      };
+    pair("push_pull_follow_lead_deg", f.lead);
+    pair("push_pull_follow_tilt_deg", f.tilt);
+    pair("push_pull_follow_wrist_deg", f.wrist);
+    f.stale_s = get_parameter("push_pull_follow_stale_s").as_double();
+    f.hold_timeout_s = get_parameter("push_pull_follow_hold_timeout_s").as_double();
+    f.filter_s = get_parameter("push_pull_follow_filter_s").as_double();
+    if (!pl_mocap_.empty() && secondsSince(pl_mocap_.back().t) < f.stale_s) {
+      f.yaw0 = pl_mocap_.back().yaw;
+      f.have_yaw0 = true;
+    }
+    pl_follow_ = f;
+    auto on = [](const double * c) {return c[1] > c[0] && c[1] > 0.0;};
+    RCLCPP_INFO(get_logger(), "push-and-pull PATH FOLLOWING on: the turn flies at a governed "
+      "progress -- lead %s, tilt %s, wrist %s (soft/hard deg, low-passed %.1f s), progress filter "
+      "%.1f rad/s, recover %.1f s, hold timeout %s; the valve's yaw %s",
+      on(f.lead) ? (fmt1(f.lead[0]) + "/" + fmt1(f.lead[1])).c_str() : "off",
+      on(f.tilt) ? (fmt1(f.tilt[0]) + "/" + fmt1(f.tilt[1])).c_str() : "off",
+      on(f.wrist) ? (fmt1(f.wrist[0]) + "/" + fmt1(f.wrist[1])).c_str() : "off",
+      f.filter_s, get_parameter("push_pull_follow_bandwidth").as_double(),
+      get_parameter("push_pull_follow_recover_s").as_double(),
+      f.hold_timeout_s > 0.0 ? (fmt1(f.hold_timeout_s) + " s").c_str() : "off",
+      f.have_yaw0 ? "captured" : "NOT FRESH (the lead channel holds until it is)");
+  }
+
+  static std::string fmt1(double x)
+  {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(1);
+    m << x;
+    return m.str();
+  }
+
+  // One stream tick of the governed turn: returns the progress to evaluate
+  // the plan at; *abort = true once a hold outlasts the timeout.
+  double plFollowTick(bool * abort)
+  {
+    PlFollow & f = *pl_follow_;
+    const auto now = Clock::now();
+    const double dt = std::clamp(std::chrono::duration<double>(now - f.last).count(), 0.0, 0.05);
+    f.last = now;
+    // the planned claw's rotation about the axis where the progress is now
+    const WbReference r = plan_->eval(f.gov.tau());
+    const double a = std::atan2(r.r_ed(1) - f.axis(1), r.r_ed(0) - f.axis(0));
+    f.alpha += wrapPi(a - f.alpha_prev);
+    f.alpha_prev = a;
+    auto on = [](const double * c) {return c[1] > c[0] && c[1] > 0.0;};
+    // first-order low-pass of a channel, seeded by its first sample
+    const double lp = f.filter_s > 0.0 ? 1.0 - std::exp(-dt / f.filter_s) : 1.0;
+    auto low = [&f, lp](int k, double * state, double x) {
+        if (!f.f_init[k]) {*state = x; f.f_init[k] = true;} else {*state += lp * (x - *state);}
+      };
+    bool stale = false;
+    double fac[3] = {1.0, 1.0, 1.0};
+    // lead: the plan ahead of the measured valve, the measured rotation taken
+    // nearest the plan (no unwrapping to drift); a one-tick jump above 30 deg
+    // is an orientation flip of the mocap body, not motion: kept out
+    if (on(f.lead)) {
+      if (pl_mocap_.empty() || secondsSince(pl_mocap_.back().t) > f.stale_s) {
+        stale = true;
+      } else {
+        const double yaw = pl_mocap_.back().yaw;
+        if (!f.have_yaw0) {
+          f.yaw0 = yaw - f.alpha;   // a late feed: taken to sit on the plan
+          f.have_yaw0 = true;
+        }
+        const double lead = f.sign * wrapPi(f.alpha - (yaw - f.yaw0)) * 180.0 / M_PI;
+        if (f.have_lead && std::abs(lead - f.lead_prev) > 30.0) {
+          ++f.flips;
+        } else {
+          f.lead_prev = lead;
+          f.have_lead = true;
+        }
+        low(0, &f.e_lead, f.lead_prev);
+        fac[0] = followFactor(f.e_lead, f.lead[0], f.lead[1]);
+      }
+    }
+    if (on(f.tilt)) {
+      if (!att_R_.has_value() || secondsSince(att_time_) > f.stale_s) {
+        stale = true;
+      } else {
+        low(1, &f.e_tilt, std::acos(std::clamp((*att_R_)(2, 2), -1.0, 1.0)) * 180.0 / M_PI);
+        fac[1] = followFactor(f.e_tilt, f.tilt[0], f.tilt[1]);
+      }
+    }
+    if (on(f.wrist)) {
+      if (!q_meas_.has_value() || secondsSince(q_meas_time_) > f.stale_s) {
+        stale = true;
+      } else {
+        low(2, &f.e_wrist, std::abs((*q_meas_)(3) - r.q_d(3)) * 180.0 / M_PI);
+        fac[2] = followFactor(f.e_wrist, f.wrist[0], f.wrist[1]);
+      }
+    }
+    double target = std::min({fac[0], fac[1], fac[2]});
+    int limit = 0;
+    if (stale) {
+      target = 0.0;
+      limit = 4;
+    } else if (target < 0.999) {
+      limit = 1 + static_cast<int>(std::min_element(fac, fac + 3) - fac);
+    }
+    f.limit = limit;
+    f.gov.step(target, dt);
+    const double rate = f.gov.rate();
+    f.min_rate = std::min(f.min_rate, rate);
+    if (rate < 0.95) {f.slowed_s += dt;}
+    f.worst[0] = std::max(f.worst[0], f.e_lead);
+    f.worst[1] = std::max(f.worst[1], f.e_tilt);
+    f.worst[2] = std::max(f.worst[2], f.e_wrist);
+    static const char * const kName[] = {"none", "lead", "tilt", "wrist", "a stale feed"};
+    if (rate < 0.02 && target < 0.02) {
+      f.held_s += dt;
+      if (!f.hold_since.has_value()) {f.hold_since = now;}
+      if (f.hold_timeout_s > 0.0 && secondsSince(f.hold_since) >= f.hold_timeout_s &&
+        !pl_aborting_ && !pl_abort_plan_)
+      {
+        std::ostringstream m;
+        m.setf(std::ios::fixed);
+        m.precision(1);
+        m << "the turn held " << secondsSince(f.hold_since) << " s on " << kName[limit]
+          << " (lead " << f.e_lead << ", tilt " << f.e_tilt << ", wrist " << f.e_wrist
+          << " deg) -- releasing";
+        pl_guard_reason_ = m.str();
+        pl_guard_tripped_ = true;
+        f.hold_since.reset();
+        *abort = true;
+      }
+    } else {
+      f.hold_since.reset();
+    }
+    const bool edge = (limit != 0) != (f.logged_limit > 0) || (limit != 0 && limit != f.logged_limit);
+    if (edge || (rate < 0.95 && secondsSince(f.last_log) >= 2.0)) {
+      f.logged_limit = limit;
+      f.last_log = now;
+      RCLCPP_INFO(get_logger(), "push-and-pull PATH FOLLOWING: rate %.2f, progress %.1f s, %s "
+        "(lead %.1f, tilt %.1f, wrist %.1f deg)", rate, f.gov.tau(),
+        limit == 0 ? "on schedule" : (std::string("limited by ") + kName[limit]).c_str(),
+        f.e_lead, f.e_tilt, f.e_wrist);
+    }
+    return f.gov.tau();
+  }
+
+  void plFollowEnd(const char * why)
+  {
+    if (!pl_follow_.has_value()) {return;}
+    const PlFollow & f = *pl_follow_;
+    RCLCPP_INFO(get_logger(), "push-and-pull PATH FOLLOWING %s: %.1f s for a %.1f s schedule "
+      "(progress %.1f s) -- rate min %.2f, slowed %.1f s, held %.1f s; worst lead %.1f, tilt %.1f, "
+      "wrist %.1f deg; %d valve flip(s) rejected", why, secondsSince(f.t0), f.plan->duration(),
+      f.gov.tau(), f.min_rate, f.slowed_s, f.held_s, f.worst[0], f.worst[1], f.worst[2], f.flips);
+    pl_follow_.reset();
   }
 
   // The tilt guard (push_pull_guard_tilt_deg), with lock_ held: true = abort now.
@@ -5918,13 +6710,40 @@ private:
   // [0] step, [1] 1 = claw target / 0 = base target, [2] |error| [m],
   // [3..5] error target - measured, world [m], [6] tolerance [m], [7] within,
   // [8] holding (no step in flight, HOLD), [9] the claw's error along the
-  // box's x axis -- the jaws' closing axis [m], [10] the low-passed |F_hat| [N].
+  // box's x axis -- the jaws' closing axis [m], [10] the low-passed |F_hat| [N],
+  // [11] the box's lag behind its plan [m], [12] the box's tilt [deg] (2026-10-16).
+  // PATH FOLLOWING (2026-10-18): [13] 1 = the governed turn in flight, [14] its
+  // progress rate (0..1), [15] progress [s], [16] lead [deg], [17] tilt [deg],
+  // [18] wrist excursion [deg], [19] the limiting channel (0 none, 1 lead,
+  // 2 tilt, 3 wrist, 4 a stale feed), [20] time held so far [s].
   void publishPlArrival()
   {
+    if (pl_box_point_clear_.exchange(false)) {
+      // the capture was dropped (an abort that touched the box): [] is then a
+      // no-op in onPlParams, which only tells the arm GS the box row is empty
+      set_parameters({rclcpp::Parameter("push_pull_box_point", std::vector<double>{})});
+    }
     if (pl_params_dirty_.exchange(false)) {
       publishPlStatus();
       publishPlInfo();
       publishPlPaths(nullptr);
+    }
+    bool feed_trip = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      feed_trip = plFeedGuardCheck();
+      if (pl_abort_anchor_due_.has_value() && Clock::now() >= *pl_abort_anchor_due_) {
+        pl_abort_anchor_due_.reset();
+        pl_abort_keep_anchor_ = false;
+        restoreAnchor();
+        RCLCPP_INFO(get_logger(), "push-and-pull ABORT: released -- the claw back to the CoM anchor");
+      }
+    }
+    if (feed_trip) {
+      auto resp = std::make_shared<Trigger::Response>();
+      onPlAbort(resp);
+      RCLCPP_ERROR(get_logger(), "push-and-pull SAFETY GUARD: %s -- %s", pl_guard_reason_.c_str(),
+        resp->message.c_str());
     }
     Float64MultiArray m;
     bool changed = false;
@@ -5937,7 +6756,8 @@ private:
       Mat3 r0;
       if (!odomPair(&x_b, &r0) || odomAge() > kOdomFreshS || !q_meas_.has_value()) {return;}
       const bool claw = s == kPlGoToStart || s == kPlReady || s == kPlPush;
-      Vec3 meas = x_b, want = s == kPlExit ? pl_wp_->exited.x_b : pl_wp_->land.x_b;
+      Vec3 meas = x_b, want = s == kPlExit ? pl_wp_->exited.x_b :
+        s == kPlGoToLandStart ? pl_wp_->land_start.x_b : pl_wp_->land.x_b;
       if (claw) {
         Vec3 r0e;
         armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
@@ -5965,8 +6785,15 @@ private:
       const double yb = pl_box_yaw_.value_or(0.0);
       const double axis = std::cos(yb) * e(0) + std::sin(yb) * e(1);
       pl_last_err_ = e.norm();
+      // [11] the box's lag behind its plan [m], [12] its tilt [deg] (the box
+      // guards, 2026-10-16; 0 until they are armed)
       m.data = {static_cast<double>(s), claw ? 1.0 : 0.0, e.norm(), e(0), e(1), e(2), tol,
-        within ? 1.0 : 0.0, holding ? 1.0 : 0.0, axis, pl_force_f_.norm()};
+        within ? 1.0 : 0.0, holding ? 1.0 : 0.0, axis, pl_force_f_.norm(), pl_bg_lag_, pl_bg_tilt_};
+      const bool fl = plFollowing();
+      m.data.insert(m.data.end(), {fl ? 1.0 : 0.0, fl ? pl_follow_->gov.rate() : 1.0,
+          fl ? pl_follow_->gov.tau() : 0.0, fl ? pl_follow_->e_lead : 0.0,
+          fl ? pl_follow_->e_tilt : 0.0, fl ? pl_follow_->e_wrist : 0.0,
+          fl ? static_cast<double>(pl_follow_->limit) : 0.0, fl ? pl_follow_->held_s : 0.0});
       if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding)) {
         pl_within_ = within;
         pl_err_step_ = s;
@@ -6001,12 +6828,19 @@ private:
         m << "INFEASIBLE: " << pl_error_;
       } else if (pl_aborted_) {
         m << "ABORTED" << guard << " -- holding higher, arm home, contact off; "
-          << (!pl_wp_.has_value() ? "Get the box and press Plan" : "re-fly go_to_start, or go_to_land");
+          << (pl_wp_.has_value() ? "re-fly go_to_start, or go_to_land_start"
+              : pl_leave_wp_.has_value() ? "go_to_land_start to leave the table, or Get the box and press Plan"
+              : "Get the box and press Plan");
+      } else if (!pl_wp_.has_value() && pl_leave_wp_.has_value() && pl_completed_ >= kPlGoToLandStart) {
+        // leaving the table after an abort (2026-10-16): the cleared plan's Land Start / Land
+        m << (pl_completed_ >= kPlLand ? std::string("COMPLETE -- touch down with SAFETY -> land")
+                                       : std::string("DONE go_to_land_start next=land"))
+          << " (off the table after the abort)";
       } else if (!pl_wp_.has_value()) {
         PushPullTargets t;
         std::string err;
         m << "NOT PLANNED: " << (plTargets(&t, &err) ? std::string("press Plan") : err);
-      } else if (pl_completed_ >= kPlGoToLand) {
+      } else if (pl_completed_ >= kPlLand) {
         m << "COMPLETE -- touch down with SAFETY -> land";
       } else if (pl_completed_ < 0) {
         m << "READY next=go_to_start";
@@ -6028,15 +6862,21 @@ private:
     pl_status_pub_->publish(msg);
   }
 
-  // [0..2] Adjust offset [m], [3] reserved (0), [4] planned, [5] last step
-  // completed (-1 none), [6] step in flight (-1 none), [7] arrival tolerance
-  // [m], [8..12] each step's planned duration [s], [13] box captured (0 / 1),
-  // [14..17] the box x, y, z [m], yaw [deg], [18..52] per step [goal base x,
-  // y, z, actual yaw deg, claw x, y, z], [53] the claw on the handle (0 / 1),
-  // [54] the contact phase requested (0 / 1), [55] the world-held claw
-  // requested (0 / 1), [56] the push distance [m], [57] the low-passed |F_hat|
-  // [N], [58] the drone's yaw at the box [deg], [59] the descent trim of the
-  // last Ready [m, norm]. NaN where there is nothing.
+  // With N = kNumPushPullSteps (6 since 2026-10-16, was 5 -- every index from
+  // [13] moved): [0..2] Adjust offset [m], [3] 1 = Go To Land Start / Land are
+  // flyable WITHOUT a plan (after an abort that touched the box, 2026-10-16), [4] planned, [5]
+  // last step completed (-1 none), [6] step in flight (-1 none), [7] arrival
+  // tolerance [m], [8 .. 7+N] each step's planned duration [s], [8+N] box
+  // captured (0 / 1), [9+N .. 12+N] the box x, y, z [m], yaw [deg],
+  // [13+N + 7k ..] per step k [goal base x, y, z, actual yaw deg, claw x, y,
+  // z], then [13+8N] the claw on the handle (0 / 1), [14+8N] the contact
+  // phase requested (0 / 1), [15+8N] the world-held claw requested (0 / 1),
+  // [16+8N] the push distance [m], [17+8N] the low-passed |F_hat| [N],
+  // [18+8N] the drone's yaw at the box [deg], [19+8N] the descent trim of the
+  // last Ready [m, norm], [20+8N] the turn angle [deg]. N = 6: T [8..13], box
+  // [14] + [15..18], goals [19..60], [61] at handle, [62] contact, [63] world,
+  // [64] distance, [65] |F|, [66] drone yaw, [67] trim, [68] turn; 69 values.
+  // NaN where there is nothing.
   void publishPlInfo()
   {
     Float64MultiArray m;
@@ -6044,7 +6884,8 @@ private:
       std::lock_guard<std::recursive_mutex> lk(lock_);
       const double nan = std::numeric_limits<double>::quiet_NaN();
       const bool planned = pl_wp_.has_value();
-      m.data = {pl_offset_(0), pl_offset_(1), pl_offset_(2), 0.0, planned ? 1.0 : 0.0,
+      m.data = {pl_offset_(0), pl_offset_(1), pl_offset_(2),
+        (!planned && pl_leave_wp_.has_value()) ? 1.0 : 0.0, planned ? 1.0 : 0.0,
         static_cast<double>(pl_completed_),
         pl_flying_.has_value() ? static_cast<double>(*pl_flying_) : -1.0,
         get_parameter("push_pull_arrival_tol").as_double()};
@@ -6062,7 +6903,8 @@ private:
         }
         const PushPullWaypoints & w = *pl_wp_;
         const RestSpec & g = k == kPlGoToStart ? w.approach : k == kPlReady ? w.grasp :
-          k == kPlPush ? w.pushed : k == kPlExit ? w.exited : w.land;
+          k == kPlPush ? w.pushed : k == kPlExit ? w.exited :
+          k == kPlGoToLandStart ? w.land_start : w.land;
         const Vec3 e = clawOf(*vehicle_, g);
         m.data.insert(
           m.data.end(), {g.x_b(0), g.x_b(1), g.x_b(2), (g.phi + 0.5 * M_PI) * 180.0 / M_PI,
@@ -6075,6 +6917,8 @@ private:
       m.data.push_back(pl_force_f_.norm());
       m.data.push_back(planned ? pl_wp_->drone_yaw * 180.0 / M_PI : nan);
       m.data.push_back(pl_trim_.norm());
+      // [20+8N] the turn angle [deg] (0 = a straight push), 2026-10-15
+      m.data.push_back(get_parameter("push_pull_turn_deg").as_double());
     }
     pl_info_pub_->publish(m);
   }
@@ -6280,10 +7124,44 @@ private:
   // push-and-pull mode (push_pull.hpp)
   std::string pl_box_topic_;                    // the box's mocap body
   std::deque<PpSample> pl_mocap_;
+  // PATH FOLLOWING (2026-10-18, push_pull_follow): the governed turn in flight
+  struct PlFollow
+  {
+    std::shared_ptr<const Trajectory> plan;   // the push plan it governs
+    ProgressGovernor gov;
+    Clock::time_point t0, last;
+    Vec3 axis{Vec3::Zero()};
+    double sign{1.0};          // the turn's direction
+    double alpha0{0.0};        // the planned claw's bearing about the axis at tau = 0
+    double alpha{0.0};         // the planned rotation so far [rad] (unwrapped)
+    double alpha_prev{0.0};
+    double yaw0{0.0};          // the valve's yaw at the start [rad]
+    bool have_yaw0{false};
+    double lead_prev{0.0};
+    bool have_lead{false};
+    int flips{0};              // valve samples rejected as orientation flips
+    double lead[2]{0.0, 0.0}, tilt[2]{0.0, 0.0}, wrist[2]{0.0, 0.0};   // [soft, hard] [deg]
+    double stale_s{0.3}, hold_timeout_s{0.0}, filter_s{1.0};
+    double e_lead{0.0}, e_tilt{0.0}, e_wrist{0.0};   // the channels now, low-passed [deg]
+    bool f_init[3]{false, false, false};
+    int limit{0};              // 0 none, 1 lead, 2 tilt, 3 wrist, 4 stale
+    double held_s{0.0}, slowed_s{0.0}, min_rate{1.0};
+    double worst[3]{0.0, 0.0, 0.0};
+    std::optional<Clock::time_point> hold_since;
+    int logged_limit{-1};
+    Clock::time_point last_log;
+  };
+  std::optional<PlFollow> pl_follow_;
   std::optional<Vec3> pl_box_;                  // captured box CG ...
   std::optional<double> pl_box_yaw_;            // ... and yaw [rad]
   Vec3 pl_offset_{Vec3::Zero()};                // the last Adjust shift
   std::optional<PushPullWaypoints> pl_wp_;      // set by Plan
+  // the plan an abort that touched the box cleared, kept ONLY for leaving the table
+  // (2026-10-16): Go To Land Start / Land need its Land Start, land point and push
+  // heading, none of which a moved box makes stale -- re-planning the whole mission
+  // from a box already pushed part-way can be refused (the box-on-table check), which
+  // left the vehicle hovering beside the table with no planned way off it
+  std::optional<PushPullWaypoints> pl_leave_wp_;
   std::array<double, kNumPushPullSteps> pl_T_{};
   bool pl_planning_{false};
   std::string pl_error_;
@@ -6294,12 +7172,22 @@ private:
   bool pl_aborting_{false};                     // the abort being planned
   bool pl_aborted_{false};                      // until the next push-and-pull action
   double pl_abort_climb_{0.0};
+  bool pl_abort_keep_anchor_{false};                         // abort_release_world_held in force
+  std::optional<Clock::time_point> pl_abort_anchor_due_;     // when the claw goes back to the CoM
   std::shared_ptr<Trajectory> pl_abort_plan_;   // the abort in flight
   bool pl_contact_{false};                      // the contact phase flag requested
   bool pl_guard_armed_{true}, pl_guard_tripped_{false};
   std::optional<Clock::time_point> pl_guard_since_;
   std::string pl_guard_reason_;
   Vec3 pl_force_f_{Vec3::Zero()};               // the low-passed F_hat [N]
+  // the box guards (2026-10-16): the box's pose when the push started
+  // executing, and each condition's since-time
+  std::optional<Vec3> pl_bg_box0_;
+  Mat3 pl_bg_R0_{Mat3::Identity()};
+  std::optional<Clock::time_point> pl_bg_lag_since_, pl_bg_tilt_since_, pl_bg_q3_since_;
+  std::optional<Vec3> pl_bg_lag0_;               // the box when the push started executing
+  unsigned pl_bg_lag_gen_{0};
+  double pl_bg_lag_{0.0}, pl_bg_tilt_{0.0};      // the last values (for the info line)
   std::optional<Clock::time_point> pl_force_t_, pl_force_since_;
   std::deque<std::pair<Clock::time_point, Vec3>> pl_trim_buf_;   // claw error holding above
   std::deque<std::pair<Clock::time_point, Vec3>> pl_ey_buf_;     // the law's e_y in the push
@@ -6311,6 +7199,7 @@ private:
   unsigned pl_gen_{0};
   std::thread pl_worker_;
   std::atomic<bool> pl_params_dirty_{false};
+  std::atomic<bool> pl_box_point_clear_{false};   ///< clear push_pull_box_point (box dropped)
   rclcpp::Client<SetBool>::SharedPtr contact_cli_;
   OnSetParametersCallbackHandle::SharedPtr pl_param_cb_;
 
