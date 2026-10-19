@@ -808,7 +808,8 @@ public:
     declare_parameter<bool>("push_pull_abort_release_world_held", false);
     // SAFETY GUARDS -> ABORT: the tilt (PX4 attitude) above this for that
     // long; the task force the whole-body node reads (wb_control_debug,
-    // low-passed) above this for that long while in contact. 0 disables.
+    // low-passed) above this for that long while the claw is on the handle or
+    // the push flies (2026-10-19; was: in the contact phase only). 0 disables.
     declare_parameter<double>("push_pull_guard_tilt_deg", 15.0);
     declare_parameter<double>("push_pull_guard_persist_s", 0.10);
     // THE BOX GUARDS (2026-10-16, the box-pushing campaign's worst cases,
@@ -1495,7 +1496,22 @@ private:
       att_R_ = kRIE * r_ned * kRBV;
       att_time_ = Clock::now();
       trip = guardCheck();
-      pl_trip = !trip && plGuardCheck();
+      // (2026-10-19) the push-and-pull guard is evaluated on its own: it used to run only when
+      // the pick-and-place guard had not tripped, and that one counts as engaged after ANY
+      // pick mission of this planner run (pp_completed_ persists). Both tripping on one tick:
+      // the mode with the claw on the handle (or flying) aborts, the other is reset.
+      pl_trip = plGuardCheck();
+      if (trip && pl_trip) {
+        if (pl_flying_.has_value() || pl_at_handle_) {
+          trip = false;
+          pp_guard_tripped_ = false;
+          pp_guard_armed_ = true;
+        } else {
+          pl_trip = false;
+          pl_guard_tripped_ = false;
+          pl_guard_armed_ = true;
+        }
+      }
     }
     if (pl_trip) {
       auto resp = std::make_shared<Trigger::Response>();
@@ -5489,6 +5505,18 @@ private:
       return true;
     }
     const double q3_lim = get_parameter("push_pull_guard_q3_min_deg").as_double();
+    // (2026-10-19) the q3 guard needs the arm's joint states; silent for box_stale_s while it
+    // is armed and the claw is on the handle, it is blind -- the same response as a silent box
+    // feed (it used to skip its check without a word)
+    const double q_age = q_meas_.has_value() ? secondsSince(q_meas_time_) : 1e9;
+    if (q3_lim > 0.0 && stale > 0.0 && q_age > stale) {
+      m.precision(2);
+      m << "the arm's joint states silent for " << std::min(q_age, 99.0) << " s > " << stale
+        << " s -- the q3 guard is blind";
+      pl_guard_reason_ = m.str();
+      pl_guard_tripped_ = true;
+      return true;
+    }
     if (q3_lim > 0.0 && q_meas_.has_value() && secondsSince(q_meas_time_) < 0.25) {
       const double q3 = (*q_meas_)(2) * 180.0 / M_PI;
       if (q3 < q3_lim) {
@@ -6644,7 +6672,7 @@ private:
   // THE PUSH-FORCE GUARD (2026-10-03): the whole-body node's own reading of
   // the task force (wb_control_debug [97..99], the 4-D attribution's raw F_hat,
   // world [N]) low-passed at kPlForceOmega; above push_pull_guard_force_n for
-  // push_pull_guard_force_persist_s while the claw is on the handle in CONTACT
+  // push_pull_guard_force_persist_s while the claw is on the handle
   // -- the box jammed, or the vehicle drifting against the clamp -- the same
   // response as ABORT. The bench's along-arm capacity is ~6 N (interaction
   // campaign, 2026-09-27); the box's friction is ~1.5 N.
@@ -6674,7 +6702,13 @@ private:
       const double a = std::exp(-kPlForceOmega * dt);
       pl_force_f_ = a * pl_force_f_ + (1.0 - a) * F;
       const double limit = get_parameter("push_pull_guard_force_n").as_double();
-      const bool armed = limit > 0.0 && mode_direct_ && pl_contact_ &&
+      // (2026-10-19) armed for the WHOLE time the claw is on the handle, not only in the law's
+      // contact phase: the contact flag is free before the Push press and after the push ends
+      // (push_pull_contact_off_at_push_end), and the jaws are on the fin in both -- the hold
+      // until Exit had no force guard at all. Isaac, 51 completed missions, the reading held
+      // for 0.3 s (this filter): before Push <= 1.06 N, the push <= 2.57 N, the hold after it
+      // <= 1.87 N, the exit <= 1.05 N, all far below the 5 N limit.
+      const bool armed = limit > 0.0 && mode_direct_ &&
         (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush)) &&
         !pl_aborting_ && !pl_abort_plan_;
       if (!armed || pl_force_f_.norm() <= limit) {

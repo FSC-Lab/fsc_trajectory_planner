@@ -25,6 +25,10 @@ set_ee_anchor_com services that record what the planner asks for.
       anchor is requested and CONTACT off, nothing moves
   [7] exit: CONTACT off; straight up the margin, then the arm home
   [8] go_to_land: the heading turns 270 deg CLOCKWISE; COMPLETE
+  [9b] (2026-10-19) the force guard is armed on the handle before the Push press too
+       (the contact flag still free): 6 N -> ABORTING
+  [9c] (2026-10-19) the arm's joint states going silent on the handle (the q3 guard
+       blind) -> ABORTING
   [9] again with the force guard: 6 N on the task-force feed while pushing ->
       ABORTING (SAFETY GUARD) -> contact off, a release hold, the climb, the
       arm home -> the box capture and the plan dropped
@@ -158,6 +162,7 @@ class Rig(Node):
         self.q = HOME.copy()
         self.box = BOX.copy()
         self.force = np.zeros(3)
+        self.js_on = True          # [9c] stops the joint states
         self.rng = np.random.default_rng(0)
         self.create_timer(0.02, self.feed)
         self.create_timer(0.004, self.feed_force)    # the node's 250 Hz debug
@@ -181,11 +186,12 @@ class Rig(Node):
         ned = 0.5 * math.pi - self.yaw
         a.q = [math.cos(0.5 * ned), 0.0, 0.0, math.sin(0.5 * ned)]
         self.att.publish(a)
-        j = JointState()
-        j.name = ["joint1", "joint2", "joint3", "joint4"]
-        j.position = list(map(float, self.q))
-        j.velocity = [0.0] * 4
-        self.js.publish(j)
+        if self.js_on:
+            j = JointState()
+            j.name = ["joint1", "joint2", "joint3", "joint4"]
+            j.position = list(map(float, self.q))
+            j.velocity = [0.0] * 4
+            self.js.publish(j)
         m = Mocap()
         noisy = self.box + self.rng.normal(0.0, 0.0005, 3)
         m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, noisy)
@@ -277,7 +283,8 @@ def heading_deg(m):
 def main():
     rclpy.init()
     rig = Rig()
-    threading.Thread(target=rclpy.spin, args=(rig,), daemon=True).start()
+    th = threading.Thread(target=rclpy.spin, args=(rig,), daemon=True)
+    th.start()
     log = tempfile.NamedTemporaryFile("w+", prefix="push_pull_node_", suffix=".log", delete=False)
     gov = subprocess.Popen(GOV_CMD, stdout=log, stderr=subprocess.STDOUT, text=True,
                            start_new_session=True)
@@ -496,6 +503,57 @@ def main():
         assert rig.info[4] == 0.0 and rig.info[I_BOX_VALID] == 0.0, "plan / capture kept after a touched abort"
         print(f"[9] abort held {hold_s:.2f} s for the release, climbed, arm home; {rig.pl_status}")
 
+        def land_abort():
+            # the perfect plant on the abort's end hold: from the MEASURED pose (where the
+            # rig sat), 0.03 m back against the push (the nose is -y: back is +y), 0.30 m up,
+            # the arm home (push_pull_abort_from_measured / _abort_back / _abort_climb)
+            rig.odom_xyz = rig.odom_xyz + np.array([0.0, 0.03, 0.30])
+            rig.q = HOME.copy()
+            rig.yaw = -0.5 * math.pi
+            time.sleep(0.3)
+
+        def back_on_handle(tag):
+            r = call(rig, "reset")
+            assert r.success, r.message
+            rig.box = BOX.copy()
+            time.sleep(0.6)
+            assert call(rig, "capture_box").success
+            assert call(rig, "plan").success
+            wait(lambda: rig.pl_status.startswith("READY"), 20, f"READY ({tag})")
+            fly(rig, 0)
+            time.sleep(0.4)
+            fly(rig, 1)
+            wait(lambda: rig.pl_status.startswith("DONE ready"), 5, f"on the handle ({tag})")
+
+        def abort_done(tag):
+            wait(lambda: rig.status.startswith("EXECUTING"), 10, f"abort executing ({tag})")
+            T = float(rig.status.split("T=")[1].rstrip("s"))
+            wait(lambda: rig.status == "HOLD", T + 20, f"abort complete ({tag})")
+            wait(lambda: rig.pl_status.startswith("ABORTED"), 5, f"ABORTED ({tag})")
+            land_abort()
+
+        # [9b] the force guard on the handle BEFORE the Push press (contact still free)
+        land_abort()                       # [9]'s abort
+        back_on_handle("9b")
+        assert not rig.contact_calls or rig.contact_calls[-1] is False, rig.contact_calls
+        time.sleep(0.5)
+        assert rig.pl_status.startswith("DONE ready"), rig.pl_status    # no trip at 0 N
+        rig.force = np.array([0.0, 6.0, 0.0])
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "force guard before the push")
+        assert "push force" in rig.pl_status, rig.pl_status
+        rig.force = np.zeros(3)
+        print(f"[9b] {rig.pl_status}")
+        abort_done("9b")
+
+        # [9c] the arm's joint states going silent on the handle
+        back_on_handle("9c")
+        rig.js_on = False
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "joint-feed guard")
+        assert "joint states silent" in rig.pl_status, rig.pl_status
+        rig.js_on = True
+        print(f"[9c] {rig.pl_status}")
+        abort_done("9c")
+
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))
         wait(lambda: rig.pl_status == "NOT IN DIRECT", 5, "NOT IN DIRECT")
@@ -517,8 +575,10 @@ def main():
             except ProcessLookupError:
                 pass
         print(f"(node log: {log.name})")
-        rig.destroy_node()
+        # stop the spin thread BEFORE the node it spins goes (the other order could
+        # abort the interpreter after ALL PASS: "terminate called ...")
         rclpy.shutdown()
+        th.join(timeout=5)
 
 
 if __name__ == "__main__":
