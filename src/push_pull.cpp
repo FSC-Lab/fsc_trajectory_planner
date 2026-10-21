@@ -605,6 +605,17 @@ std::unique_ptr<Trajectory> planPushPullPush(
       << " s) must be less than half the push time (" << T << " s)";
     throw std::runtime_error(m.str());
   }
+  // (2026-10-21 review) the flat planner clamps a leg's duration to T_max without
+  // saying so: a slower push would fly faster than the time Plan and the GS show
+  if (!turn && !cruise && T > opts.T_max) {
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m << std::setprecision(2) << "push: " << std::abs(c.push_distance) << " m at "
+      << std::setprecision(1) << c.push_speed * 1e3 << " mm/s takes " << T
+      << " s, longer than the planner's t_max (" << opts.T_max
+      << " s) -- raise push_pull_push_mean_speed or shorten the Push Distance";
+    throw std::runtime_error(m.str());
+  }
   return step(v, c, "push", [&]() -> std::unique_ptr<Trajectory> {
       std::vector<std::shared_ptr<const Trajectory>> segs;
       if (c.push_settle > 0.0) {

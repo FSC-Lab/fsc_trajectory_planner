@@ -826,4 +826,18 @@ TEST(PushPull, PushTimeComesFromTheMeanSpeed)
       EXPECT_NE(std::string(e.what()).find("push_pull_push_mean_speed"), std::string::npos) << e.what();
     }
   }
+  // (2026-10-21 review) slower than T_max: refused, never silently flown at T_max
+  PlanOptions o;
+  o.T_max = 40.0;
+  c.push_distance = 0.40;
+  c.push_speed = 0.008;   // 50 s
+  try {
+    planPushPullPush(*v, *planner, o, c, wp.grasp);
+    FAIL() << "a 50 s push was planned against T_max 40 s";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("t_max"), std::string::npos) << e.what();
+  }
+  c.push_speed = 0.0105;  // 38.1 s: inside, flown at its own time
+  EXPECT_NEAR(planPushPullPush(*v, *planner, o, c, wp.grasp)->duration(),
+    c.push_settle + 0.40 / 0.0105, 1e-6);
 }
