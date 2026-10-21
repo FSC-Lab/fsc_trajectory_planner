@@ -52,6 +52,7 @@ PushPullConfig config(const VehicleModel & v)
   c.table.y_max = 0.50;
   c.table.z_top = 0.80;
   c.fence.max_z = 2.2;
+  c.push_speed = c.push_distance / 12.0;   // 0.50 m in 12 s (2026-10-21: the speed sets the time)
   return c;
 }
 
@@ -110,7 +111,7 @@ TEST(PushPull, PushHoldsTheArmAndHeadingAndMovesAlongTheNose)
   const PushPullWaypoints wp = pushPullWaypoints(*v, c, scene());
   const auto traj = planPushPullPush(*v, *planner, PlanOptions{}, c, wp.grasp);
 
-  EXPECT_GE(traj->duration(), c.push_settle + c.push_time - 1e-9);
+  EXPECT_GE(traj->duration(), c.push_settle + pushPullPushTime(c) - 1e-9);
   const WbReference r0 = traj->eval(0.0);
   const Vec3 claw0 = r0.r_ed;
   double max_dq = 0.0, max_dpsi = 0.0, max_dz = 0.0, max_lat = 0.0, max_speed = 0.0;
@@ -149,12 +150,13 @@ TEST(PushPull, PushCanCruiseAtConstantSpeed)
   const auto v = makeVehicleModel("t650_aerial_manipulator");
   const auto planner = makePlanner("bspline");
   PushPullConfig c = config(*v);
-  c.push_time = 20.0;
+  c.push_speed = c.push_distance / 20.0;   // 20 s
   c.push_ramp = 3.0;
   const PushPullWaypoints wp = pushPullWaypoints(*v, c, scene());
   const auto traj = planPushPullPush(*v, *planner, PlanOptions{}, c, wp.grasp);
-  const double V = c.push_distance / (c.push_time - c.push_ramp);
-  const double t0 = c.push_settle, t1 = t0 + c.push_time;
+  const double T = pushPullPushTime(c);
+  const double V = c.push_distance / (T - c.push_ramp);
+  const double t0 = c.push_settle, t1 = t0 + T;
   EXPECT_NEAR(traj->duration(), t1, 1e-9);
   const Vec3 nose = wp.push_dir;
   const WbReference r0 = traj->eval(0.0);
@@ -786,4 +788,42 @@ TEST(PushPull, FollowFactorRampsBetweenSoftAndHard)
   EXPECT_EQ(followFactor(99.0, 4.0, 8.0), 0.0);
   EXPECT_EQ(followFactor(99.0, 0.0, 0.0), 1.0);   // channel off
   EXPECT_EQ(followFactor(std::nan(""), 4.0, 8.0), 0.0);   // unknown = hold
+}
+
+// THE PUSH SPEED (2026-10-21, user): a straight push lasts max(|d| / v, floor) --
+// the mean speed is its one source (push_time is a turn's only); no speed = the
+// push refused; the floor holds a short push to a gentle move; a pull takes |d|.
+TEST(PushPull, PushTimeComesFromTheMeanSpeed)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PushPullConfig c = config(*v);
+  c.push_distance = 0.10;
+  c.push_speed = 0.017;
+  c.push_time = 99.0;   // a turn's: must not matter
+  EXPECT_NEAR(pushPullPushTime(c), 0.10 / 0.017, 1e-12);
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, scene());
+  const auto traj = planPushPullPush(*v, *planner, PlanOptions{}, c, wp.grasp);
+  EXPECT_NEAR(traj->duration(), c.push_settle + 0.10 / 0.017, 1e-6);
+  EXPECT_LT((traj->goalRest().x_b - wp.pushed.x_b).norm(), 1e-9);
+  // the floor
+  c.push_min_time = 8.0;
+  EXPECT_NEAR(pushPullPushTime(c), 8.0, 1e-12);
+  EXPECT_NEAR(planPushPullPush(*v, *planner, PlanOptions{}, c, wp.grasp)->duration(),
+    c.push_settle + 8.0, 1e-6);
+  c.push_min_time = 0.0;
+  // a pull: the same time for |d|
+  c.push_distance = -0.10;
+  EXPECT_NEAR(pushPullPushTime(c), 0.10 / 0.017, 1e-12);
+  // not set: refused, with the key named
+  c.push_distance = 0.10;
+  for (const double bad : {0.0, -0.01, std::nan("")}) {
+    c.push_speed = bad;
+    try {
+      planPushPullPush(*v, *planner, PlanOptions{}, c, wp.grasp);
+      FAIL() << "a push with speed " << bad << " was planned";
+    } catch (const std::runtime_error & e) {
+      EXPECT_NE(std::string(e.what()).find("push_pull_push_mean_speed"), std::string::npos) << e.what();
+    }
+  }
 }

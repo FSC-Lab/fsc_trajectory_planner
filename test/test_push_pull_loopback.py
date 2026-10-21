@@ -32,6 +32,10 @@ set_ee_anchor_com services that record what the planner asks for.
   [9] again with the force guard: 6 N on the task-force feed while pushing ->
       ABORTING (SAFETY GUARD) -> contact off, a release hold, the climb, the
       arm home -> the box capture and the plan dropped
+  [9d] (2026-10-21) the raw-mocap guard: BRIDGING on the handle aborts nothing,
+       CONFIRMED aborts (release, climb, arm home), then 'HOVERING on EKF2' and every
+       step / Plan waits for the mocap; the status recovers when the mocap does
+  [9e] the guard's own status silent: steps refused
   [10] SAFETY silences the stream
 
 Run with a scratch install first on the path and a private ROS domain:
@@ -65,6 +69,7 @@ BOX_TOPIC = "/pl_rig/obj_0/mocap"
 FORCE_TOPIC = "/pl_rig/wb_control_debug"
 CONTACT_SRV = "/pl_rig/set_contact"
 ANCHOR_SRV = "/pl_rig/set_ee_anchor_com"
+GUARD_TOPIC = "/pl_rig/mocap_guard"        # the estimator's raw-mocap guard (2026-10-21)
 YAML = os.environ.get("PL_YAML", os.path.expanduser(
     "~/ros2_ws/src/fsc_autopilot_ros2/config/"
     "params_single_aerial_manipulator_whole_body_l1_4d_direct_actuation_t650_sim_box_pushing.yaml"))
@@ -74,6 +79,7 @@ GOV_CMD = ["ros2", "run", "fsc_trajectory_planner", "whole_body_trajectory_plann
            "-p", f"push_pull_force_topic:={FORCE_TOPIC}",
            "-p", f"push_pull_contact_service:={CONTACT_SRV}",
            "-p", f"pick_place_anchor_service:={ANCHOR_SRV}",
+           "-p", f"push_pull_mocap_guard_topic:={GUARD_TOPIC}",
            # the rig is a PERFECT plant: no trim to measure
            "-p", "push_pull_descent_trim:=false",
            # ... and its box is a fixed mocap pose that never moves with the claw,
@@ -105,23 +111,29 @@ PUSH_POSE = np.radians(_yaml_list("push_pull_push_pose_deg"))
 LATCHED = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
 STEPS = ["go_to_start", "ready", "push", "exit", "go_to_land_start", "land"]   # six since 2026-10-16
-BOX = np.array([1.275, 0.25, 0.85])          # the scene's box, on the moved table
 EE_OFFSET = _yaml_list("push_pull_ee_offset")
 APPROACH_DZ = _yaml_num("push_pull_approach_dz", 0.20)
 APPROACH_BACK = _yaml_num("push_pull_approach_back", 0.0)
 EXIT_DZ = _yaml_num("push_pull_exit_dz", 0.0) or APPROACH_DZ
 TABLE = _yaml_list("push_pull_table")
+# the scene's box on the table's centre line (2026-10-21: from the yaml's table, not a
+# constant -- the layout moved 0.60 m back; it was x 1.275)
+BOX = np.array([0.5 * (TABLE[0] + TABLE[1]), 0.25, 0.85])
 WORLD_ANCHOR_PUSH = _yaml_bool("push_pull_world_anchor_push", True)
 WORLD_ANCHOR_READY = _yaml_bool("push_pull_world_anchor_ready", True)
 WORLD_ANCHOR_ON_HANDLE = _yaml_bool("push_pull_world_anchor_on_handle", False)
 CONTACT_OFF_AT_PUSH_END = _yaml_bool("push_pull_contact_off_at_push_end", False)
-# the push's profile (2026-10-17): > 0 = the cruise at push_distance / (push_time - ramp)
-PUSH_TIME = _yaml_num("push_pull_push_time_s", 12.0)
+# the push's profile (2026-10-17): > 0 = the cruise at push_distance / (T - ramp)
 PUSH_RAMP = _yaml_num("push_pull_push_ramp_s", 0.0)
 PUSH_DIST = _yaml_num("push_pull_push_distance", 0.50)
+# 2026-10-21: a straight push's time is the yaml's mean speed's, max(|d| / v, floor)
+PUSH_SPEED = _yaml_num("push_pull_push_mean_speed", 0.0)
+PUSH_MIN_TIME = _yaml_num("push_pull_push_min_time_s", 0.0)
+PUSH_TIME = max(abs(PUSH_DIST) / PUSH_SPEED, PUSH_MIN_TIME) if PUSH_SPEED > 0.0 else float("nan")
 # push_pull/info with six steps: goals at [19 + 7k], at handle [61], contact [62], drone yaw [66]
 I_BOX_VALID, I_GOAL, I_AT_HANDLE, I_CONTACT, I_DRONE_YAW = 14, 19, 61, 62, 66
-OFFSET = np.array([0.10, -0.07])             # the start mark, as the scene spawns
+OFFSET = np.array([0.10, -0.07])             # the spawn's shift from the start mark, as the scene spawns
+START = _yaml_list("push_pull_start_mark")[:2]   # 2026-10-21: (-0.60, 0); (0, 0) before
 
 
 class Rig(Node):
@@ -137,6 +149,7 @@ class Rig(Node):
         self.js = self.create_publisher(JointState, "fsc_open_manipulator/joint_states", 10)
         self.box_pub = self.create_publisher(Mocap, BOX_TOPIC, 10)
         self.force_pub = self.create_publisher(Float32MultiArray, FORCE_TOPIC, 10)
+        self.guard_pub = self.create_publisher(Float64MultiArray, GUARD_TOPIC, 10)
         self.status = self.pl_status = self.info = self.arrival = None
         self.refs = []
         self.contact_calls, self.anchor_calls = [], []
@@ -157,12 +170,14 @@ class Rig(Node):
                     for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort", "release"]}
         self.params = self.create_client(SetParameters, "whole_body_trajectory_planner/set_parameters")
         self.getp = self.create_client(GetParameters, "whole_body_trajectory_planner/get_parameters")
-        self.odom_xyz = np.array([OFFSET[0], OFFSET[1], 0.0])
+        self.odom_xyz = np.array([*(START + OFFSET), 0.0])
         self.yaw = 0.0
         self.q = HOME.copy()
         self.box = BOX.copy()
         self.force = np.zeros(3)
         self.js_on = True          # [9c] stops the joint states
+        self.mg = [0.0, 0.0, 0.01]  # [9d] the mocap guard: state, cause, age
+        self.mg_on = True          # [9e] stops it
         self.rng = np.random.default_rng(0)
         self.create_timer(0.02, self.feed)
         self.create_timer(0.004, self.feed_force)    # the node's 250 Hz debug
@@ -197,6 +212,10 @@ class Rig(Node):
         m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, noisy)
         m.pose.orientation.w = 1.0
         self.box_pub.publish(m)
+        if self.mg_on:
+            g = Float64MultiArray()
+            g.data = list(map(float, self.mg)) + [0.0] * 13
+            self.guard_pub.publish(g)
 
     def feed_force(self):
         data = [0.0] * 115
@@ -309,7 +328,7 @@ def main():
         print(f"[1] adjust: {r.message if not r.success else ''} land {land.round(3).tolist()}")
 
         # [2] DIRECT at the hover; Plan before Get refused; Get; Plan
-        rig.odom_xyz = np.array([OFFSET[0], OFFSET[1], 1.0])
+        rig.odom_xyz = np.array([*(START + OFFSET), 1.0])
         time.sleep(0.3)
         rig.mode.publish(String(data="DIRECT"))
         wait(lambda: rig.status == "HOLD", 10, "DIRECT hold")
@@ -393,7 +412,7 @@ def main():
         h_dev = max(abs((heading_deg(m) - h0 + 180) % 360 - 180) for m in refs)
         y = [m.r_ed.y for m in refs]
         assert q_dev < 1e-6 and h_dev < 1e-4, (q_dev, h_dev)
-        assert abs((y[-1] - y[0]) + 0.50) < 2e-3, (y[0], y[-1])
+        assert abs((y[-1] - y[0]) + PUSH_DIST) < 2e-3, (y[0], y[-1])
         settle = [m for t_, m in zip(range(len(refs)), refs)][:100]   # the first 1.0 s at 100 Hz
         assert max(abs(m.r_ed.y - y[0]) for m in settle) < 1e-6, "moved during the settle"
         assert rig.info[I_CONTACT] == (0.0 if CONTACT_OFF_AT_PUSH_END else 1.0)
@@ -412,8 +431,28 @@ def main():
             # acceleration tilt swings it (0.13 % measured)
             assert sp.max() < V * (1 + 1e-2), (V, sp.max())
             prof = f", cruise {mid.mean() * 1e3:.2f} mm/s (want {V * 1e3:.2f}) for {len(mid) / 100:.1f} s"
+        # THE PUSH SPEED (2026-10-21): the step = settle + max(|d| / v, floor), info [72]
+        # carries that time, and the push monitor (arrival [21..29]) holds its summary --
+        # the claw reference's full travel, the rig's fixed box none
+        settle_s = _yaml_num("push_pull_push_settle_s", 1.5)
+        assert abs(rig.info[72] - PUSH_TIME) < 1e-9, (rig.info[69:73], PUSH_TIME)
+        # the tested ranges (2026-10-21, display only): info [73..76] = the yaml's, NaN if unset
+        for i, key in ((73, "push_pull_push_distance_ok"), (75, "push_pull_push_speed_ok")):
+            want = _yaml_list(key)
+            got = rig.info[i:i + 2]
+            if want is None or len(want) != 2:
+                assert np.all(np.isnan(got)), (key, got)
+            else:
+                assert np.allclose(got, want), (key, got, want)
+        assert abs(T - (settle_s + PUSH_TIME)) < 0.06, (T, settle_s, PUSH_TIME)   # T printed to 0.1 s
+        wait(lambda: rig.arrival is not None and len(rig.arrival) >= 30 and rig.arrival[22] == 1.0,
+             3, "the push monitor's summary")
+        a = rig.arrival
+        assert a[21] == 1.0 and abs(a[24] - T) < 0.06 and abs(a[25] - settle_s) < 1e-9, a[21:30]
+        assert abs(a[27] - abs(PUSH_DIST)) < 2e-3 and abs(a[26]) < 5e-3 and a[29] == 0.0, a[21:30]
         print(f"[6] push T={T:.1f}s: {msg}; arm dev {q_dev:.1e} rad, heading dev {h_dev:.1e} deg, "
-              f"claw y {y[0]:.3f} -> {y[-1]:.3f}{prof}; contact calls {rig.contact_calls}")
+              f"claw y {y[0]:.3f} -> {y[-1]:.3f}{prof}; contact calls {rig.contact_calls}; "
+              f"monitor t {a[23]:.1f}/{a[24]:.1f} s, travel box {a[26] * 1e3:.1f} / plan {a[27] * 1e3:.1f} mm")
 
         # [6b] release (2026-10-17, the release-window fix): as the station opens
         # the gripper the claw's reference goes back to the CoM anchor -- one CoM
@@ -470,6 +509,17 @@ def main():
         # [9] the force guard mid-push
         r = call(rig, "reset")
         assert r.success, r.message
+        # a second mission starts like the first, at the takeoff hover: the planner
+        # plans from its HOLD, which after Land sits at the Land hover (0.30 m since
+        # 2026-10-21), and from there Go To Start would climb through the table's
+        # height on its way over it -- refused, rightly. Leave DIRECT, climb, re-enter
+        # (the hold is captured from the odometry at DIRECT entry).
+        rig.mode.publish(String(data="SAFETY"))
+        wait(lambda: rig.pl_status == "NOT IN DIRECT", 10, "SAFETY")
+        rig.odom_xyz = np.array([rig.odom_xyz[0], rig.odom_xyz[1], 1.3])
+        time.sleep(0.3)
+        rig.mode.publish(String(data="DIRECT"))
+        wait(lambda: rig.status == "HOLD", 10, "DIRECT hold at the takeoff hover")
         # back at its start: from where the push left it a second push would end
         # 0.25 m past the table's end, which the 2026-10-16 box-on-table check refuses
         rig.box = BOX.copy()
@@ -553,6 +603,44 @@ def main():
         rig.js_on = True
         print(f"[9c] {rig.pl_status}")
         abort_done("9c")
+
+        # [9d] the raw-mocap guard (2026-10-21) on the handle: BRIDGING (a short
+        # pause) aborts nothing; CONFIRMED (frozen > 0.15 s) aborts -- release,
+        # climb, arm home -- and then every step waits for the mocap while the
+        # vehicle hovers on EKF2 for the pilot
+        back_on_handle("9d")
+        rig.mg = [1.0, 2.0, 0.08]
+        time.sleep(0.6)
+        assert rig.pl_status.startswith("DONE ready"), rig.pl_status
+        rig.mg = [2.0, 2.0, 0.20]
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "mocap guard")
+        assert "mocap CONFIRMED (frozen" in rig.pl_status, rig.pl_status
+        print(f"[9d] {rig.pl_status}")
+        wait(lambda: rig.status.startswith("EXECUTING"), 10, "abort executing (9d)")
+        T = float(rig.status.split("T=")[1].rstrip("s"))
+        wait(lambda: rig.status == "HOLD", T + 20, "abort complete (9d)")
+        rig.mg = [3.0, 2.0, 3.5]
+        wait(lambda: rig.pl_status.startswith("ABORTED") and "HOVERING on EKF2" in rig.pl_status, 5,
+             "ABORTED, hovering on EKF2")
+        print(f"[9d] {rig.pl_status}")
+        for name in ("go_to_land_start", "plan"):
+            r = call(rig, name)
+            assert not r.success and "waits for the mocap" in r.message, (name, r.message)
+        print(f"[9d] go_to_land_start / plan refused: {r.message}")
+        rig.mg = [0.0, 0.0, 0.01]
+        wait(lambda: rig.pl_status.startswith("ABORTED") and "HOVERING" not in rig.pl_status, 5,
+             "mocap back")
+        land_abort()
+        print(f"[9d] mocap back: {rig.pl_status}")
+
+        # [9e] the guard's status itself going silent: steps refused
+        rig.mg_on = False
+        time.sleep(0.7)
+        r = call(rig, "go_to_land_start")
+        assert not r.success and "no mocap-guard status" in r.message, r.message
+        rig.mg_on = True
+        time.sleep(0.3)
+        print(f"[9e] guard silent: {r.message}")
 
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))

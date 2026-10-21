@@ -100,21 +100,29 @@ struct PushPullConfig
   double exit_dz{0.0};
   // how far the push moves the base along the nose [m]; < 0 PULLS back
   double push_distance{0.50};
-  // the push's shortest duration [s] (its speed: a min-snap move of d in T
-  // peaks at ~2.19 d / T)
+  // a TURN's duration [s] (push_pull_push_time_s). Since 2026-10-21 a straight
+  // push takes its duration from push_speed instead (pushPullPushTime).
   double push_time{12.0};
+  // THE PUSH SPEED (2026-10-21, user): a straight push's MEAN speed [m/s]
+  // (push_pull_push_mean_speed) -- the one source of its duration, which is
+  // max(|push_distance| / push_speed, push_min_time). 0 = not set: a straight
+  // push is refused. A min-snap move of d in T peaks at ~2.19 d / T.
+  double push_speed{0.0};
+  // a straight push's shortest duration [s] (push_pull_push_min_time_s): a
+  // short push at the mean speed would accelerate at 7.51 v^2 / d. 0 = none.
+  double push_min_time{0.0};
   // held in place at the grasp before the push moves [s] (the law has been in
   // contact since the end of ready; the node keeps the claw world-held)
   double push_settle{1.0};
   // THE CRUISE (2026-10-17): > 0 = the straight push speeds up over this many
-  // seconds, holds a CONSTANT speed push_distance / (push_time - push_ramp),
-  // and slows down over the same time, all inside push_time. Its speed ramps
+  // seconds, holds a CONSTANT speed push_distance / (T - push_ramp), and slows
+  // down over the same time, all inside T = pushPullPushTime(). Its speed ramps
   // are septic, so the CoM stays smooth through snap at every join. 0 = the
   // min-snap transition (unchanged: no constant-speed part, the speed peaks at
   // 2.19 x its mean). A box held by friction slides without stopping only
   // while the claw outruns the vehicle's ~0.7 Hz speed ripple (~25 mm/s in
   // the 10-16 Isaac pushes), and the min-snap spends over half its time below
-  // that. Ignored by a turn. Must be below push_time / 2.
+  // that. Ignored by a turn. Must be below T / 2.
   double push_ramp{0.0};
   // the exit climb's duration [s]; 0 = the leg bounds
   double exit_time{3.0};
@@ -211,6 +219,11 @@ std::unique_ptr<Trajectory> planPushPullReady(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const PushPullWaypoints & wp, const RestSpec & from,
   const Vec3 & trim = Vec3::Zero());
+// THE PUSH SPEED (2026-10-21): a straight push's duration [s] (the moving part,
+// without push_settle) -- max(|push_distance| / push_speed, push_min_time).
+// Throws when push_speed is not set (<= 0 or not finite).
+double pushPullPushTime(const PushPullConfig & c);
+
 // from the hold on the handle: settle push_settle s, then the base along the
 // hold's nose by push_distance -- arm, heading and height unchanged. With
 // c.turn_angle != 0: instead the whole rest (claw, base, heading) rotates

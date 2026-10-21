@@ -670,13 +670,29 @@ public:
     // -> free as soon as the push completes, before the GS opens the jaws.
     declare_parameter<bool>("push_pull_contact_at_ready", true);
     declare_parameter<bool>("push_pull_contact_off_at_push_end", false);
-    // the push: this far along the nose [m] (< 0 pulls), no faster than this
-    // [s], after holding the grasp this long [s] (the law's phase flag and the
-    // EE anchor switch at the press; the anchor blends over the node's
-    // wb_ee_anchor_blend_s, 1.0 s)
+    // the push: this far along the nose [m] (< 0 pulls), after holding the
+    // grasp this long [s] (the law's phase flag and the EE anchor switch at the
+    // press; the anchor blends over the node's wb_ee_anchor_blend_s, 1.0 s)
     declare_parameter<double>("push_pull_push_distance", 0.50);
+    // a TURN's duration [s] (valve turning). A straight push no longer reads it
+    // (2026-10-21): its duration comes from the mean speed below.
     declare_parameter<double>("push_pull_push_time_s", 12.0);
     declare_parameter<double>("push_pull_push_settle_s", 1.5);
+    // THE PUSH SPEED (2026-10-21, user): a straight push's MEAN speed [m/s] --
+    // the ONE source of its duration, max(|push_pull_push_distance| / this,
+    // push_pull_push_min_time_s); the arm GS shows the time it gives under the
+    // Push Distance box. No value in the code: 0 = not set, and a straight push
+    // is refused until the yaml sets it. The floor [s] keeps a short push from
+    // accelerating at 7.51 v^2 / d; 0 = none.
+    declare_parameter<double>("push_pull_push_mean_speed", 0.0);
+    declare_parameter<double>("push_pull_push_min_time_s", 0.0);
+    // THE PUSH'S TESTED RANGE (2026-10-21, user): [min, max] of the Push Distance
+    // [m] and of the mean speed it gives [m/s]. The arm GS shows the push's
+    // numbers GREEN inside both, RED outside ("retype"). Display only: nothing
+    // here refuses a push (the planner's own checks and the guards still do).
+    // [] = no range (the GS shows the numbers uncoloured).
+    declare_parameter<std::vector<double>>("push_pull_push_distance_ok", std::vector<double>{});
+    declare_parameter<std::vector<double>>("push_pull_push_speed_ok", std::vector<double>{});
     // THE CRUISE (2026-10-17, PushPullConfig::push_ramp): > 0 = the straight
     // push speeds up over this many seconds, holds a constant speed
     // push_pull_push_distance / (push_pull_push_time_s - this), and slows down
@@ -874,6 +890,14 @@ public:
     declare_parameter<double>("push_pull_follow_hold_timeout_s", 0.0);
     declare_parameter<std::string>(
       "push_pull_force_topic", "fsc_autopilot_ros2/whole_body_direct_actuation/wb_control_debug");
+    // THE RAW-MOCAP SAFETY GUARD (2026-10-21): the estimator's guard health
+    // (fsc_drone_state_estimator_ros2 MocapOdomBridge, state_estimator/mocap_guard,
+    // [0] 0 MOCAP / 1 BRIDGING / 2 CONFIRMED / 3 LOST). While the feed is bad the
+    // odometry is EKF2 + an offset -- good for seconds, not for a task. So: CONFIRMED
+    // with the claw on the box (or Ready / Push flying) -> the push-and-pull ABORT
+    // (release, climb, arm home, hover), LOST in any step in flight -> the same; every
+    // step and Plan are refused until the mocap is back; the pilot lands. "" = off.
+    declare_parameter<std::string>("push_pull_mocap_guard_topic", "");
     declare_parameter<double>("push_pull_capture_window", 0.5);
     declare_parameter<double>("push_pull_capture_max_spread", 0.02);
     // (2026-10-19, the hardware box push) the box capture also refuses a FROZEN
@@ -1128,6 +1152,25 @@ public:
         pl_box_topic_, rclcpp::SensorDataQoS(), [this](const Mocap & m) {onPlMocap(m);});
     }
     {
+      const auto gtopic = get_parameter("push_pull_mocap_guard_topic").as_string();
+      if (!gtopic.empty()) {
+        // BEST_EFFORT: the estimator publishes it so (a fresh status beats a complete one)
+        pl_guard_sub_ = create_subscription<Float64MultiArray>(
+          gtopic, rclcpp::SensorDataQoS(), [this](const Float64MultiArray & m) {
+            if (m.data.size() < 3) {return;}
+            std::lock_guard<std::recursive_mutex> lk(lock_);
+            const int was = pl_mg_state_;
+            pl_mg_state_ = static_cast<int>(std::lround(m.data[0]));
+            pl_mg_cause_ = static_cast<int>(std::lround(m.data[1]));
+            pl_mg_age_ = m.data[2];
+            pl_mg_t_ = Clock::now();
+            if ((was == 0) != (pl_mg_state_ == 0)) {publishPlStatus();}   // the status names it
+          });
+        RCLCPP_INFO(get_logger(), "push-and-pull: the raw-mocap guard on %s -- a confirmed fault "
+          "aborts into a hover, every step waits for the mocap", gtopic.c_str());
+      }
+    }
+    {
       const auto ftopic = get_parameter("push_pull_force_topic").as_string();
       if (!ftopic.empty()) {
         pl_force_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
@@ -1338,6 +1381,7 @@ private:
         pl_guard_tripped_ = false;
         pl_abort_keep_anchor_ = false;
         pl_abort_anchor_due_.reset();
+        pl_mg_aborted_ = false;
         ++pl_gen_;
         if (teleop_) {
           RCLCPP_WARN(get_logger(), "SAFETY -- PS4 teleoperation dropped.");
@@ -5135,6 +5179,8 @@ private:
     c->exit_dz = get_parameter("push_pull_exit_dz").as_double();
     c->push_distance = get_parameter("push_pull_push_distance").as_double();
     c->push_time = get_parameter("push_pull_push_time_s").as_double();
+    c->push_speed = get_parameter("push_pull_push_mean_speed").as_double();
+    c->push_min_time = get_parameter("push_pull_push_min_time_s").as_double();
     c->push_settle = get_parameter("push_pull_push_settle_s").as_double();
     c->push_ramp = get_parameter("push_pull_push_ramp_s").as_double();
     c->exit_time = get_parameter("push_pull_exit_time_s").as_double();
@@ -5219,8 +5265,10 @@ private:
       "push_pull_unload_avg_s", "push_pull_unload_max",
       "push_pull_follow", "push_pull_follow_filter_s", "push_pull_follow_lead_deg", "push_pull_follow_tilt_deg",
       "push_pull_follow_wrist_deg", "push_pull_follow_stale_s", "push_pull_follow_bandwidth",
-      "push_pull_follow_recover_s", "push_pull_follow_hold_timeout_s"};
+      "push_pull_follow_recover_s", "push_pull_follow_hold_timeout_s",
+      "push_pull_push_distance_ok", "push_pull_push_speed_ok"};
     bool stale = false;
+    bool ranges = false;   // the tested ranges changed: republish info (2026-10-21)
     const rclcpp::Parameter * box_point = nullptr;
     for (const auto & p : ps) {
       const std::string & n = p.get_name();
@@ -5244,11 +5292,25 @@ private:
         continue;
       }
       if (n == "push_pull_box_topic" || n == "push_pull_contact_service" ||
-        n == "push_pull_force_topic")
+        n == "push_pull_force_topic" || n == "push_pull_mocap_guard_topic")
       {
         r.successful = false;
         r.reason = n + " is fixed at launch (its subscription / client is made then)";
         return r;
+      }
+      if (n == "push_pull_push_distance_ok" || n == "push_pull_push_speed_ok") {
+        // [] = no range, else [min, max] with 0 <= min < max (2026-10-21)
+        const bool arr = p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY;
+        const auto v = arr ? p.as_double_array() : std::vector<double>{};
+        const bool ok = arr && (v.empty() || (v.size() == 2 && std::isfinite(v[0]) &&
+          std::isfinite(v[1]) && v[0] >= 0.0 && v[0] < v[1]));
+        if (!ok) {
+          r.successful = false;
+          r.reason = n + " needs [min, max] with 0 <= min < max, or [] for no range";
+          return r;
+        }
+        ranges = true;
+        continue;
       }
       size_t len = 0;
       if (n == "push_pull_land_start") {
@@ -5282,6 +5344,9 @@ private:
       {
         stale = true;
       }
+    }
+    if (ranges && !stale) {
+      pl_params_dirty_ = true;   // display only: the GS's colours follow, the plan stays
     }
     if (stale) {
       std::lock_guard<std::recursive_mutex> lk(lock_);
@@ -5377,6 +5442,7 @@ private:
       {
         pl_mocap_.pop_front();
       }
+      plMonitorUpdate(p);
       const Eigen::Quaterniond qb(o.w, o.x, o.y, o.z);
       if (std::abs(qb.norm() - 1.0) < 0.1) {trip = plBoxGuardCheck(p, qb.normalized().toRotationMatrix());}
     }
@@ -5460,6 +5526,104 @@ private:
       pl_bg_lag_since_.reset();
     }
     return false;
+  }
+
+  // THE PUSH MONITOR (2026-10-21, user): the arm GS's live Push rows -- the
+  // push step's time, the box's travel and speed along the push (obj_0)
+  // against the claw reference's. With lock_ held, on every box sample; held
+  // after the push (its summary) until the next push starts or Reset. Display
+  // only: the box guards above are what act.
+  static constexpr double kPlMonSpeedWindow = 0.5;   // [s] the box speed's window
+  void plMonitorUpdate(const Vec3 & p)
+  {
+    const auto now = Clock::now();
+    PlMonitor & mo = pl_mon_;
+    const bool executing = get_parameter("push_pull_turn_deg").as_double() == 0.0 &&
+      pl_wp_.has_value() && pl_flying_.has_value() && *pl_flying_ == kPlPush &&
+      state_ == "EXECUTING" && plan_ && exec_t0_.has_value() && pl_exec_plan_ == plan_;
+    if (executing) {
+      if (!mo.valid || mo.gen != plan_gen_) {   // the push started executing
+        mo = PlMonitor{};
+        mo.valid = true;
+        mo.gen = plan_gen_;
+        mo.box0 = p;
+        mo.T = plan_->duration();
+        mo.settle = std::max(get_parameter("push_pull_push_settle_s").as_double(), 0.0);
+        const double d = get_parameter("push_pull_push_distance").as_double();
+        mo.u = (d < 0.0 ? -1.0 : 1.0) * pl_wp_->push_dir;
+        mo.ref0 = plan_->eval(0.0).r_ed;
+      }
+      mo.t = std::chrono::duration<double>(now - *exec_t0_).count();
+      const WbReference r = plan_->eval(std::clamp(mo.t, 0.0, mo.T));
+      mo.plan_travel = (r.r_ed - mo.ref0).dot(mo.u);
+      mo.plan_speed = mo.t < mo.T ? r.r_ed_dot.dot(mo.u) : 0.0;
+    } else if (mo.valid && !mo.done) {
+      mo.done = true;   // flown to its end, or cut by an abort
+      mo.plan_speed = 0.0;
+    }
+    if (!mo.valid) {return;}
+    // the box: live in the push, and while the claw still holds it after
+    if (executing || (mo.done && pl_at_handle_ && !pl_flying_.has_value())) {
+      mo.travel = (p - mo.box0).dot(mo.u);
+      mo.hist.emplace_back(now, mo.travel);
+      while (mo.hist.size() > 1 &&
+        std::chrono::duration<double>(now - mo.hist.front().first).count() > kPlMonSpeedWindow)
+      {
+        mo.hist.pop_front();
+      }
+      const double span = std::chrono::duration<double>(now - mo.hist.front().first).count();
+      mo.speed = span > 0.2 ? (mo.travel - mo.hist.front().second) / span : 0.0;
+    } else {
+      mo.hist.clear();
+      mo.speed = 0.0;
+    }
+  }
+
+  // THE RAW-MOCAP GUARD (2026-10-21, push_pull_mocap_guard_topic): with lock_
+  // held, "" = the mocap is usable (or the guard is off), else why it is not.
+  std::string plMocapProblem() const
+  {
+    if (!pl_guard_sub_) {return "";}
+    if (!pl_mg_t_.has_value() || secondsSince(pl_mg_t_) > 0.5) {
+      return "no mocap-guard status from the estimator";
+    }
+    if (pl_mg_state_ == 0) {return "";}
+    static const char * const kState[] = {"MOCAP", "BRIDGING", "CONFIRMED", "LOST"};
+    static const char * const kCause[] = {"none", "stale", "frozen", "jump", "test"};
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(2);
+    m << "mocap " << kState[std::clamp(pl_mg_state_, 0, 3)] << " (" << kCause[std::clamp(pl_mg_cause_, 0, 4)]
+      << ", last good sample " << pl_mg_age_ << " s ago)";
+    return m.str();
+  }
+
+  // With lock_ held, from the 10 Hz tick: true = abort now. A CONFIRMED fault
+  // (> 0.15 s without a good sample) with the claw on the box, or a LOST one
+  // (> 1 s) while any step flies: the odometry is EKF2 dead-reckoning, good for
+  // seconds -- release and climb now, then hover for the pilot. Once per fault.
+  bool plMocapGuardCheck()
+  {
+    if (!pl_guard_sub_) {return false;}
+    const bool fresh = pl_mg_t_.has_value() && secondsSince(pl_mg_t_) <= 0.5;
+    if (fresh && pl_mg_state_ == 0) {
+      pl_mg_aborted_ = false;
+      return false;
+    }
+    if (!fresh || pl_mg_aborted_ || !mode_direct_ || !hold_.has_value() || pl_aborting_ ||
+      pl_abort_plan_)
+    {
+      return false;
+    }
+    const bool contact = pl_at_handle_ ||
+      (pl_flying_.has_value() && (*pl_flying_ == kPlReady || *pl_flying_ == kPlPush));
+    if (!((pl_mg_state_ >= 2 && contact) || (pl_mg_state_ >= 3 && pl_flying_.has_value()))) {
+      return false;
+    }
+    pl_mg_aborted_ = true;
+    pl_guard_reason_ = plMocapProblem();
+    pl_guard_tripped_ = true;
+    return true;
   }
 
   // The box feed and the arm's buckle (push_pull_guard_box_stale_s /
@@ -5790,6 +5954,8 @@ private:
       std::string err;
       if (!mode_direct_ || !hold_.has_value()) {
         err = "not in whole-body DIRECT (the first step is planned from the hold)";
+      } else if (!plMocapProblem().empty()) {
+        err = plMocapProblem() + " -- Plan waits for the mocap";
       } else if (teleopActive()) {
         err = "PS4 teleoperation engaged -- disengage it first";
       } else if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_ ||
@@ -5910,8 +6076,11 @@ private:
       std::ostringstream w;
       w.setf(std::ios::fixed);
       w.precision(0);
+      const std::string mocap = plMocapProblem();
       if (!mode_direct_ || !hold_.has_value()) {
         err = "not in whole-body DIRECT";
+      } else if (!mocap.empty()) {
+        err = mocap + " -- every step waits for the mocap (hover; the pilot lands)";
       } else if (pl_planning_) {
         err = "the mission is still planning";
       } else if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
@@ -6012,6 +6181,7 @@ private:
           pl_ey_buf_.clear();
           pl_bg_box0_.reset();       // the box guards: taken when the push executes
           pl_bg_lag_since_.reset();
+          pl_mon_ = PlMonitor{};     // the push monitor: starts when the push executes
           break;
         case kPlExit:
           // the gripper is open: no contact any more
@@ -6092,13 +6262,20 @@ private:
       if (cfg.turn_angle != 0.0) {
         m << "turns " << std::setprecision(0) << cfg.turn_angle * 180.0 / M_PI
           << " deg about the axis in " << std::setprecision(1) << cfg.push_time << " s";
-      } else if (cfg.push_ramp > 0.0 && cfg.push_time > 2.0 * cfg.push_ramp) {
-        m << "slides " << std::setprecision(2) << cfg.push_distance << " m at a constant "
-          << std::setprecision(1) << std::abs(cfg.push_distance) / (cfg.push_time - cfg.push_ramp) * 1e3
-          << " mm/s (" << cfg.push_ramp << " s ramps, " << cfg.push_time << " s)";
       } else {
-        m << "slides " << std::setprecision(2) << cfg.push_distance << " m in "
-          << std::setprecision(1) << cfg.push_time << " s";
+        // THE PUSH SPEED (2026-10-21): the time is the speed's (NaN = not set:
+        // the step's planning refuses it with the reason)
+        double T = std::numeric_limits<double>::quiet_NaN();
+        try {T = pushPullPushTime(cfg);} catch (const std::exception &) {}
+        if (cfg.push_ramp > 0.0 && T > 2.0 * cfg.push_ramp) {
+          m << "slides " << std::setprecision(2) << cfg.push_distance << " m at a constant "
+            << std::setprecision(1) << std::abs(cfg.push_distance) / (T - cfg.push_ramp) * 1e3
+            << " mm/s (" << cfg.push_ramp << " s ramps, " << T << " s)";
+        } else {
+          m << "slides " << std::setprecision(2) << cfg.push_distance << " m in "
+            << std::setprecision(1) << T << " s (mean " << std::abs(cfg.push_distance) / T * 1e3
+            << " mm/s)";
+        }
       }
     }
     resp->success = true;
@@ -6343,6 +6520,11 @@ private:
         retreat = -get_parameter("push_pull_abort_back").as_double() *
           (turning ? 1.0 : (d < 0.0 ? -1.0 : 1.0)) * dir;
       }
+      // a mocap-guard abort climbs STRAIGHT up once the jaws are open (2026-10-21, the first
+      // Isaac freeze): the back-out is for a jammed box, and it held the claw 3.5 s at fin
+      // height on an EKF2 estimate that drifted 200 mm meanwhile -- the open jaws dragged
+      // the box along and tipped it
+      if (pl_mg_aborted_) {retreat = Vec3::Zero();}
       climb = std::max(0.0, std::min(
           get_parameter("push_pull_abort_climb").as_double(), cfg.fence.max_z - from.x_b(2)));
       wait = touched ? get_parameter("push_pull_abort_release_wait_s").as_double() : 0.0;
@@ -6445,6 +6627,7 @@ private:
       pl_completed_ = -1;
       pl_aborted_ = false;
       pl_guard_tripped_ = false;
+      pl_mon_ = PlMonitor{};
       plInvalidate();
       restoreAnchor();
     }
@@ -6750,6 +6933,13 @@ private:
   // progress rate (0..1), [15] progress [s], [16] lead [deg], [17] tilt [deg],
   // [18] wrist excursion [deg], [19] the limiting channel (0 none, 1 lead,
   // 2 tilt, 3 wrist, 4 a stale feed), [20] time held so far [s].
+  // THE PUSH MONITOR (2026-10-21, appended): [21] 1 = a push started (its
+  // numbers live, or held after it), [22] 1 = the push step ended (the numbers
+  // are its summary), [23] time since the push step started [s] (settle
+  // included), [24] its planned duration [s] (settle + push), [25] the settle
+  // [s], [26] the box's travel along the push [m] (obj_0), [27] the claw
+  // reference's [m], [28] the box's speed [m/s] (0.5 s window), [29] the claw
+  // reference's [m/s].
   void publishPlArrival()
   {
     if (pl_box_point_clear_.exchange(false)) {
@@ -6766,6 +6956,7 @@ private:
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       feed_trip = plFeedGuardCheck();
+      if (!feed_trip) {feed_trip = plMocapGuardCheck();}   // the same abort (2026-10-21)
       if (pl_abort_anchor_due_.has_value() && Clock::now() >= *pl_abort_anchor_due_) {
         pl_abort_anchor_due_.reset();
         pl_abort_keep_anchor_ = false;
@@ -6828,6 +7019,9 @@ private:
           fl ? pl_follow_->gov.tau() : 0.0, fl ? pl_follow_->e_lead : 0.0,
           fl ? pl_follow_->e_tilt : 0.0, fl ? pl_follow_->e_wrist : 0.0,
           fl ? static_cast<double>(pl_follow_->limit) : 0.0, fl ? pl_follow_->held_s : 0.0});
+      const PlMonitor & mo = pl_mon_;
+      m.data.insert(m.data.end(), {mo.valid ? 1.0 : 0.0, mo.done ? 1.0 : 0.0, mo.t, mo.T,
+          mo.settle, mo.travel, mo.plan_travel, mo.speed, mo.plan_speed});
       if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding)) {
         pl_within_ = within;
         pl_err_step_ = s;
@@ -6860,6 +7054,9 @@ private:
         if (state_ == "EXECUTING" && plan_) {m << " T=" << plan_->duration() << "s";}
       } else if (!pl_error_.empty()) {
         m << "INFEASIBLE: " << pl_error_;
+      } else if (pl_aborted_ && pl_mg_aborted_ && !plMocapProblem().empty()) {
+        // THE RAW-MOCAP GUARD (2026-10-21): aborted on a mocap fault that is still on
+        m << "ABORTED" << guard << " -- HOVERING on EKF2: take over with the RC and land";
       } else if (pl_aborted_) {
         m << "ABORTED" << guard << " -- holding higher, arm home, contact off; "
           << (pl_wp_.has_value() ? "re-fly go_to_start, or go_to_land_start"
@@ -6909,8 +7106,13 @@ private:
   // [18+8N] the drone's yaw at the box [deg], [19+8N] the descent trim of the
   // last Ready [m, norm], [20+8N] the turn angle [deg]. N = 6: T [8..13], box
   // [14] + [15..18], goals [19..60], [61] at handle, [62] contact, [63] world,
-  // [64] distance, [65] |F|, [66] drone yaw, [67] trim, [68] turn; 69 values.
-  // NaN where there is nothing.
+  // [64] distance, [65] |F|, [66] drone yaw, [67] trim, [68] turn; then THE
+  // PUSH SPEED (2026-10-21, appended): [69] push_pull_push_mean_speed [m/s]
+  // (0 = not set), [70] push_pull_push_min_time_s [s], [71] the settle [s],
+  // [72] a straight push's time from them, max(|distance| / speed, floor) [s]
+  // (NaN when the speed is not set); then THE TESTED RANGES (2026-10-21):
+  // [73] / [74] the Push Distance's min / max [m], [75] / [76] the mean speed's
+  // [m/s] (NaN = no range); 77 values. NaN where there is nothing.
   void publishPlInfo()
   {
     Float64MultiArray m;
@@ -6953,6 +7155,22 @@ private:
       m.data.push_back(pl_trim_.norm());
       // [20+8N] the turn angle [deg] (0 = a straight push), 2026-10-15
       m.data.push_back(get_parameter("push_pull_turn_deg").as_double());
+      // [21+8N ..] THE PUSH SPEED (2026-10-21): the setting, the floor, the
+      // settle and the time they give -- the arm GS's Push rows
+      PushPullConfig c;
+      c.push_distance = get_parameter("push_pull_push_distance").as_double();
+      c.push_speed = get_parameter("push_pull_push_mean_speed").as_double();
+      c.push_min_time = get_parameter("push_pull_push_min_time_s").as_double();
+      double T = nan;
+      try {T = pushPullPushTime(c);} catch (const std::exception &) {}
+      m.data.insert(m.data.end(), {c.push_speed, c.push_min_time,
+          get_parameter("push_pull_push_settle_s").as_double(), T});
+      // [73..76] the tested ranges (display only)
+      for (const char * k : {"push_pull_push_distance_ok", "push_pull_push_speed_ok"}) {
+        const auto v = get_parameter(k).as_double_array();
+        m.data.push_back(v.size() == 2 ? v[0] : nan);
+        m.data.push_back(v.size() == 2 ? v[1] : nan);
+      }
     }
     pl_info_pub_->publish(m);
   }
@@ -7157,6 +7375,12 @@ private:
   OnSetParametersCallbackHandle::SharedPtr pp_param_cb_;
   // push-and-pull mode (push_pull.hpp)
   std::string pl_box_topic_;                    // the box's mocap body
+  // THE RAW-MOCAP GUARD (2026-10-21, push_pull_mocap_guard_topic): its last message
+  rclcpp::Subscription<Float64MultiArray>::SharedPtr pl_guard_sub_;
+  int pl_mg_state_{0}, pl_mg_cause_{0};
+  double pl_mg_age_{0.0};
+  std::optional<Clock::time_point> pl_mg_t_;
+  bool pl_mg_aborted_{false};                   // this fault already aborted (until the mocap is back)
   std::deque<PpSample> pl_mocap_;
   // PATH FOLLOWING (2026-10-18, push_pull_follow): the governed turn in flight
   struct PlFollow
@@ -7222,6 +7446,23 @@ private:
   std::optional<Vec3> pl_bg_lag0_;               // the box when the push started executing
   unsigned pl_bg_lag_gen_{0};
   double pl_bg_lag_{0.0}, pl_bg_tilt_{0.0};      // the last values (for the info line)
+  // THE PUSH MONITOR (2026-10-21): plMonitorUpdate, push_pull/arrival_error [21..29]
+  struct PlMonitor
+  {
+    bool valid{false};          // a push started executing: its numbers, live or held
+    bool done{false};           // the push step ended: the numbers are its summary
+    unsigned gen{0};            // the plan_gen_ it executes on
+    double t{0.0};              // [s] since the push step started (settle included)
+    double T{0.0};              // [s] the push step's planned duration (settle + push)
+    double settle{0.0};         // [s]
+    double travel{0.0};         // [m] the box along the push since the step started
+    double plan_travel{0.0};    // [m] the claw reference's, same origin
+    double speed{0.0};          // [m/s] the box's, over kPlMonSpeedWindow
+    double plan_speed{0.0};     // [m/s] the claw reference's now
+    Vec3 box0{Vec3::Zero()}, ref0{Vec3::Zero()}, u{Vec3::UnitX()};
+    std::deque<std::pair<Clock::time_point, double>> hist;   // (time, travel)
+  };
+  PlMonitor pl_mon_;
   std::optional<Clock::time_point> pl_force_t_, pl_force_since_;
   std::deque<std::pair<Clock::time_point, Vec3>> pl_trim_buf_;   // claw error holding above
   std::deque<std::pair<Clock::time_point, Vec3>> pl_ey_buf_;     // the law's e_y in the push

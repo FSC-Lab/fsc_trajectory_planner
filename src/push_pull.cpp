@@ -573,6 +573,18 @@ std::unique_ptr<Trajectory> planPushPullReady(
     });
 }
 
+double pushPullPushTime(const PushPullConfig & c)
+{
+  if (!(std::isfinite(c.push_speed) && c.push_speed > 0.0)) {
+    std::ostringstream m;
+    m << "push: push_pull_push_mean_speed is not set (" << c.push_speed
+      << " m/s) -- set it in the yaml: a straight push's duration is distance / speed";
+    throw std::runtime_error(m.str());
+  }
+  const double floor = std::isfinite(c.push_min_time) ? std::max(c.push_min_time, 0.0) : 0.0;
+  return std::max(std::abs(c.push_distance) / c.push_speed, floor);
+}
+
 std::unique_ptr<Trajectory> planPushPullPush(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from, const Vec3 & axis)
@@ -583,11 +595,14 @@ std::unique_ptr<Trajectory> planPushPullPush(
   if (turn && !(c.push_time > 0.0)) {
     throw std::runtime_error("push: a turn needs push_pull_push_time_s > 0 (its duration)");
   }
+  // THE PUSH SPEED (2026-10-21): a straight push's duration is the speed's
+  // (push_time is a turn's only)
+  const double T = turn ? c.push_time : pushPullPushTime(c);
   const bool cruise = !turn && c.push_ramp > 0.0;
-  if (cruise && !(c.push_time > 2.0 * c.push_ramp)) {
+  if (cruise && !(T > 2.0 * c.push_ramp)) {
     std::ostringstream m;
     m << "push: push_pull_push_ramp_s (" << c.push_ramp
-      << " s) must be less than half push_pull_push_time_s (" << c.push_time << " s)";
+      << " s) must be less than half the push time (" << T << " s)";
     throw std::runtime_error(m.str());
   }
   return step(v, c, "push", [&]() -> std::unique_ptr<Trajectory> {
@@ -600,10 +615,10 @@ std::unique_ptr<Trajectory> planPushPullPush(
         goal = segs.back()->goalRest();
       } else if (cruise) {
         segs.push_back(std::make_shared<CruiseTrajectory>(
-          v.params, from, noseOf(from.phi), c.push_distance, c.push_time, c.push_ramp));
+          v.params, from, noseOf(from.phi), c.push_distance, T, c.push_ramp));
       } else {
         segs.push_back(transitionLeg(
-          v, transition, timedOptions(opts, c.push_distance, c.push_time), from, goal));
+          v, transition, timedOptions(opts, c.push_distance, T), from, goal));
       }
       // the unload measures the claw's task error over the end of this hold
       if (c.unload_time > 0.0 && c.unload_wait > 0.0) {
