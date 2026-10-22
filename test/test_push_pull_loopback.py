@@ -16,6 +16,9 @@ set_ee_anchor_com services that record what the planner asks for.
   [3] steps out of order are refused
   [4] go_to_start: the claw ends approach_dz above the grasp point; the WORLD
       anchor is requested on arrival
+  [4b] (2026-10-22) with push_pull_table_from_box: the table published in info [77..86]
+       is the one the box places; with push_pull_go_to_start_bypass go_to_start comes
+       near the table only at the approach height (round its box end, never across)
   [5] ready: refused 80 mm off; then the vertical descent onto the handle
   [6] push: the planner asks for CONTACT and -- per push_pull_world_anchor_push
       -- keeps the WORLD anchor (true) or returns to the CoM (false); the reference
@@ -24,7 +27,8 @@ set_ee_anchor_com services that record what the planner asks for.
   [6b] release (2026-10-17): refused off the handle ([4a]); after the push the CoM
       anchor is requested and CONTACT off, nothing moves
   [7] exit: CONTACT off; straight up the margin, then the arm home
-  [8] go_to_land: the heading turns 270 deg CLOCKWISE; COMPLETE
+  [8] go_to_land: the heading turns as typed from the push heading CLOCKWISE (-180: 90 deg;
+      -360: 270); with the bypass ([8b], 2026-10-22) round the table; COMPLETE
   [9b] (2026-10-19) the force guard is armed on the handle before the Push press too
        (the contact flag still free): 6 N -> ABORTING
   [9c] (2026-10-19) the arm's joint states going silent on the handle (the q3 guard
@@ -36,6 +40,20 @@ set_ee_anchor_com services that record what the planner asks for.
        CONFIRMED aborts (release, climb, arm home), then 'HOVERING on EKF2' and every
        step / Plan waits for the mocap; the status recovers when the mocap does
   [9e] the guard's own status silent: steps refused
+  [9f] (2026-10-21) the box-lag guard against the LAW's claw target: the box
+       following the plan exactly, the law's free-axis shift (wb_control_debug [117])
+       is the lag the guard reads -- 30 mm passes, 60 mm aborts (BEHIND, shift counted)
+  [9g] (2026-10-21) the box sample gate: a 0.3 s run of the 10-21 obj_0 mis-solve (95 deg
+       roll, origin 61 mm off) while pushing -- which the 0.2 s tilt guard would abort on --
+       is dropped (no trip, the monitor's travel stays on the plan); a feed that keeps
+       jumping ages out and aborts as JUMPING
+  [9h] (2026-10-21) the unbuckle: the arm buckled on the handle (the 10-21 trip pose, q2 44.9 /
+       q3 5 deg) trips the q3 guard; the abort holds the measured arm through the release
+       wait, then the retreat brings q2 / q3 to the push pose's (q1 / q4 kept) before the
+       climb, and the fold ends home
+  [9i] (2026-10-22) the q3 RATE guard (push_pull_guard_q3_lookahead_s): a slow drift toward the
+       limit and a fast dip that stops well above it abort nothing; a fast fold (150 deg/s)
+       aborts while q3 is still above push_pull_guard_q3_min_deg
   [10] SAFETY silences the stream
 
 Run with a scratch install first on the path and a private ROS domain:
@@ -120,6 +138,10 @@ TABLE = _yaml_list("push_pull_table")
 # constant -- the layout moved 0.60 m back; it was x 1.275)
 BOX = np.array([0.5 * (TABLE[0] + TABLE[1]), 0.25, 0.85])
 WORLD_ANCHOR_PUSH = _yaml_bool("push_pull_world_anchor_push", True)
+# 2026-10-22: the table placed from the box, Go To Start round it
+TABLE_FROM_BOX = _yaml_bool("push_pull_table_from_box", False)
+TABLE_BOX_GAP = _yaml_num("push_pull_table_box_gap", 0.10)
+BYPASS = _yaml_bool("push_pull_go_to_start_bypass", False)
 WORLD_ANCHOR_READY = _yaml_bool("push_pull_world_anchor_ready", True)
 WORLD_ANCHOR_ON_HANDLE = _yaml_bool("push_pull_world_anchor_on_handle", False)
 CONTACT_OFF_AT_PUSH_END = _yaml_bool("push_pull_contact_off_at_push_end", False)
@@ -178,6 +200,9 @@ class Rig(Node):
         self.js_on = True          # [9c] stops the joint states
         self.mg = [0.0, 0.0, 0.01]  # [9d] the mocap guard: state, cause, age
         self.mg_on = True          # [9e] stops it
+        self.free_off = 0.0        # [9f] the law's free-axis shift, wb_control_debug [117] [m]
+        self.box_follow = None     # [9f] (box0, r_ed0): the box follows the streamed claw reference
+        self.glitch_n = 0          # [9g] the next n box samples are the 10-21 mis-solve
         self.rng = np.random.default_rng(0)
         self.create_timer(0.02, self.feed)
         self.create_timer(0.004, self.feed_force)    # the node's 250 Hz debug
@@ -203,14 +228,24 @@ class Rig(Node):
         self.att.publish(a)
         if self.js_on:
             j = JointState()
+            j.header.stamp = self.get_clock().now().to_msg()
             j.name = ["joint1", "joint2", "joint3", "joint4"]
             j.position = list(map(float, self.q))
             j.velocity = [0.0] * 4
             self.js.publish(j)
         m = Mocap()
-        noisy = self.box + self.rng.normal(0.0, 0.0005, 3)
+        box = self.box
+        if self.box_follow is not None and self.refs:
+            r = self.refs[-1][1].r_ed
+            box = self.box_follow[0] + (np.array([r.x, r.y, r.z]) - self.box_follow[1])
+        noisy = box + self.rng.normal(0.0, 0.0005, 3)
+        q = (1.0, 0.0, 0.0, 0.0)
+        if self.glitch_n > 0:      # [9g] a 95 deg roll, the origin 61 mm off
+            self.glitch_n -= 1
+            noisy = noisy + np.array([0.0, 0.040, -0.046])
+            q = (math.cos(math.radians(47.5)), math.sin(math.radians(47.5)), 0.0, 0.0)
         m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, noisy)
-        m.pose.orientation.w = 1.0
+        m.pose.orientation.w, m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z = q
         self.box_pub.publish(m)
         if self.mg_on:
             g = Float64MultiArray()
@@ -218,8 +253,9 @@ class Rig(Node):
             self.guard_pub.publish(g)
 
     def feed_force(self):
-        data = [0.0] * 115
+        data = [0.0] * 118
         data[97:100] = list(map(float, self.force))
+        data[117] = float(self.free_off)
         d = Float32MultiArray()
         d.data = data
         self.force_pub.publish(d)
@@ -265,6 +301,19 @@ def get_param(rig, name):
         time.sleep(0.05)
         assert time.monotonic() - t0 < 10, name
     return np.array(fut.result().values[0].double_array_value)
+
+
+def set_param(rig, name, value):
+    assert rig.params.wait_for_service(timeout_sec=10)
+    p = Parameter(name=name, value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
+                                                  double_value=float(value)))
+    fut = rig.params.call_async(SetParameters.Request(parameters=[p]))
+    t0 = time.monotonic()
+    while not fut.done():
+        time.sleep(0.05)
+        assert time.monotonic() - t0 < 10, name
+    res = fut.result().results[0]
+    assert res.successful, (name, res.reason)
 
 
 def wait(cond, timeout, what):
@@ -371,6 +420,31 @@ def main():
         assert abs(heading_deg(refs[-1]) - (-180.0)) < 0.5 or abs(heading_deg(refs[-1]) - 180.0) < 0.5
         wait(lambda: rig.pl_status.startswith("DONE go_to_start"), 5, "DONE go_to_start")
         print(f"[4] go_to_start T={T:.1f}s, anchor calls {rig.anchor_calls}; {rig.pl_status}")
+        # [4b] (2026-10-22) the table placed from the box (info [77..86]) and Go To Start round
+        # it: seen from above, the vehicle comes within 0.65 m of the table (0.70 less the arm's
+        # CoM offset) only once it is at the approach height -- never low, never across the table
+        if TABLE_FROM_BOX:
+            tb = rig.info[77:87]
+            assert len(rig.info) >= 87 and tb[0] == 1.0 and tb[1] == 1.0, rig.info[77:87]
+            yaw_t = math.radians(tb[4])
+            ex = rig.box - np.array([math.cos(yaw_t), math.sin(yaw_t), 0.0]) * (-tb[5])
+            assert abs(tb[5] + 0.12 + TABLE_BOX_GAP) < 1e-6 and abs(tb[9] - (BOX[2] - 0.05)) < 3e-3, tb   # the capture is noisy
+
+            def table_dist(p):
+                dx, dy = p[0] - tb[2], p[1] - tb[3]
+                lx = math.cos(yaw_t) * dx + math.sin(yaw_t) * dy
+                ly = -math.sin(yaw_t) * dx + math.cos(yaw_t) * dy
+                return math.hypot(max(tb[5] - lx, 0.0, lx - tb[6]), max(tb[7] - ly, 0.0, ly - tb[8]))
+            z_end = refs[-1].x_cd.z
+            near = [(table_dist((m.x_cd.x, m.x_cd.y)), m.x_cd.z) for m in refs]
+            low_near = [d for d, z in near if d < 0.65 and z < z_end - 0.005]
+            assert not low_near, f"go_to_start came {min(low_near):.2f} m from the table below the approach height"
+            if BYPASS:
+                start_d = table_dist((refs[0].x_cd.x, refs[0].x_cd.y))
+                assert start_d > 0.70, start_d
+                print(f"[4b] the table placed from the box (box end at {ex[0]:.3f}, {ex[1]:.3f}); go_to_start "
+                      f"from {start_d:.2f} m round it: within 0.65 m only at the approach height "
+                      f"(closest {min(d for d, _ in near):.2f} m at the end)")
 
         # [4a] release (2026-10-17) is refused off the handle: nothing to release
         r = call(rig, "release")
@@ -491,13 +565,31 @@ def main():
         h = [heading_deg(m) for m in refs]
         steps_h = [((b - a + 180) % 360 - 180) for a, b in zip(h, h[1:])]
         turn = sum(steps_h)
-        assert abs(turn + 270.0) < 1.0 and max(steps_h) < 1e-3, (turn, max(steps_h))
+        # the typed Land Start yaw from the push heading -90 (2026-10-22: -180 -> 90 deg clockwise;
+        # it was -360 -> 270): the box's yaw is 0 here, so relative and absolute agree
+        want = _yaml_list("push_pull_land_start")[3] + 90.0
+        assert abs(turn - want) < 1.0 and max(steps_h) < 1e-3, (turn, want, max(steps_h))
+        if TABLE_FROM_BOX and BYPASS:
+            # round the table: near it (0.65 m) only at the exit height, backing out over its end
+            tb = rig.info[77:87]
+            yaw_t = math.radians(tb[4])
+
+            def tdist(p):
+                dx, dy = p[0] - tb[2], p[1] - tb[3]
+                lx = math.cos(yaw_t) * dx + math.sin(yaw_t) * dy
+                ly = -math.sin(yaw_t) * dx + math.cos(yaw_t) * dy
+                return math.hypot(max(tb[5] - lx, 0.0, lx - tb[6]), max(tb[7] - ly, 0.0, ly - tb[8]))
+            z0 = refs[0].x_cd.z
+            low = [tdist((m.x_cd.x, m.x_cd.y)) for m in refs if m.x_cd.z < z0 - 0.005]
+            assert not low or min(low) > 0.65, min(low)
+            print(f"[8b] go_to_land_start round the table: below the exit height only >= "
+                  f"{min(low) if low else float('nan'):.2f} m from it")
         over = [m.x_cd.z for m in refs
                 if TABLE[0] - 0.25 < m.x_cd.x < TABLE[1] + 0.25 and TABLE[2] - 0.25 < m.x_cd.y < TABLE[3] + 0.25]
         z_min = min(over) if over else float("nan")
         assert not over or z_min > TABLE[4] + 0.30, (z_min, TABLE[4])
         wait(lambda: rig.pl_status.startswith("DONE go_to_land_start next=land"), 5, "DONE go_to_land_start")
-        print(f"[8] go_to_land_start T={T:.1f}s: one transition, turned {turn:.1f} deg (clockwise only), "
+        print(f"[8] go_to_land_start T={T:.1f}s: turned {turn:.1f} deg (clockwise only), "
               f"CoM >= {z_min:.2f} m near the table (top {TABLE[4]:.2f}); {rig.pl_status}")
         T, refs, _ = fly(rig, 5)
         xy_dev = max(np.hypot(m.x_cd.x - refs[0].x_cd.x, m.x_cd.y - refs[0].x_cd.y) for m in refs)
@@ -641,6 +733,175 @@ def main():
         rig.mg_on = True
         time.sleep(0.3)
         print(f"[9e] guard silent: {r.message}")
+
+        # [9f] the box-lag guard measured against the LAW's claw target (2026-10-21): with
+        # wb_ee_anchor_free_axis_weight > 0 the law moves the target along the nose by its share
+        # of the vehicle's drift (wb_control_debug [117]) and the clamped box follows it ON
+        # PURPOSE. Here the rig's box follows the streamed plan exactly, so the bare lag is ~0
+        # and the guard reads the shift alone: 30 mm (inside the 40 mm limit) passes, a target
+        # 60 mm AHEAD of the box = the box 60 mm BEHIND -> ABORTING, the shift named
+        set_param(rig, "push_pull_guard_box_lag", 0.040)
+        back_on_handle("9f")
+        rig.refs.clear()
+        r = call(rig, "push")
+        assert r.success, r.message
+        wait(lambda: rig.status.startswith("EXECUTING") and rig.refs, 10, "push executing (9f)")
+        r0 = rig.refs[-1][1].r_ed
+        rig.box_follow = (rig.box.copy(), np.array([r0.x, r0.y, r0.z]))
+        time.sleep(2.5)                       # the settle and the slide's start, shift 0
+        assert rig.pl_status.startswith("FLYING push"), rig.pl_status
+        lag_bare = rig.arrival[11]
+        rig.free_off = 0.030
+        time.sleep(1.5)
+        assert rig.pl_status.startswith("FLYING push"), rig.pl_status    # no trip at 30 mm
+        lag_30 = rig.arrival[11]
+        assert abs(lag_bare) < 0.005 and abs(lag_30 - 0.030) < 0.005, (lag_bare, lag_30)
+        rig.free_off = 0.060
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 3, "box-lag guard on the law's target")
+        assert "BEHIND its plan" in rig.pl_status and "law free-axis shift" in rig.pl_status, rig.pl_status
+        rig.free_off = 0.0
+        rig.box_follow = None
+        print(f"[9f] bare lag {lag_bare * 1e3:+.1f} mm, with a 30 mm shift {lag_30 * 1e3:+.1f} mm (no trip); "
+              f"{rig.pl_status}")
+        abort_done("9f")
+        set_param(rig, "push_pull_guard_box_lag", 0.0)
+
+        # [9g] the box sample gate (2026-10-21): the yaml's push_pull_box_gate_jump_m / _deg.
+        # A 0.3 s run of the 10-21 mis-solve while pushing (15 samples at the rig's 50 Hz):
+        # ungated it would trip the 2 deg / 0.2 s box-tilt guard; gated it is dropped -- no
+        # trip, and the monitor's box travel stays on the plan's. A feed that keeps jumping
+        # is dropped until it ages out: the 0.5 s stale guard aborts, naming it JUMPING.
+        if _yaml_num("push_pull_box_gate_jump_m", 0.0) > 0.0:
+            set_param(rig, "push_pull_guard_box_lag", 0.040)
+            set_param(rig, "push_pull_guard_box_tilt_deg", 2.0)
+            back_on_handle("9g")
+            rig.refs.clear()
+            r = call(rig, "push")
+            assert r.success, r.message
+            wait(lambda: rig.status.startswith("EXECUTING") and rig.refs, 10, "push executing (9g)")
+            r0 = rig.refs[-1][1].r_ed
+            rig.box_follow = (rig.box.copy(), np.array([r0.x, r0.y, r0.z]))
+            time.sleep(2.5)                     # into the slide
+            gap = []
+            for _ in range(2):
+                rig.glitch_n = 15
+                t_g = time.monotonic()
+                while time.monotonic() - t_g < 0.4:
+                    a = rig.arrival
+                    gap.append(abs(a[26] - a[27]))
+                    time.sleep(0.05)
+                assert rig.pl_status.startswith("FLYING push"), rig.pl_status    # no trip
+                time.sleep(0.6)
+            assert max(gap) < 0.005, max(gap)
+            rig.glitch_n = 10 ** 6              # keeps jumping
+            wait(lambda: rig.pl_status.startswith("ABORTING"), 3, "a jumping box feed")
+            assert "JUMPING" in rig.pl_status, rig.pl_status
+            rig.glitch_n = 0
+            rig.box_follow = None
+            print(f"[9g] two 0.3 s mis-solve runs while pushing: no trip, monitor travel within "
+                  f"{max(gap) * 1e3:.1f} mm of the plan; then {rig.pl_status}")
+            abort_done("9g")
+            set_param(rig, "push_pull_guard_box_lag", 0.0)
+            set_param(rig, "push_pull_guard_box_tilt_deg", 0.0)
+        else:
+            print("[9g] skipped: the yaml sets no box sample gate (push_pull_box_gate_jump_m)")
+
+        # [9h] the unbuckle (2026-10-21): the yaml's push_pull_abort_unbuckle. The arm on the
+        # handle buckles to the 10-21 trip pose (q2 44.9, q3 5 deg); the q3 guard (the yaml's
+        # push_pull_guard_q3_min_deg) aborts. The abort holds that MEASURED arm through the
+        # release wait (the jaws open), then the retreat -- before the climb -- brings q2 / q3 to
+        # the push pose's with q1 / q4 untouched, and the fold ends home.
+        q3_min = _yaml_num("push_pull_guard_q3_min_deg", 0.0)
+        if _yaml_bool("push_pull_abort_unbuckle", False) and q3_min > 0.0:
+            push_q = np.radians(_yaml_list("push_pull_push_pose_deg"))
+            wait_s = _yaml_num("push_pull_abort_release_wait_s", 0.5)
+            back_on_handle("9h")
+            q_trip = rig.q.copy()
+            q_trip[1], q_trip[2] = math.radians(44.9), math.radians(5.0)
+            rig.q = q_trip
+            wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "q3 guard on a buckled arm")
+            assert "q3" in rig.pl_status, rig.pl_status
+            print(f"[9h] {rig.pl_status}")
+            wait(lambda: rig.status.startswith("EXECUTING"), 10, "abort executing (9h)")
+            rig.refs.clear()
+            T = float(rig.status.split("T=")[1].rstrip("s"))
+            wait(lambda: rig.status == "HOLD", T + 20, "abort complete (9h)")
+            refs = [m for _, m in rig.refs]
+            Q = np.array([list(m.q_d) for m in refs])
+            Z = np.array([m.r_ed.z for m in refs])
+            # the release: the measured arm (the stream runs at 100 Hz)
+            held = int(np.argmax(np.abs(Q - q_trip).max(axis=1) > 1e-6))
+            assert held >= int(0.9 * wait_s * 100), (held, wait_s)
+            # q1 / q4 untouched until the fold; q2 / q3 at the push pose's while the claw is
+            # still within 5 cm of its height (the retreat, not the climb, carried it)
+            unb = q_trip.copy()
+            unb[1], unb[2] = push_q[1], push_q[2]
+            at_unb = np.where(np.abs(Q - unb).max(axis=1) < 1e-6)[0]
+            assert len(at_unb), "the arm never reached the push pose's q2 / q3"
+            i_u = int(at_unb[0])
+            assert np.allclose(Q[:i_u + 1, [0, 3]], q_trip[[0, 3]], atol=1e-9), "q1 / q4 moved before the fold"
+            assert Z[i_u] - Z[0] < 0.05, ("unbuckled only in the climb", Z[i_u] - Z[0])
+            assert np.min(Z[:i_u + 1]) > Z[0] - 1e-3, "the open claw dropped while unbuckling"
+            assert np.allclose(Q[-1], HOME, atol=1e-6), Q[-1]
+            wait(lambda: rig.pl_status.startswith("ABORTED"), 5, "ABORTED (9h)")
+            print(f"[9h] held the buckled arm {held / 100.0:.2f} s (the release), q2/q3 "
+                  f"{math.degrees(q_trip[1]):.1f}/{math.degrees(q_trip[2]):.1f} -> "
+                  f"{math.degrees(unb[1]):.1f}/{math.degrees(unb[2]):.1f} deg by {i_u / 100.0:.2f} s "
+                  f"with the claw {1e3 * (Z[i_u] - Z[0]):+.1f} mm, then the climb and home")
+            land_abort()
+        else:
+            print("[9h] skipped: the yaml sets no push_pull_abort_unbuckle (or no q3 guard)")
+
+        # [9i] the q3 RATE guard (2026-10-22): the yaml's push_pull_guard_q3_lookahead_s.
+        # q3 moves at a set rate on the handle (the rig publishes it at 50 Hz, stamped).
+        tau = _yaml_num("push_pull_guard_q3_lookahead_s", 0.0)
+        if tau > 0.0 and q3_min > 0.0:
+            vmin = _yaml_num("push_pull_guard_q3_rate_min_deg_s", 5.0)
+
+            def ramp(to_deg, rate_deg_s):
+                """q3 from where it is toward to_deg at rate_deg_s; stops on an abort."""
+                q = rig.q.copy()
+                a = math.degrees(q[2])
+                t0 = time.monotonic()
+                while True:
+                    if rig.pl_status.startswith("ABORTING"):
+                        return True
+                    x = a - rate_deg_s * (time.monotonic() - t0)
+                    done = x <= to_deg
+                    q[2] = math.radians(max(x, to_deg))
+                    rig.q = q.copy()
+                    if done:
+                        return False
+                    time.sleep(0.004)
+
+            back_on_handle("9i")
+            q_home = rig.q.copy()
+            q3_0 = math.degrees(q_home[2])
+            # a slow drift to 4 deg above the limit: below the rate floor, above the limit
+            assert not ramp(q3_min + 4.0, 0.6 * vmin), rig.pl_status
+            time.sleep(0.5)
+            assert rig.pl_status.startswith("DONE ready"), rig.pl_status
+            rig.q = q_home.copy()
+            time.sleep(0.5)
+            # a fast dip that stops where the look-ahead never reaches the limit
+            dip = q3_min + tau * 60.0 + 3.0
+            if dip < q3_0 - 2.0:
+                assert not ramp(dip, 60.0), rig.pl_status
+                time.sleep(0.5)
+                assert rig.pl_status.startswith("DONE ready"), rig.pl_status
+                rig.q = q_home.copy()
+                time.sleep(0.5)
+            # the fold: 150 deg/s toward the elbow branch
+            assert ramp(-30.0, 150.0), "the fold never aborted"
+            assert "falling at" in rig.pl_status, rig.pl_status
+            m = re.search(r"q3 (-?[0-9.]+) deg falling", rig.pl_status)
+            q3_trip = float(m.group(1))
+            assert q3_trip > q3_min, (q3_trip, rig.pl_status)
+            print(f"[9i] no trip on a {0.6 * vmin:.0f} deg/s drift to {q3_min + 4.0:.0f} deg or a 60 deg/s "
+                  f"dip to {dip:.0f} deg; the 150 deg/s fold aborted at q3 {q3_trip:.1f} deg: {rig.pl_status}")
+            abort_done("9i")
+        else:
+            print("[9i] skipped: the yaml sets no push_pull_guard_q3_lookahead_s (or no q3 guard)")
 
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))

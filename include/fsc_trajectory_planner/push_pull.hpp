@@ -10,6 +10,8 @@
 //   0 go_to_start  -> the claw approach_dz straight ABOVE the handle's grasp
 //                     point, nose along the push (the box's yaw + yaw_from_box),
 //                     the arm unfolding from home into the push pose on the way
+//                     (2026-10-22, c.bypass: first ROUND the table's box end,
+//                     then straight in along the push)
 //   1 ready        -> straight down onto the grasp point (the arm GS opens the
 //                     gripper first; the node holds the claw in the WORLD
 //                     from the hover above through the grasp)
@@ -26,6 +28,9 @@
 //                     table), the heading turning the way the typed yaw says
 //                     (-90 -> -360 deg is 270 deg CLOCKWISE), the arm home;
 //                     checked against the table like every other leg.
+//                     (2026-10-22, c.bypass: on along the push's line, over the
+//                     pushed box, past the table's FAR end, then round that
+//                     end back to Land Start -- go_to_start's mirror image)
 //   5 land         -> straight from Land Start to the Land hover, heading kept.
 //                     The planner never touches down: the touchdown is the
 //                     operator's SAFETY -> land.
@@ -34,15 +39,17 @@
 // box pose plus ONE EE offset in the box's frame. The drone faces along the
 // push: its ACTUAL yaw is the box's yaw + yaw_from_box (-90 deg: the handle is
 // on the box's +y side, the push goes along the box's -y). Every step is
-// checked against the geofence AND against the TABLE (an axis-aligned keep-
-// out box): wherever the landing gear's footprint or a point of the arm is
-// over the table top, it must stay table_clearance above it.
+// checked against the geofence AND against the TABLE (a keep-out box, typed or
+// -- 2026-10-22 -- placed from the box capture): wherever the landing gear's
+// footprint or a point of the arm is over the table top, it must stay
+// table_clearance above it.
 
 #ifndef FSC_TRAJECTORY_PLANNER_PUSH_PULL_HPP_
 #define FSC_TRAJECTORY_PLANNER_PUSH_PULL_HPP_
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -68,12 +75,20 @@ enum PushPullStep : int
 // node's service names); "?" otherwise.
 const char * pushPullStepName(int step);
 
-// The table top as an axis-aligned keep-out box, WORLD frame [m]: its
-// footprint and the height of its top surface.
+// The table top as a keep-out box [m]: its footprint and the height of its top
+// surface. The footprint's bounds are in the frame turned by `yaw` about
+// (ox, oy): world axes when both are zero (the typed push_pull_table), the
+// push's axes about the box for a table placed from the box (2026-10-22,
+// tableFromBox: x along the push, the box end at x_min).
 struct TableKeepOut
 {
   double x_min{0.0}, x_max{0.0}, y_min{0.0}, y_max{0.0}, z_top{0.0};
+  double ox{0.0}, oy{0.0}, yaw{0.0};
   bool valid() const {return x_max > x_min && y_max > y_min;}
+  // p in the table's frame (x, y turned; z unchanged)
+  Vec3 toLocal(const Vec3 & p) const;
+  // the inverse: a point of the table's frame in the world
+  Vec3 toWorld(const Vec3 & l) const;
   // horizontal distance from p to the footprint, 0 over it
   double distanceXY(const Vec3 & p) const;
 };
@@ -170,7 +185,46 @@ struct PushPullConfig
   // Straight pushes only (a turn keeps the body on its axis).
   double box_half_length{0.0};
   double box_edge_margin{0.03};
+  // THE TABLE PLACED FROM THE BOX (2026-10-22, user: the lab table goes wherever
+  // the floor is flat, so a room-fixed keep-out refused the box): true = `table`
+  // is replaced by the table's footprint placed by the box capture -- the table
+  // table_length along the push x table_depth across it, the box centred across
+  // it with its back face (box_half_length behind its centre) table_box_gap in
+  // from the table's end, the top box_half_height under the box centre. The
+  // landing headings then turn with the box (as typed from the push heading),
+  // and pushPullWaypoints refuses a start more than start_middle_tol off the
+  // table's middle line (the layout rule: the vehicle starts on it, in front --
+  // and the catch for a box or mocap body turned 180 deg). Straight pushes only.
+  bool table_from_box{false};
+  double table_length{1.0};
+  double table_depth{0.15};
+  double table_box_gap{0.10};
+  double box_half_height{0.05};
+  double start_middle_tol{0.30};
+  // GO TO START GOES ROUND THE TABLE (2026-10-22, user): true = go_to_start
+  // flies a smooth curve round the table's BOX end, the body bypass_clearance
+  // or more from the table's footprint (seen from above), climbing to the
+  // approach height and turning to the push heading on the way; it stops on the
+  // push's axis bypass_clearance past the table's end and flies straight in
+  // along the push while the arm unfolds. The start must be beside the table,
+  // bypass_clearance + kBypassStartMargin or more from it. false = one
+  // transition straight to the approach (unchanged).
+  bool bypass{false};
+  double bypass_clearance{0.70};
+  // the handle's top above the grasp point [m] (the CAD fin: the claw closes 25 mm
+  // under its top): with bypass the way home flies over the pushed box, which is
+  // then a keep-out up to there (2026-10-22)
+  double handle_above_grasp{0.025};
 };
+
+// The start's extra room for the curve round the table [m]: the curve leaves the
+// start parallel to the table and bends towards it only past the table's end, by
+// up to this much (measured on the degree-8 curve, push_pull.cpp).
+constexpr double kBypassStartMargin = 0.05;
+
+// The table's footprint placed from the box (PushPullConfig::table_from_box).
+// Throws std::runtime_error when the sizes cannot describe a table under the box.
+TableKeepOut tableFromBox(const PushPullConfig & c, const Vec3 & box, double box_yaw);
 
 struct PushPullTargets
 {
@@ -184,6 +238,10 @@ struct PushPullTargets
   // (the turn direction, as land's was); unset = the same pose as land
   BasePose land_start;
   bool land_start_set{false};
+  // the start mark (Adjust: where the vehicle took off) -- the layout check of
+  // a table placed from the box (2026-10-22); unset = no check
+  BasePose start;
+  bool start_set{false};
 };
 
 struct PushPullWaypoints
@@ -199,6 +257,10 @@ struct PushPullWaypoints
   double drone_yaw{0.0};          // ACTUAL yaw at the box [rad]
   Vec3 push_dir{Vec3::Zero()};    // unit, horizontal, world: the nose at the box
   Vec3 axis{Vec3::Zero()};        // the turn's axis (the captured body), world [m]
+  // the table the plan was made against (2026-10-22): the typed one, or the one
+  // placed from the box -- every later step is checked against THIS, so it
+  // stays when the capture is dropped (an abort that touched the box)
+  TableKeepOut table;
 };
 
 // The waypoints. Throws std::runtime_error "<step>: <reason>" when one is
@@ -209,7 +271,10 @@ PushPullWaypoints pushPullWaypoints(
 
 // Each step from the rest `from` (the CURRENT hold when flown). Throw
 // std::runtime_error "<step>: <reason>"; every path is checked against the
-// geofence and the table.
+// geofence and the table (c.table: the caller passes the plan's, wp.table).
+// go_to_start with c.bypass: the curve round the table's box end, then straight
+// in (see PushPullConfig::bypass); from a hold already within bypass_clearance
+// of the table (a re-fly near it) the one transition as before.
 std::unique_ptr<Trajectory> planPushPullGoToStart(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const PushPullWaypoints & wp, const RestSpec & from);
@@ -243,7 +308,9 @@ std::unique_ptr<Trajectory> planPushPullExit(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from);
 // one transition to Land Start, the heading turned as typed (a pause when
-// already there)
+// already there); with c.bypass (2026-10-22) on along the push's line past the
+// table's far end (over the pushed box, checked against it), then round the
+// table's far corner to it
 std::unique_ptr<Trajectory> planPushPullGoToLandStart(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const PushPullWaypoints & wp, const RestSpec & from);
@@ -260,11 +327,18 @@ std::unique_ptr<Trajectory> planPushPullLand(
 // none): after the release wait the base first moves by it -- back against the
 // push, so the opened fingers leave the fin horizontally before the climb (Isaac:
 // a jammed / tipping box was LIFTED by the open claw climbing straight up, and the
-// vehicle flipped when it dropped off).
+// vehicle flipped when it dropped off). `unbuckle` (2026-10-21, empty = none): the
+// arm pose the FIRST motion leg after the release wait brings the arm to -- the
+// retreat when there is one, else the climb; the climb and the fold home then
+// start from it. Meant for an abort held on the MEASURED pose (the 10-21 flight:
+// a q3-guard trip left q2 on its limit and q3 at ~2 deg, the elbow-singular
+// boundary, and the abort held that for 9 s until the fold). When the claw would
+// end more than 10 mm lower against the base than it starts, the climb carries the
+// arm instead of the retreat, so the open claw never drops along the handle.
 std::unique_ptr<Trajectory> planPushPullAbort(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from, double climb, double release_wait = 0.0,
-  const Vec3 & retreat = Vec3::Zero());
+  const Vec3 & retreat = Vec3::Zero(), const std::optional<VecN> & unbuckle = std::nullopt);
 
 // Throws "<what>: <part> is <h> m above the table top at t = .. s ..." when a
 // sample of `traj` puts the landing gear (within gear_radius of the body
@@ -320,6 +394,17 @@ private:
 // A channel's rate factor: 1 at or below `soft`, 0 at or above `hard`, linear
 // between; 1 when the channel is off (hard <= soft or hard <= 0).
 double followFactor(double e, double soft, double hard);
+
+// THE BOX SAMPLE GATE (2026-10-21): the drone mocap guard's jump test
+// (fsc_drone_state_estimator_ros2 MocapGuard), with its constants. A box sample
+// d_m [m] and a_deg [deg] from the LAST GOOD one, dt [s] after it, is good when
+//   d_m <= jump_m + kBoxGateV dt + 1/2 kBoxGateA dt^2  and  a_deg <= jump_deg + kBoxGateW dt.
+// The allowance grows with the gap, so a pose that really moved is let back in.
+// A non-positive limit disables its test (both: every sample is good).
+constexpr double kBoxGateV = 1.0;    // [m/s]
+constexpr double kBoxGateA = 2.0;    // [m/s^2]
+constexpr double kBoxGateW = 90.0;   // [deg/s]
+bool boxSampleWithinGate(double d_m, double a_deg, double dt, double jump_m, double jump_deg);
 
 }  // namespace fsc_trajectory_planner
 

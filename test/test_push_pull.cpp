@@ -465,6 +465,84 @@ TEST(PushPull, AbortRetreatsHorizontallyBeforeTheClimb)
   EXPECT_LT((traj->goalRest().q - v->home).norm(), 1e-9);
 }
 
+// THE UNBUCKLE (2026-10-21): an abort held on a buckled measured arm (the 10-21
+// q3-guard trip: q2 on its +45 limit, q3 at 5 deg) keeps the arm still through the
+// release wait (the jaws open), then brings q2 / q3 to the push pose's in the
+// retreat with q1 / q4 untouched; the open claw never drops against its start and
+// never moves toward the box; the climb and the fold start from the unbuckled pose.
+// From an over-folded arm (unbuckling would LOWER the claw 84 mm against the base)
+// the climb carries it instead, and the claw still only rises.
+TEST(PushPull, AbortUnbucklesTheArmOnceTheJawsAreOpen)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PushPullConfig c = config(*v);
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, scene());
+  const Vec3 back = -0.03 * wp.push_dir;
+  auto clawOf = [&](const WbReference & r) {
+      Vec3 r0e;
+      armKinematics(r.q_d, v->params, nullptr, &r0e, nullptr);
+      return Vec3(bodyOf(*v, r) + Rz(headingOf(r)) * r0e);
+    };
+  VecN buckled, folded;
+  buckled << 1.9 * kDeg, 44.9 * kDeg, 5.0 * kDeg, -2.0 * kDeg;   // 10-21, model signs
+  folded << 1.0 * kDeg, 40.0 * kDeg, 45.0 * kDeg, 3.0 * kDeg;
+  const char * const names[2] = {"buckled", "over-folded"};
+  for (int n = 0; n < 2; ++n) {
+    SCOPED_TRACE(names[n]);
+    const bool retreat_carries = n == 0;
+    RestSpec from = wp.grasp;
+    from.q = n == 0 ? buckled : folded;
+    VecN unb = from.q;
+    unb(1) = 32.0 * kDeg;
+    unb(2) = 28.0 * kDeg;
+    const auto traj = planPushPullAbort(*v, *planner, PlanOptions{}, c, from, 0.30, 1.5, back, unb);
+    const auto * seq = dynamic_cast<const SequenceTrajectory *>(traj.get());
+    ASSERT_NE(seq, nullptr);
+    ASSERT_EQ(seq->segmentStarts().size(), 4u);   // release, retreat, climb, fold
+    const double t_ret = seq->segmentStarts()[1], t_climb = seq->segmentStarts()[2];
+    const double t_fold = seq->segmentStarts()[3];
+    EXPECT_NEAR(t_ret, 1.5, 1e-9);
+    // the release: the measured arm held while the jaws open
+    for (int i = 0; i <= 20; ++i) {
+      EXPECT_LT((traj->eval(t_ret * i / 20.0).q_d - from.q).cwiseAbs().maxCoeff(), 1e-9);
+    }
+    const Vec3 claw0 = clawOf(traj->eval(0.0));
+    // the retreat and the climb: q1 / q4 untouched, the claw never below its start,
+    // never toward the box along the push
+    for (int i = 0; i <= 100; ++i) {
+      const WbReference r = traj->eval(t_ret + (t_fold - t_ret) * i / 100.0);
+      EXPECT_NEAR(r.q_d(0), from.q(0), 1e-9);
+      EXPECT_NEAR(r.q_d(3), from.q(3), 1e-9);
+      const Vec3 claw = clawOf(r);
+      EXPECT_GT(claw(2), claw0(2) - 1e-3) << "the open claw dropped along the handle";
+      if (retreat_carries) {   // the buckled arm folds back toward the body
+        EXPECT_LT((claw - claw0).dot(wp.push_dir), 1e-3) << "the open claw moved toward the box";
+      }
+    }
+    // which leg carried it
+    const VecN q_at_climb = traj->eval(t_climb).q_d;
+    EXPECT_LT((q_at_climb - (retreat_carries ? unb : from.q)).cwiseAbs().maxCoeff(), 1e-9);
+    EXPECT_LT((traj->eval(t_fold).q_d - unb).cwiseAbs().maxCoeff(), 1e-9);
+    // the fold ends home, above the retreated point
+    const Vec3 end = bodyOf(*v, traj->eval(traj->duration()));
+    EXPECT_LT((end.head<2>() - (from.x_b + back).head<2>()).norm(), 1e-6);
+    EXPECT_NEAR(end(2), from.x_b(2) + 0.30, 1e-6);
+    EXPECT_LT((traj->goalRest().q - v->home).norm(), 1e-9);
+  }
+  // no retreat (the mocap-guard abort): the climb carries the unbuckle
+  RestSpec from = wp.grasp;
+  from.q = buckled;
+  VecN unb = from.q;
+  unb(1) = 32.0 * kDeg;
+  unb(2) = 28.0 * kDeg;
+  const auto traj = planPushPullAbort(*v, *planner, PlanOptions{}, c, from, 0.30, 1.5, Vec3::Zero(), unb);
+  const auto * seq = dynamic_cast<const SequenceTrajectory *>(traj.get());
+  ASSERT_NE(seq, nullptr);
+  ASSERT_EQ(seq->segmentStarts().size(), 3u);   // release, climb, fold
+  EXPECT_LT((traj->eval(seq->segmentStarts()[2]).q_d - unb).cwiseAbs().maxCoeff(), 1e-9);
+}
+
 // THE TURN (2026-10-15, the valve-turning task): with turn_angle set, the push
 // step rotates the whole rest about the captured body's vertical axis -- the
 // claw on a circle of its radius from the axis, the heading turning with it,
@@ -840,4 +918,370 @@ TEST(PushPull, PushTimeComesFromTheMeanSpeed)
   c.push_speed = 0.0105;  // 38.1 s: inside, flown at its own time
   EXPECT_NEAR(planPushPullPush(*v, *planner, o, c, wp.grasp)->duration(),
     c.push_settle + 0.40 / 0.0105, 1e-6);
+}
+
+TEST(PushPull, BoxSampleGateDropsTheMisSolvesOnly)
+{
+  // (2026-10-21) the drone mocap guard's jump test on the box, with the 10-21 hardware numbers:
+  // 20 mm / 10 deg from the LAST GOOD sample, growing +1 m/s, +2 m/s^2, +90 deg/s over the gap
+  const double jm = 0.020, jd = 10.0, dt = 1.0 / 120.0;
+  // the mis-solve (a 94-96 deg roll, the origin 61 mm off) and the 180 deg flip: dropped
+  EXPECT_FALSE(boxSampleWithinGate(0.061, 95.0, dt, jm, jd));
+  EXPECT_FALSE(boxSampleWithinGate(0.179, 178.8, dt, jm, jd));
+  // ... and still dropped after the longest run seen, 25 samples (199 ms): the angle holds it
+  EXPECT_FALSE(boxSampleWithinGate(0.061, 94.8, 0.199, jm, jd));
+  // the largest real steps: the push (6.7 mm / 4.1 deg), a hand carry at 1.9 m/s (17.3 mm)
+  EXPECT_TRUE(boxSampleWithinGate(0.0067, 4.06, dt, jm, jd));
+  EXPECT_TRUE(boxSampleWithinGate(0.0173, 3.66, 0.0091, jm, jd));
+  // a pose that really moved is let back in as the allowance grows: 61 mm after 41 ms, a
+  // 95 deg turn after (95 - 10) / 90 = 0.94 s
+  EXPECT_FALSE(boxSampleWithinGate(0.061, 0.0, 0.035, jm, jd));
+  EXPECT_TRUE(boxSampleWithinGate(0.061, 0.0, 0.041, jm, jd));
+  EXPECT_FALSE(boxSampleWithinGate(0.0, 95.0, 0.93, jm, jd));
+  EXPECT_TRUE(boxSampleWithinGate(0.0, 95.0, 0.95, jm, jd));
+  // NaN is never good; each limit can be off alone; both off = every sample, NaN included
+  EXPECT_FALSE(boxSampleWithinGate(std::nan(""), 0.0, dt, jm, jd));
+  EXPECT_FALSE(boxSampleWithinGate(0.0, std::nan(""), dt, jm, jd));
+  EXPECT_TRUE(boxSampleWithinGate(0.061, 0.0, dt, 0.0, jd));
+  EXPECT_FALSE(boxSampleWithinGate(0.061, 95.0, dt, 0.0, jd));
+  EXPECT_TRUE(boxSampleWithinGate(0.0, 95.0, dt, jm, 0.0));
+  EXPECT_TRUE(boxSampleWithinGate(1.0, 180.0, dt, 0.0, 0.0));
+  EXPECT_TRUE(boxSampleWithinGate(std::nan(""), std::nan(""), dt, 0.0, 0.0));
+}
+
+// THE TABLE PLACED FROM THE BOX and GO TO START ROUND IT (2026-10-22, user: the lab
+// table goes where the floor is flat; the box always sits at its left end, its back
+// face 0.10 m in; the vehicle starts on the table's middle line, in front of it). The
+// box-pushing yaml of 2026-10-22: the HOOBRO table (1.000 x 0.150, top 0.80), the
+// CAD box 240 x 160 x 100 mm centred at (0.675, 0.28), the fin's grasp 0.183 m over
+// its centre, push pose [0, 32, 28, 0], margins 0.15 up / 0.12 back, T650 gear.
+namespace
+{
+PushPullConfig layoutConfig(const VehicleModel & v)
+{
+  PushPullConfig c;
+  c.home = v.home;
+  c.push_pose << 0.0, 32.0 * kDeg, 28.0 * kDeg, 0.0;
+  c.ee_offset << 0.0, 0.0, 0.183;
+  c.approach_dz = 0.15;
+  c.approach_back = 0.12;
+  c.exit_dz = 0.25;
+  c.push_distance = 0.10;
+  c.push_speed = 0.021;
+  c.push_min_time = 3.0;
+  c.push_settle = 1.5;
+  c.gear_depth = 0.2425;
+  c.fence.min_z = 0.25;
+  c.fence.max_z = 2.2;
+  c.box_half_length = 0.12;
+  c.table_from_box = true;
+  c.table_length = 1.0;
+  c.table_depth = 0.15;
+  c.table_box_gap = 0.10;
+  c.box_half_height = 0.05;
+  c.start_middle_tol = 0.30;
+  c.bypass = true;
+  c.bypass_clearance = 0.70;
+  return c;
+}
+
+PushPullTargets layoutScene(double box_yaw = 0.0)
+{
+  PushPullTargets t;
+  t.box << 0.675, 0.28, 0.85;
+  t.box_yaw = box_yaw;
+  t.start.p << -0.50, -0.07, 1.0;
+  t.start_set = true;
+  t.land.p << -0.50, -0.07, 0.30;
+  t.land.yaw = -360.0 * kDeg;
+  t.land_start.p << -0.50, -0.07, 1.30;
+  t.land_start.yaw = -360.0 * kDeg;
+  t.land_start_set = true;
+  return t;
+}
+
+// the takeoff hover over the start, facing the table (actual yaw 0), arm home
+RestSpec takeoffHover(const VehicleModel & v)
+{
+  RestSpec r;
+  r.x_b << -0.50, -0.07, 1.0;
+  r.phi = -0.5 * M_PI;
+  r.q = v.home;
+  return r;
+}
+}  // namespace
+
+TEST(PushPullLayout, TheTableIsPlacedUnderTheBox)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const PushPullConfig c = layoutConfig(*v);
+  // box yaw 0, the push along -y: the Isaac table exactly (x 0.600..0.750, y -0.5..0.5)
+  const TableKeepOut tb = tableFromBox(c, layoutScene().box, 0.0);
+  const std::array<Vec3, 4> corners = {
+    tb.toWorld(Vec3(tb.x_min, tb.y_min, 0.0)), tb.toWorld(Vec3(tb.x_min, tb.y_max, 0.0)),
+    tb.toWorld(Vec3(tb.x_max, tb.y_min, 0.0)), tb.toWorld(Vec3(tb.x_max, tb.y_max, 0.0))};
+  double x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (const Vec3 & p : corners) {
+    x0 = std::min(x0, p(0));
+    x1 = std::max(x1, p(0));
+    y0 = std::min(y0, p(1));
+    y1 = std::max(y1, p(1));
+  }
+  EXPECT_NEAR(x0, 0.600, 1e-12);
+  EXPECT_NEAR(x1, 0.750, 1e-12);
+  EXPECT_NEAR(y0, -0.50, 1e-12);
+  EXPECT_NEAR(y1, 0.50, 1e-12);
+  EXPECT_NEAR(tb.z_top, 0.80, 1e-12);
+  // the box end is the +y end, 0.22 m behind the box centre along the push
+  EXPECT_NEAR(tb.distanceXY(Vec3(0.675, 0.70, 0.0)), 0.20, 1e-12);
+  EXPECT_NEAR(tb.distanceXY(Vec3(0.675, -0.70, 0.0)), 0.20, 1e-12);
+  EXPECT_NEAR(tb.distanceXY(Vec3(-0.50, 0.0, 0.0)), 1.10, 1e-12);
+  EXPECT_EQ(tb.distanceXY(Vec3(0.70, 0.0, 0.0)), 0.0);
+  // round trip, and a table turned with a box at 30 deg
+  const Vec3 p(0.3, -0.2, 1.1);
+  EXPECT_LT((tb.toWorld(tb.toLocal(p)) - p).norm(), 1e-12);
+  const TableKeepOut t30 = tableFromBox(c, Vec3(1.0, 2.0, 0.85), 30.0 * kDeg);
+  const Vec3 end = Vec3(1.0, 2.0, 0.0) - 0.22 * Vec3(std::cos(-60.0 * kDeg), std::sin(-60.0 * kDeg), 0.0);
+  EXPECT_NEAR(t30.distanceXY(end), 0.0, 1e-12);
+  EXPECT_NEAR(t30.distanceXY(end - 0.10 * Vec3(std::cos(-60.0 * kDeg), std::sin(-60.0 * kDeg), 0.0)),
+    0.10, 1e-12);
+  // the waypoints carry it, and the box may slide at most 1.0 - 0.10 - 0.24 - 0.03 = 0.63 m
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, layoutScene());
+  EXPECT_NEAR(wp.table.x_min, tb.x_min, 1e-12);
+  EXPECT_NEAR(wp.table.yaw, tb.yaw, 1e-12);
+  PushPullConfig longer = c;
+  longer.push_distance = 0.62;
+  EXPECT_NO_THROW(pushPullWaypoints(*v, longer, layoutScene()));
+  longer.push_distance = 0.64;
+  EXPECT_THROW(pushPullWaypoints(*v, longer, layoutScene()), std::runtime_error);
+}
+
+TEST(PushPullLayout, PlanRefusesAStartThatDoesNotFitTheTable)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const PushPullConfig c = layoutConfig(*v);
+  EXPECT_NO_THROW(pushPullWaypoints(*v, c, layoutScene()));
+  const auto refused = [&](const PushPullTargets & t, const std::string & what) {
+      try {
+        pushPullWaypoints(*v, c, t);
+      } catch (const std::exception & e) {
+        EXPECT_NE(std::string(e.what()).find(what), std::string::npos) << e.what();
+        std::cout << "refused: " << e.what() << "\n";
+        return;
+      }
+      ADD_FAILURE() << "accepted: " << what;
+    };
+  // 0.35 m off the table's middle line (y 0 with the box at the +y end)
+  PushPullTargets off = layoutScene();
+  off.start.p(1) = 0.35;
+  refused(off, "middle line");
+  // the box (or its mocap body) read 180 deg off: the table would lie the other way
+  refused(layoutScene(M_PI), "middle line");
+  // 0.55 m from the table's front: the way round keeps 0.70 + 0.05
+  PushPullTargets close = layoutScene();
+  close.start.p(0) = 0.600 - 0.55;
+  refused(close, "from the table's side");
+}
+
+TEST(PushPullLayout, LandingHeadingsTurnWithTheBox)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PushPullConfig c = layoutConfig(*v);
+  for (const double yaw_deg : {0.0, 30.0, -100.0, 170.0}) {
+    const PushPullTargets t = layoutScene(yaw_deg * kDeg);
+    // the start on the middle line of the table this box places, 1.2 m in front
+    const TableKeepOut tb = tableFromBox(c, t.box, t.box_yaw);
+    PushPullTargets t2 = t;
+    t2.start.p = tb.toWorld(Vec3(0.5 * (tb.x_min + tb.x_max), -1.275, 1.0));
+    t2.land.p = Vec3(t2.start.p(0), t2.start.p(1), 0.30);
+    t2.land_start.p = Vec3(t2.start.p(0), t2.start.p(1), 1.30);
+    const PushPullWaypoints wp = pushPullWaypoints(*v, c, t2);
+    // land facing the table as typed from the push heading: -360 - (-90) = 270 deg clockwise
+    const double turn = wp.land_start.phi + 0.5 * M_PI - wp.drone_yaw;
+    EXPECT_NEAR(turn, -270.0 * kDeg, 1e-9) << yaw_deg;
+    const double facing = std::atan2(std::sin(wp.land.phi + 0.5 * M_PI - t.box_yaw),
+        std::cos(wp.land.phi + 0.5 * M_PI - t.box_yaw));
+    EXPECT_NEAR(facing, 0.0, 1e-9) << yaw_deg;
+    const auto home = planPushPullGoToLandStart(*v, *planner, PlanOptions{}, c, wp, wp.exited);
+    double unwrapped = 0.0, prev = headingOf(home->eval(0.0));
+    for (int k = 1; k <= 400; ++k) {
+      const double h = headingOf(home->eval(home->duration() * k / 400.0));
+      unwrapped += std::atan2(std::sin(h - prev), std::cos(h - prev));
+      prev = h;
+    }
+    EXPECT_NEAR(unwrapped, -270.0 * kDeg, 1e-3) << yaw_deg;
+  }
+}
+
+TEST(PushPullLayout, GoToStartGoesRoundTheTablesBoxEnd)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PushPullConfig c = layoutConfig(*v);
+  for (const double front : {1.10, 0.76, 2.0}) {
+    for (const double along : {0.0, 0.29, -0.29}) {
+      PushPullTargets t = layoutScene();
+      const TableKeepOut tb = tableFromBox(c, t.box, t.box_yaw);
+      // the start on (or off by `along`) the middle line, `front` m from the table's side
+      t.start.p = tb.toWorld(Vec3(0.5 * (tb.x_min + tb.x_max) + along, tb.y_min - front, 1.0));
+      const PushPullWaypoints wp = pushPullWaypoints(*v, c, t);
+      c.table = wp.table;
+      RestSpec from = takeoffHover(*v);
+      from.x_b = t.start.p;
+      const auto traj = planPushPullGoToStart(*v, *planner, PlanOptions{}, c, wp, from);
+      const double T = traj->duration();
+      const auto * seq = dynamic_cast<const SequenceTrajectory *>(traj.get());
+      ASSERT_NE(seq, nullptr) << traj->diag().summary;
+      ASSERT_EQ(seq->segmentStarts().size(), 2u) << traj->diag().summary;
+      const double t_in = seq->segmentStarts()[1];
+      EXPECT_LT((traj->goalRest().x_b - wp.approach.x_b).norm(), 1e-9);
+      for (const double te : {0.0, t_in, T}) {
+        const WbReference r = traj->eval(te);
+        EXPECT_LT(r.x_cd_dot.norm() + r.x_cd_ddot.norm() + r.x_cd_d3.norm(), 1e-6) << te;
+      }
+      // the curve: the body keeps 0.70 m from the table seen from above, the arm home
+      double closest = 1e9;
+      for (int k = 0; k <= 2000; ++k) {
+        const WbReference r = traj->eval(t_in * k / 2000.0);
+        closest = std::min(closest, wp.table.distanceXY(bodyOf(*v, r)));
+        EXPECT_LT((r.q_d - v->home).cwiseAbs().maxCoeff(), 1e-12);
+      }
+      EXPECT_GT(closest, c.bypass_clearance - 5e-3) << front << " " << along;
+      // in: along the push line, the heading already the push's
+      const WbReference e = traj->eval(t_in);
+      const Vec3 entry = bodyOf(*v, e);
+      EXPECT_NEAR(wp.table.distanceXY(entry), c.bypass_clearance, 1e-6);
+      EXPECT_NEAR(std::cos(headingOf(e) - wp.approach.phi), 1.0, 1e-9);
+      const Vec3 lat = (entry - wp.approach.x_b) - (entry - wp.approach.x_b).dot(wp.push_dir) * wp.push_dir;
+      EXPECT_LT(Vec3(lat(0), lat(1), 0.0).norm(), 1e-9);
+      // the derivative chain of the curve is consistent with its own position,
+      // through snap and the heading's rate (FD error relative to each peak)
+      double err[5] = {0, 0, 0, 0, 0}, peak[5] = {0, 0, 0, 0, 0};
+      const double h = 1e-4;
+      for (int k = 1; k < 400; ++k) {
+        const double tt = t_in * k / 400.0;
+        const WbReference a = traj->eval(tt - h), b = traj->eval(tt), d = traj->eval(tt + h);
+        const Vec3 fd[5] = {(d.x_cd - a.x_cd) / (2 * h), (d.x_cd_dot - a.x_cd_dot) / (2 * h),
+          (d.x_cd_ddot - a.x_cd_ddot) / (2 * h), (d.x_cd_d3 - a.x_cd_d3) / (2 * h),
+          (d.b1_d - a.b1_d) / (2 * h)};
+        const Vec3 an[5] = {b.x_cd_dot, b.x_cd_ddot, b.x_cd_d3, b.x_cd_d4, b.b1_d_dot};
+        for (int i = 0; i < 5; ++i) {
+          err[i] = std::max(err[i], (fd[i] - an[i]).norm());
+          peak[i] = std::max(peak[i], an[i].norm());
+        }
+      }
+      for (int i = 0; i < 5; ++i) {
+        EXPECT_LT(err[i], 1e-3 * peak[i]) << "derivative " << i + 1 << ": FD " << err[i]
+                                          << " vs peak " << peak[i];
+      }
+      EXPECT_LT(T, 30.0);
+      std::cout << "go_to_start, " << front << " m in front, " << along << " m along: " << T
+                << " s, the curve " << t_in << " s, " << closest << " m from the table -- "
+                << traj->diag().summary << "\n";
+    }
+  }
+}
+
+TEST(PushPullLayout, GoToStartNearTheTableFliesStraightAndPastItsFarEndRefuses)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PushPullConfig c = layoutConfig(*v);
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, layoutScene());
+  c.table = wp.table;
+  // a re-fly from just above the handle (an abort's climb): the one transition
+  RestSpec near = wp.approach;
+  near.x_b(2) += 0.30;
+  near.q = v->home;
+  const auto straight = planPushPullGoToStart(*v, *planner, PlanOptions{}, c, wp, near);
+  EXPECT_EQ(straight->diag().summary.rfind("(straight:", 0), 0u) << straight->diag().summary;
+  // past the table's FAR end, on its line: no way round its box end
+  RestSpec far = takeoffHover(*v);
+  far.x_b = wp.table.toWorld(Vec3(wp.table.x_max + 0.8, 0.0, 1.0));
+  EXPECT_THROW(planPushPullGoToStart(*v, *planner, PlanOptions{}, c, wp, far), std::runtime_error);
+  // past the BOX end already: straight to the entry, then in
+  RestSpec past = takeoffHover(*v);
+  past.x_b = wp.table.toWorld(Vec3(wp.table.x_min - 1.2, 0.4, 1.0));
+  const auto in = planPushPullGoToStart(*v, *planner, PlanOptions{}, c, wp, past);
+  EXPECT_LT((in->goalRest().x_b - wp.approach.x_b).norm(), 1e-9);
+}
+
+TEST(PushPullLayout, TheMissionDryRunsRoundTheTable)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PushPullConfig c = layoutConfig(*v);
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, layoutScene());
+  const auto steps = planPushPullMission(*v, *planner, PlanOptions{}, c, wp, takeoffHover(*v));
+  ASSERT_EQ(steps.size(), static_cast<size_t>(kNumPushPullSteps));
+  for (size_t k = 0; k < steps.size(); ++k) {
+    std::cout << pushPullStepName(static_cast<int>(k)) << ": " << steps[k]->duration() << " s -- "
+              << steps[k]->diag().summary << "\n";
+  }
+  // without the bypass the same mission flies straight to the approach and home;
+  // the steps at the box are the same
+  PushPullConfig direct = c;
+  direct.bypass = false;
+  const auto d = planPushPullMission(*v, *planner, PlanOptions{}, direct, wp, takeoffHover(*v));
+  EXPECT_GT(steps[0]->duration(), d[0]->duration());
+  for (const int k : {kPlReady, kPlPush, kPlExit, kPlLand}) {
+    EXPECT_NEAR(steps[k]->duration(), d[k]->duration(), 1e-9) << k;
+  }
+  EXPECT_NE(steps[kPlGoToLandStart]->diag().summary.find("round the table"), std::string::npos);
+}
+
+// THE WAY HOME ROUND THE TABLE (2026-10-22, user): Go To Land Start flies on
+// along the push's line past the table's FAR end (at the exit height, over the
+// pushed box), then curves round that corner of the table to Land Start; landing
+// at yaw -180 is a 90 deg clockwise turn from the push heading -90 (no full turn).
+TEST(PushPullLayout, GoToLandStartGoesRoundTheTableToo)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PushPullConfig c = layoutConfig(*v);
+  PushPullTargets t = layoutScene();
+  t.land.yaw = -180.0 * kDeg;
+  t.land_start.yaw = -180.0 * kDeg;
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, t);
+  c.table = wp.table;
+  const auto steps = planPushPullMission(*v, *planner, PlanOptions{}, c, wp, takeoffHover(*v));
+  const auto & home = steps[kPlGoToLandStart];
+  const double T = home->duration();
+  EXPECT_LT((home->goalRest().x_b - wp.land_start.x_b).norm(), 1e-9);
+  const RestSpec exited = steps[kPlExit]->goalRest();
+  double unwrapped = 0.0, prev = headingOf(home->eval(0.0)), low_near = 1e9, closest_low = 1e9;
+  for (int k = 0; k <= 2000; ++k) {
+    const WbReference r = home->eval(T * k / 2000.0);
+    const double h = headingOf(r);
+    const double d = std::atan2(std::sin(h - prev), std::cos(h - prev));
+    EXPECT_LE(d, 1e-9) << "turned counter-clockwise";
+    unwrapped += d;
+    prev = h;
+    const Vec3 body = bodyOf(*v, r);
+    const double dist = wp.table.distanceXY(body);
+    // near the table only at the exit height (backing out over its end)
+    if (dist < c.bypass_clearance - 5e-3) {low_near = std::min(low_near, body(2) - exited.x_b(2));}
+    if (body(2) < exited.x_b(2) - 1e-3) {closest_low = std::min(closest_low, dist);}
+  }
+  EXPECT_NEAR(unwrapped, -90.0 * kDeg, 1e-3);
+  EXPECT_GT(low_near, -1e-3);
+  // round the FAR end: the farthest it goes along the push is R past the table's far end
+  double reach = -1e9;
+  for (int k = 0; k <= 400; ++k) {
+    const Vec3 l = wp.table.toLocal(bodyOf(*v, home->eval(T * k / 400.0)));
+    reach = std::max(reach, l(0));
+  }
+  EXPECT_NEAR(reach, wp.table.x_max + c.bypass_clearance, 2e-3);
+  // too low a handle clearance is refused (the pushed box as a keep-out): a fin
+  // 0.40 m above the grasp would stand above the gear's path
+  PushPullConfig tall = c;
+  tall.handle_above_grasp = 0.40;
+  EXPECT_THROW(planPushPullGoToLandStart(*v, *planner, PlanOptions{}, tall, wp, exited), std::runtime_error);
+  EXPECT_GT(closest_low, c.bypass_clearance - 5e-3);
+  const double land_yaw = wp.land.phi + 0.5 * M_PI;
+  EXPECT_NEAR(std::cos(land_yaw - M_PI), 1.0, 1e-12);
+  std::cout << "go_to_land_start: " << T << " s -- " << home->diag().summary << "\n";
+  // land: straight down, heading kept
+  EXPECT_NEAR(std::cos(headingOf(steps[kPlLand]->eval(steps[kPlLand]->duration())) - wp.land.phi), 1.0, 1e-9);
 }

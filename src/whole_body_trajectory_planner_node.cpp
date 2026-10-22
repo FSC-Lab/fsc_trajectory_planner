@@ -756,6 +756,31 @@ public:
     // 0 = off (unchanged).
     declare_parameter<double>("push_pull_box_half_length", 0.0);
     declare_parameter<double>("push_pull_box_edge_margin", 0.03);
+    // THE TABLE PLACED FROM THE BOX (2026-10-22, user: the lab table goes where
+    // the floor is flat; PushPullConfig::table_from_box): true = push_pull_table
+    // is IGNORED and the keep-out is the table's footprint placed by the box
+    // capture -- push_pull_table_size [length along the push, depth], the box
+    // centred across it with its back face push_pull_table_box_gap in from the
+    // table's end, the top push_pull_box_half_height under the box centre. The
+    // landing headings turn with the box, Adjust takes the start wherever the
+    // vehicle is (no push_pull_adjust_max), and Plan refuses a start more than
+    // push_pull_start_middle_tol off the table's middle line. false = unchanged.
+    declare_parameter<bool>("push_pull_table_from_box", false);
+    declare_parameter<std::vector<double>>("push_pull_table_size", std::vector<double>{1.0, 0.15});
+    declare_parameter<double>("push_pull_table_box_gap", 0.10);
+    declare_parameter<double>("push_pull_box_half_height", 0.05);
+    declare_parameter<double>("push_pull_start_middle_tol", 0.30);
+    // GO TO START GOES ROUND THE TABLE (2026-10-22, user; PushPullConfig::bypass):
+    // a smooth curve round the table's box end, the body push_pull_bypass_clearance
+    // or more from it seen from above, then straight in along the push; and the
+    // way home goes on past the table's far end and round it. false = one
+    // transition each (unchanged).
+    declare_parameter<bool>("push_pull_go_to_start_bypass", false);
+    declare_parameter<double>("push_pull_bypass_clearance", 0.70);
+    // with the bypass the way home flies on along the push, over the pushed box,
+    // round the table's FAR end (2026-10-22): the box is a keep-out up to its
+    // handle's top, this far above the grasp point [m]
+    declare_parameter<double>("push_pull_handle_top_above_grasp", 0.025);
     declare_parameter<double>("push_pull_fence_min_z", 0.6);
     declare_parameter<double>("push_pull_fence_max_z", 1.8);
     declare_parameter<std::vector<double>>(
@@ -822,6 +847,16 @@ public:
     // (push_dir is the tangent at the grasp: mid-turn it points sideways or into the fin).
     // false = the anchor goes back to the CoM at once (unchanged).
     declare_parameter<bool>("push_pull_abort_release_world_held", false);
+    // THE UNBUCKLE (2026-10-21, archive/box_abort_unbuckle_20261021): true = an abort held
+    // on the MEASURED pose (push_pull_abort_from_measured) brings q2 / q3 back to the
+    // push pose's once the jaws are open -- in the first motion leg after the release wait
+    // (the retreat, else the climb) -- instead of holding the measured joints until the
+    // fold home. q1 / q4 stay as measured until the fold (they move the claw ACROSS the
+    // handle, q2 / q3 only along and above it). The 10-21 flight: a q3-guard trip held
+    // q2 on its +45 limit and q3 at ~2 deg (the elbow-singular boundary) for 9 s. An arm
+    // already within 1 deg of the push pose, or an unbuckle the planner refuses, keeps the
+    // old abort. false = the measured joints held until the fold (unchanged).
+    declare_parameter<bool>("push_pull_abort_unbuckle", false);
     // SAFETY GUARDS -> ABORT: the tilt (PX4 attitude) above this for that
     // long; the task force the whole-body node reads (wb_control_debug,
     // low-passed) above this for that long while the claw is on the handle or
@@ -850,6 +885,37 @@ public:
     declare_parameter<double>("push_pull_guard_box_persist_s", 0.20);
     declare_parameter<double>("push_pull_guard_box_stale_s", 0.50);
     declare_parameter<double>("push_pull_guard_q3_min_deg", 0.0);
+    // THE q3 RATE GUARD (2026-10-22): the static check above (q3 < q3_min_deg for
+    // box_persist_s, read on the 10 Hz tick) fires only after the fold has passed the
+    // limit -- in the 10-22 Isaac runs the arm folded at 51-141 deg/s, and at 259-356 deg/s
+    // in the three crashes, where it would have fired only AFTER the node had left DIRECT
+    // (q3 -45..-49 deg). This one looks AHEAD: on EVERY arm joint sample, q3's own rate
+    // (a finite difference of the measured q3, first-order low-passed over
+    // q3_rate_filter_s) predicts q3 lookahead_s later; the push-and-pull abort trips when
+    // that prediction is below q3_min_deg while q3 falls faster than q3_rate_min_deg_s,
+    // for q3_rate_persist_s. Armed exactly when the static check is. Replayed on the 10-22
+    // runs at 0.2 s: it fires 0.25-0.32 s before the DIRECT loss in the crashes (q3
+    // 15-16 deg), 0.24-0.35 s before the static check elsewhere, and in none of the
+    // shipped config's completed runs. lookahead_s 0 = off (unchanged); the static check
+    // stays either way.
+    declare_parameter<double>("push_pull_guard_q3_lookahead_s", 0.0);
+    declare_parameter<double>("push_pull_guard_q3_rate_min_deg_s", 5.0);
+    declare_parameter<double>("push_pull_guard_q3_rate_persist_s", 0.05);
+    declare_parameter<double>("push_pull_guard_q3_rate_filter_s", 0.02);
+    // THE BOX SAMPLE GATE (2026-10-21, the first hardware push): obj_0 mis-solved -- a 94-96
+    // deg roll with the origin 61 mm off, or a 180 deg flip -- in runs of 1-25 samples, 80
+    // samples over that flight, 2 of them with the claw on the box, where they reached both
+    // box guards and the push monitor (the guards' 0.2 s persistence kept it from aborting).
+    // A box sample farther than jump_m [m] or jump_deg [deg] from the LAST GOOD one, the
+    // allowance growing with the gap (+1 m/s, +2 m/s^2, +90 deg/s: boxSampleWithinGate), is
+    // dropped before Get, the box guards and the push monitor read it -- the drone mocap
+    // guard's jump test (fsc_drone_state_estimator_ros2 MocapGuard), its constants. A pose
+    // that really moved is let back in as the allowance grows; while samples keep being
+    // dropped the box feed ages, and box_stale_s aborts with the claw on the box. Replayed on
+    // the 10-21 bags: every mis-solve dropped, no other sample (a hand carry at 1.9 m/s
+    // passes). 0 = off: every sample used, as before.
+    declare_parameter<double>("push_pull_box_gate_jump_m", 0.0);
+    declare_parameter<double>("push_pull_box_gate_jump_deg", 0.0);
     declare_parameter<double>("push_pull_guard_force_n", 5.0);
     declare_parameter<double>("push_pull_guard_force_persist_s", 0.30);
     // PATH FOLLOWING FOR THE TURN (2026-10-18; push_pull_turn_deg != 0 only):
@@ -1617,10 +1683,79 @@ private:
       qd(j) = k < msg.velocity.size() ? msg.velocity[k] : 0.0;
     }
     if (!q.allFinite() || !qd.allFinite()) {return;}
-    std::lock_guard<std::recursive_mutex> lk(lock_);
-    q_meas_ = joint_sign_.cwiseProduct(q);
-    q_meas_time_ = Clock::now();
-    qdot_meas_ = joint_sign_.cwiseProduct(qd);
+    // the sample's own time for the q3 rate: its header stamp when it has one (a burst
+    // delivered late keeps its true spacing), else the receive time
+    const bool stamped = msg.header.stamp.sec != 0 || msg.header.stamp.nanosec != 0;
+    const double t_s = stamped ? rclcpp::Time(msg.header.stamp).seconds() :
+      std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+    bool trip = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      q_meas_ = joint_sign_.cwiseProduct(q);
+      q_meas_time_ = Clock::now();
+      qdot_meas_ = joint_sign_.cwiseProduct(qd);
+      trip = plQ3RateGuard(t_s, stamped, (*q_meas_)(2));
+    }
+    if (trip) {
+      auto resp = std::make_shared<Trigger::Response>();
+      onPlAbort(resp);
+      RCLCPP_ERROR(get_logger(), "push-and-pull SAFETY GUARD: %s -- %s", pl_guard_reason_.c_str(),
+        resp->message.c_str());
+    }
+  }
+
+  // THE q3 RATE GUARD (push_pull_guard_q3_lookahead_s > 0 enables; the parameters'
+  // comment has the why), with lock_ held, on every arm joint sample: true = abort now.
+  // The rate is kept warm on every sample, armed or not, and starts again after a gap
+  // (>= 0.1 s), a clock step backwards or a change of time source.
+  bool plQ3RateGuard(double t, bool stamped, double q3)
+  {
+    if (q3r_t_.has_value()) {
+      const double dt = t - *q3r_t_;
+      if (stamped == q3r_stamped_ && dt <= 0.0 && dt > -1e-9) {return false;}   // a repeated sample
+      if (stamped == q3r_stamped_ && dt > 0.0 && dt < 0.1) {
+        const double tc = std::max(1e-3, get_parameter("push_pull_guard_q3_rate_filter_s").as_double());
+        q3r_v_ += (1.0 - std::exp(-dt / tc)) * ((q3 - q3r_q_) / dt - q3r_v_);
+      } else {
+        q3r_v_ = 0.0;
+        pl_q3r_since_.reset();
+      }
+    }
+    q3r_t_ = t;
+    q3r_q_ = q3;
+    q3r_stamped_ = stamped;
+    const double tau = get_parameter("push_pull_guard_q3_lookahead_s").as_double();
+    const double lim = get_parameter("push_pull_guard_q3_min_deg").as_double();
+    const bool pushing = pl_flying_.has_value() && *pl_flying_ == kPlPush;
+    const bool engaged = mode_direct_ && hold_.has_value() && (pl_at_handle_ || pushing) &&
+      !pl_aborting_ && !pl_abort_plan_;
+    if (tau <= 0.0 || lim <= 0.0 || !engaged) {
+      pl_q3r_since_.reset();
+      return false;
+    }
+    const double q3d = q3 * 180.0 / M_PI;
+    const double vd = q3r_v_ * 180.0 / M_PI;
+    const double pred = q3d + tau * vd;
+    if (pred < lim && vd < -get_parameter("push_pull_guard_q3_rate_min_deg_s").as_double()) {
+      if (!pl_q3r_since_.has_value()) {pl_q3r_since_ = t;}
+      if (t - *pl_q3r_since_ >= get_parameter("push_pull_guard_q3_rate_persist_s").as_double() - 1e-9) {
+        std::ostringstream m;
+        m.setf(std::ios::fixed);
+        m.precision(1);
+        m << "q3 " << q3d << " deg falling at " << -vd << " deg/s -> " << pred << " deg in ";
+        m.precision(2);
+        m << tau << " s";
+        m.precision(1);
+        m << " < " << lim << " deg (the arm folding toward its elbow-singular branch)";
+        pl_guard_reason_ = m.str();
+        pl_guard_tripped_ = true;
+        pl_q3r_since_.reset();
+        return true;
+      }
+    } else {
+      pl_q3r_since_.reset();
+    }
+    return false;
   }
 
   // Grasp-point EE at the MEASURED joints, and the measured airframe it hangs
@@ -5224,7 +5359,47 @@ private:
     c->gear_radius = get_parameter("push_pull_gear_radius").as_double();
     c->box_half_length = get_parameter("push_pull_box_half_length").as_double();
     c->box_edge_margin = get_parameter("push_pull_box_edge_margin").as_double();
+    c->table_from_box = get_parameter("push_pull_table_from_box").as_bool();
+    const auto ts = get_parameter("push_pull_table_size").as_double_array();
+    if (ts.size() != 2) {
+      *err = "push_pull_table_size needs [length along the push, depth]";
+      return false;
+    }
+    c->table_length = ts[0];
+    c->table_depth = ts[1];
+    c->table_box_gap = get_parameter("push_pull_table_box_gap").as_double();
+    c->box_half_height = get_parameter("push_pull_box_half_height").as_double();
+    c->start_middle_tol = get_parameter("push_pull_start_middle_tol").as_double();
+    c->bypass = get_parameter("push_pull_go_to_start_bypass").as_bool();
+    c->bypass_clearance = get_parameter("push_pull_bypass_clearance").as_double();
+    c->handle_above_grasp = get_parameter("push_pull_handle_top_above_grasp").as_double();
     return true;
+  }
+
+  // The table to show and check against (lock_ held): the plan's when there is
+  // one (the plan's own, kept after an abort that dropped the capture), else the
+  // one the box capture places (push_pull_table_from_box), else the typed one.
+  // `derived` says whether it came from a box.
+  std::optional<TableKeepOut> plTableNow(bool * derived) const
+  {
+    *derived = false;
+    PushPullConfig c;
+    std::string err;
+    const bool cfg_ok = plConfig(&c, &err);
+    if (pl_wp_.has_value() || pl_leave_wp_.has_value()) {
+      *derived = cfg_ok && c.table_from_box;
+      return pl_wp_.has_value() ? pl_wp_->table : pl_leave_wp_->table;
+    }
+    if (!cfg_ok) {return std::nullopt;}
+    if (!c.table_from_box) {return c.table;}
+    if (!pl_box_.has_value()) {return std::nullopt;}
+    try {
+      *derived = true;
+      return tableFromBox(c, *pl_box_, pl_box_yaw_.value_or(0.0));
+    } catch (const std::exception &) {
+      *derived = false;
+      return std::nullopt;
+    }
   }
 
   // The goals' inputs: the captured box and the typed (Adjust-shifted) land
@@ -5234,6 +5409,9 @@ private:
     if (!ppBase("push_pull_land", &t->land, err)) {return false;}
     t->land_start_set = !get_parameter("push_pull_land_start").as_double_array().empty();
     if (t->land_start_set && !ppBase("push_pull_land_start", &t->land_start, err)) {return false;}
+    // the start mark: the layout check of a table placed from the box (2026-10-22)
+    if (!ppBase("push_pull_start_mark", &t->start, err)) {return false;}
+    t->start_set = true;
     if (!pl_box_.has_value()) {
       *err = "Get the box first (" + (pl_box_topic_.empty()
         ? std::string("no push_pull_box_topic set") : "mocap " + pl_box_topic_) + ")";
@@ -5253,9 +5431,13 @@ private:
       "push_pull_arrival_tol", "push_pull_leg_start_tol", "push_pull_adjust_max",
       "push_pull_abort_climb", "push_pull_abort_release_wait_s", "push_pull_guard_tilt_deg",
       "push_pull_abort_from_measured", "push_pull_abort_back", "push_pull_abort_release_world_held",
+      "push_pull_abort_unbuckle",
       "push_pull_guard_persist_s", "push_pull_guard_force_n", "push_pull_guard_force_persist_s",
       "push_pull_guard_box_lag", "push_pull_guard_box_tilt_deg", "push_pull_guard_box_persist_s",
       "push_pull_guard_box_stale_s", "push_pull_guard_q3_min_deg",
+      "push_pull_guard_q3_lookahead_s", "push_pull_guard_q3_rate_min_deg_s",
+      "push_pull_guard_q3_rate_persist_s", "push_pull_guard_q3_rate_filter_s",
+      "push_pull_box_gate_jump_m", "push_pull_box_gate_jump_deg",
       "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
       "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
       "push_pull_world_anchor_on_handle",
@@ -5329,6 +5511,8 @@ private:
         len = 4;
       } else if (n == "push_pull_ee_offset") {
         len = 3;
+      } else if (n == "push_pull_table_size") {
+        len = 2;
       } else if (n == "push_pull_table" || n == "push_pull_obstacle") {
         len = 5;
       }
@@ -5436,6 +5620,9 @@ private:
     bool trip = false;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
+      // THE BOX SAMPLE GATE (2026-10-21): a dropped sample reaches nothing below -- not Get's
+      // buffer, the push monitor or the box guards; the feed then ages for the stale guard
+      if (!plBoxGateAccept(p, Eigen::Quaterniond(o.w, o.x, o.y, o.z))) {return;}
       pl_mocap_.push_back(PpSample{Clock::now(), p, std::isfinite(yaw) ? yaw : 0.0, 0.0});
       while (pl_mocap_.size() > 1 &&
         (secondsSince(pl_mocap_.front().t) > 2.0 || pl_mocap_.size() > 2000))
@@ -5452,6 +5639,70 @@ private:
       RCLCPP_ERROR(get_logger(), "push-and-pull SAFETY GUARD: %s -- %s", pl_guard_reason_.c_str(),
         resp->message.c_str());
     }
+  }
+
+  // THE BOX SAMPLE GATE (push_pull_box_gate_jump_m / _deg), with lock_ held: true = use this
+  // box sample. boxSampleWithinGate from the LAST GOOD sample; a broken quaternion is dropped
+  // too ("garbage is never a pose", MocapGuard). Both limits 0: every sample, as before.
+  bool plBoxGateAccept(const Vec3 & p, const Eigen::Quaterniond & q_raw)
+  {
+    const double jm = get_parameter("push_pull_box_gate_jump_m").as_double();
+    const double jd = get_parameter("push_pull_box_gate_jump_deg").as_double();
+    if (!(jm > 0.0) && !(jd > 0.0)) {return true;}
+    const bool q_ok = q_raw.coeffs().allFinite() && std::abs(q_raw.norm() - 1.0) < 0.1;
+    const Eigen::Quaterniond q = q_ok ? q_raw.normalized() : Eigen::Quaterniond::Identity();
+    const double gap = pl_gate_t_.has_value() ? secondsSince(pl_gate_t_) : 0.0;
+    double d = 0.0, a = 0.0;
+    bool ok = q_ok;
+    if (ok && pl_gate_t_.has_value()) {
+      d = (p - pl_gate_p_).norm();
+      a = 2.0 * std::acos(std::min(1.0, std::abs(q.coeffs().dot(pl_gate_q_.coeffs())))) * 180.0 / M_PI;
+      ok = boxSampleWithinGate(d, a, gap, jm, jd);
+    }
+    if (ok) {
+      if (pl_gate_run_ > 0) {
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+          "box mocap: good again after %zu dropped sample(s) (%zu since start)", pl_gate_run_,
+          pl_gate_dropped_);
+      }
+      pl_gate_t_ = Clock::now();
+      pl_gate_p_ = p;
+      pl_gate_q_ = q;
+      pl_gate_run_ = 0;
+      return true;
+    }
+    ++pl_gate_dropped_;
+    ++pl_gate_run_;
+    pl_gate_last_mm_ = d * 1e3;
+    pl_gate_last_deg_ = a;
+    pl_gate_drop_t_.push_back(Clock::now());   // Get refuses a window with any (onPlCapture)
+    while (!pl_gate_drop_t_.empty() &&
+      (secondsSince(pl_gate_drop_t_.front()) > 2.0 || pl_gate_drop_t_.size() > 2000))
+    {
+      pl_gate_drop_t_.pop_front();
+    }
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+      "box mocap: sample DROPPED by the gate, %.0f mm / %.0f deg from the last good one %.0f ms "
+      "ago (> %.0f mm / %.0f deg + the growth over the gap)%s -- %zu dropped since start",
+      d * 1e3, a, gap * 1e3, jm * 1e3, jd, q_ok ? "" : " [broken quaternion]", pl_gate_dropped_);
+    return false;
+  }
+
+  // THE LAW'S FREE-AXIS SHIFT ALONG u (2026-10-21), with lock_ held: the whole-body law
+  // moves the claw's target by wb_ee_anchor_free_axis_weight x the CoM error along the
+  // vehicle's horizontal nose (wb_control_debug [117], metres along that axis). 0 when the
+  // feed or the attitude is stale -- the guard then reads the bare plan, as before.
+  static constexpr double kPlFreeOffStaleS = 0.25;
+  double plFreeAxisShift(const Vec3 & u) const
+  {
+    if (secondsSince(pl_free_off_t_) > kPlFreeOffStaleS || !att_R_.has_value() ||
+      secondsSince(att_time_) > kOdomFreshS)
+    {
+      return 0.0;
+    }
+    const Vec3 nose{(*att_R_)(0, 0), (*att_R_)(1, 0), 0.0};
+    const double n = nose.norm();
+    return n > 1e-6 ? pl_free_off_ * nose.dot(u) / n : 0.0;
   }
 
   // THE BOX GUARDS (push_pull_guard_box_lag / _box_tilt_deg), with lock_
@@ -5500,16 +5751,24 @@ private:
       pl_bg_lag_since_.reset();
       return false;
     }
+    const double d = get_parameter("push_pull_push_distance").as_double();
+    const Vec3 u = (d < 0.0 ? -1.0 : 1.0) * pl_wp_->push_dir;
     if (!pl_bg_lag0_.has_value() || pl_bg_lag_gen_ != plan_gen_) {
       pl_bg_lag0_ = p;
       pl_bg_lag_gen_ = plan_gen_;
+      pl_bg_shift0_ = plFreeAxisShift(u);
     }
     const double t = std::chrono::duration<double>(Clock::now() - *exec_t0_).count();
     const Vec3 plan = plan_->eval(std::min(t, plan_->duration())).r_ed -
       plan_->eval(0.0).r_ed;
-    const double d = get_parameter("push_pull_push_distance").as_double();
-    const Vec3 u = (d < 0.0 ? -1.0 : 1.0) * pl_wp_->push_dir;
-    pl_bg_lag_ = plan.dot(u) - (p - *pl_bg_lag0_).dot(u);
+    // the box against the claw target the LAW flies (2026-10-21): the plan plus the law's
+    // free-axis shift (wb_ee_anchor_free_axis_weight: the target rides that share of the
+    // vehicle's drift along the nose -- the push -- and the clamped box follows it ON
+    // PURPOSE). Against the bare plan that drift read as lag: Isaac a75_1 34.6 mm of the
+    // 40 mm limit, 16.2 mm against the law's target (no anchor: 6-13 mm), and the real
+    // vehicle drifts ~2x Isaac's. With the anchor off the shift is 0: the old guard exactly.
+    const double shift = plFreeAxisShift(u) - pl_bg_shift0_;
+    pl_bg_lag_ = plan.dot(u) + shift - (p - *pl_bg_lag0_).dot(u);
     if (std::abs(pl_bg_lag_) > lag_lim) {
       if (!pl_bg_lag_since_.has_value()) {pl_bg_lag_since_ = Clock::now();}
       if (secondsSince(pl_bg_lag_since_) >= persist) {
@@ -5517,6 +5776,7 @@ private:
         m << "the box is " << std::abs(pl_bg_lag_) * 1e3 << " mm " << (pl_bg_lag_ > 0.0 ? "BEHIND" : "AHEAD OF")
           << " its plan (> " << lag_lim * 1e3 << " mm: " << (pl_bg_lag_ > 0.0 ? "jammed or too heavy" : "running away")
           << ")";
+        if (std::abs(shift) > 5e-4) {m << " [law free-axis shift " << shift * 1e3 << " mm counted]";}
         pl_guard_reason_ = m.str();
         pl_guard_tripped_ = true;
         pl_bg_lag_since_.reset();
@@ -5661,9 +5921,16 @@ private:
     }
     if (box_armed && stale > 0.0 && std::max(age, frozen) > stale) {
       m.precision(2);
-      m << "the box's mocap (" << pl_box_topic_ << ") " << (frozen > age ? "FROZEN" : "silent")
+      const bool jumping = frozen <= age && pl_gate_run_ > 0;
+      m << "the box's mocap (" << pl_box_topic_ << ") "
+        << (frozen > age ? "FROZEN" : jumping ? "JUMPING" : "silent")
         << " for " << std::min(std::max(age, frozen), 99.0)
         << " s > " << stale << " s -- the box guards are blind";
+      if (jumping) {
+        m.precision(0);
+        m << " (" << pl_gate_run_ << " samples dropped by the box sample gate, the latest "
+          << pl_gate_last_mm_ << " mm / " << pl_gate_last_deg_ << " deg from the last good one)";
+      }
       pl_guard_reason_ = m.str();
       pl_guard_tripped_ = true;
       return true;
@@ -5780,6 +6047,28 @@ private:
         resp->message = m.str();
         return;
       }
+      // FLIPPING / JUMPING (2026-10-21, the box sample gate): the gate drops a mis-solve and
+      // keeps the solution it holds -- the true one when the box was tracked before the flips
+      // began, NOT necessarily when the feed has flipped from the start. A capture window with
+      // any dropped sample is refused, as the flipping-yaw check below did before the gate.
+      std::size_t dropped = 0;
+      for (const auto & t : pl_gate_drop_t_) {
+        if (secondsSince(t) <= window) {++dropped;}
+      }
+      if (dropped > 0) {
+        m.precision(2);
+        m << "the box's mocap is flipping or jumping: the box sample gate dropped " << dropped
+          << " of " << dropped + pts.size() << " samples from " << pl_box_topic_ << " in the last "
+          << window << " s";
+        m.precision(0);
+        m << " (the latest " << pl_gate_last_mm_ << " mm / " << pl_gate_last_deg_
+          << " deg from the last good one) -- check the body in the mocap software, then Get "
+             "again -- NOT captured";
+        resp->success = false;
+        resp->message = m.str();
+        RCLCPP_WARN(get_logger(), "push-and-pull capture refused: %s", resp->message.c_str());
+        return;
+      }
       // FROZEN (2026-10-19, as the pick-and-place capture since 2026-10-10): a
       // tracked body jitters by tens of micrometres at least; identical samples
       // are the mocap processor republishing the last pose of a body it lost
@@ -5894,7 +6183,11 @@ private:
       Vec3 off = *odom_p_ - mark.p;
       off(2) = 0.0;
       const double max_off = get_parameter("push_pull_adjust_max").as_double();
-      if (off.norm() > max_off) {
+      // the table placed from the box (2026-10-22): the start is wherever the
+      // vehicle is -- the table goes where the floor is flat, so a room-fixed mark
+      // means nothing; Plan checks the start against the table instead
+      const bool from_box = get_parameter("push_pull_table_from_box").as_bool();
+      if (!from_box && off.norm() > max_off) {
         m << "offset [" << off(0) << ", " << off(1) << "] m is larger than " << max_off
           << " m -- is the vehicle on its start mark? Not adjusted";
         resp->success = false;
@@ -5924,8 +6217,13 @@ private:
       }
       pl_offset_ = off;
       plInvalidate();
-      m << "start mark and land point moved by [" << off(0) << ", " << off(1)
-        << "] m (the box is measured and not moved); press Plan";
+      if (from_box) {
+        m << "start, Land Start and land moved to where the vehicle is (by [" << off(0) << ", "
+          << off(1) << "] m; the table is placed from the box); press Plan";
+      } else {
+        m << "start mark and land point moved by [" << off(0) << ", " << off(1)
+          << "] m (the box is measured and not moved); press Plan";
+      }
     }
     resp->success = true;
     resp->message = m.str();
@@ -6025,6 +6323,18 @@ private:
                 get_logger(), "push-and-pull planned: %.1f s of flight in six steps; the push slides "
                 "the box %.2f m along yaw %.1f deg.", whole->duration(), cfg.push_distance,
                 wp->drone_yaw * 180.0 / M_PI);
+            }
+            if (cfg.table_from_box) {
+              // the table placed from the box (2026-10-22): its corners, to check by eye
+              const TableKeepOut & tb = wp->table;
+              const Vec3 a = tb.toWorld(Vec3(tb.x_min, tb.y_min, 0.0));
+              const Vec3 b = tb.toWorld(Vec3(tb.x_min, tb.y_max, 0.0));
+              const Vec3 e = tb.toWorld(Vec3(tb.x_max, tb.y_max, 0.0));
+              const Vec3 d = tb.toWorld(Vec3(tb.x_max, tb.y_min, 0.0));
+              RCLCPP_INFO(
+                get_logger(), "push-and-pull: the table placed from the box -- box end corners "
+                "(%.3f, %.3f) (%.3f, %.3f), far end (%.3f, %.3f) (%.3f, %.3f), top %.3f m",
+                a(0), a(1), b(0), b(1), e(0), e(1), d(0), d(1), tb.z_top);
             }
           }
         }
@@ -6144,6 +6454,7 @@ private:
       }
       from = *hold_;
       wp = pl_wp_.has_value() ? *pl_wp_ : *pl_leave_wp_;   // leaving the table after an abort
+      cfg.table = wp.table;   // the plan's table (2026-10-22: placed from the box, or typed)
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -6299,6 +6610,7 @@ private:
     PushPullConfig cfg;
     std::string err;
     if (!plConfig(&cfg, &err) || cfg.unload_time <= 0.0) {return false;}
+    if (pl_wp_.has_value()) {cfg.table = pl_wp_->table;}   // the plan's table (2026-10-22)
     pl_unloaded_ = true;
     const auto now = Clock::now();
     const double avg = get_parameter("push_pull_unload_avg_s").as_double();
@@ -6456,6 +6768,7 @@ private:
     double climb = 0.0, wait = 0.0;
     Vec3 retreat = Vec3::Zero();
     bool measured = false;
+    std::optional<VecN> unbuckle;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !hold_.has_value()) {
@@ -6477,7 +6790,8 @@ private:
         return;
       }
       std::string err;
-      if (!plConfig(&cfg, &err)) {
+      const bool cfg_ok = plConfig(&cfg, &err);
+      if (!cfg_ok) {
         // an abort is never refused for a configuration error: the defaults
         cfg = PushPullConfig{};
         cfg.home = home_pose_;
@@ -6510,6 +6824,16 @@ private:
           cut = false;
           measured = true;
         }
+      }
+      // THE UNBUCKLE (2026-10-21): the measured arm back to the push pose's q2 / q3 once
+      // the jaws are open (planPushPullAbort's first motion leg); q1 / q4 as measured.
+      // Only with a configured push pose (the defaults' is all zero: q3 = 0 IS the
+      // singularity this leaves) and when the arm is off it by more than 1 deg.
+      if (measured && cfg_ok && get_parameter("push_pull_abort_unbuckle").as_bool()) {
+        VecN q = from.q;
+        q(1) = cfg.push_pose(1);
+        q(2) = cfg.push_pose(2);
+        if ((q - from.q).cwiseAbs().maxCoeff() > M_PI / 180.0) {unbuckle = q;}
       }
       const bool turning = get_parameter("push_pull_turn_deg").as_double() != 0.0;
       if (touched && pl_wp_.has_value()) {
@@ -6564,13 +6888,25 @@ private:
     publishPlStatus();
     publishPlInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, from, cfg, opts, gen, climb, wait, retreat]() {
+    worker_ = std::thread([this, from, cfg, opts, gen, climb, wait, retreat, unbuckle]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
-          traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat);
+          traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat, unbuckle);
         } catch (const std::exception & e) {
           err = e.what();
+        }
+        // an abort is never lost to the unbuckle: refused, the arm is held as measured
+        // until the fold (the abort before 2026-10-21)
+        if (!traj && unbuckle.has_value()) {
+          RCLCPP_WARN(get_logger(), "push-and-pull ABORT: the unbuckle was refused (%s) -- "
+            "the arm held as measured until the fold", err.c_str());
+          err.clear();
+          try {
+            traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat);
+          } catch (const std::exception & e) {
+            err = e.what();
+          }
         }
         {
           std::lock_guard<std::recursive_mutex> lk(lock_);
@@ -6605,6 +6941,12 @@ private:
       << (retreat.norm() > 1e-3 ? "back " : "") << "then up " << climb << " m and the "
       << "arm home, from " << (measured ? "the MEASURED pose" : cut ? "the point the step was cut at" : "the hold");
     if (retreat.norm() > 1e-3) {m << " (back " << retreat.norm() << " m against the push first)";}
+    if (unbuckle.has_value()) {
+      m.precision(1);
+      m << "; once the jaws are open the arm unbuckles from q2/q3 " << from.q(1) * 180.0 / M_PI
+        << "/" << from.q(2) * 180.0 / M_PI << " to " << (*unbuckle)(1) * 180.0 / M_PI << "/"
+        << (*unbuckle)(2) * 180.0 / M_PI << " deg";
+    }
     resp->success = true;
     resp->message = m.str();
     RCLCPP_WARN(get_logger(), "push-and-pull: %s", resp->message.c_str());
@@ -6869,6 +7211,12 @@ private:
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       const auto now = Clock::now();
+      // the law's free-axis shift for the box-lag guard (2026-10-21; the array has carried
+      // it since 2026-10-18 -- an older node's shorter array leaves it at 0, the old guard)
+      if (msg.data.size() > 117 && std::isfinite(msg.data[117])) {
+        pl_free_off_ = msg.data[117];
+        pl_free_off_t_ = now;
+      }
       // the unload's input: the law's task error while the push flies
       const Vec3 ey{msg.data[24], msg.data[25], msg.data[26]};
       if (pl_flying_.has_value() && *pl_flying_ == kPlPush && ey.allFinite()) {
@@ -7112,7 +7460,13 @@ private:
   // [72] a straight push's time from them, max(|distance| / speed, floor) [s]
   // (NaN when the speed is not set); then THE TESTED RANGES (2026-10-21):
   // [73] / [74] the Push Distance's min / max [m], [75] / [76] the mean speed's
-  // [m/s] (NaN = no range); 77 values. NaN where there is nothing.
+  // [m/s] (NaN = no range); then THE TABLE (2026-10-22, appended): [77] 1 = a
+  // table to check against, [78] 1 = placed from the box (push_pull_table_from_box),
+  // [79] / [80] its frame's origin x, y [m], [81] its frame's yaw [deg] (0 = world
+  // axes, the typed table), [82..85] x_min, x_max, y_min, y_max in that frame [m],
+  // [86] its top z [m] -- the plan's table when planned, else the one the box
+  // capture places, else the typed one (NaN when none); 87 values. NaN where
+  // there is nothing.
   void publishPlInfo()
   {
     Float64MultiArray m;
@@ -7170,6 +7524,17 @@ private:
         const auto v = get_parameter(k).as_double_array();
         m.data.push_back(v.size() == 2 ? v[0] : nan);
         m.data.push_back(v.size() == 2 ? v[1] : nan);
+      }
+      // [77..86] the table (2026-10-22)
+      bool derived = false;
+      const auto tb = plTableNow(&derived);
+      if (tb.has_value() && tb->valid()) {
+        m.data.insert(m.data.end(), {1.0, derived ? 1.0 : 0.0, tb->ox, tb->oy,
+            tb->yaw * 180.0 / M_PI, tb->x_min, tb->x_max, tb->y_min, tb->y_max, tb->z_top});
+      } else {
+        m.data.push_back(0.0);
+        m.data.push_back(derived ? 1.0 : 0.0);
+        m.data.insert(m.data.end(), 8, nan);
       }
     }
     pl_info_pub_->publish(m);
@@ -7446,6 +7811,20 @@ private:
   std::optional<Vec3> pl_bg_lag0_;               // the box when the push started executing
   unsigned pl_bg_lag_gen_{0};
   double pl_bg_lag_{0.0}, pl_bg_tilt_{0.0};      // the last values (for the info line)
+  // THE BOX SAMPLE GATE (2026-10-21): the last GOOD box sample, and the samples dropped
+  std::optional<Clock::time_point> pl_gate_t_;
+  Vec3 pl_gate_p_{Vec3::Zero()};
+  Eigen::Quaterniond pl_gate_q_{Eigen::Quaterniond::Identity()};
+  std::size_t pl_gate_dropped_{0};               // since start
+  std::size_t pl_gate_run_{0};                   // in the current run (0: the last sample was good)
+  double pl_gate_last_mm_{0.0}, pl_gate_last_deg_{0.0};   // the latest dropped sample's jump
+  std::deque<Clock::time_point> pl_gate_drop_t_;          // the drops of the last 2 s (Get's check)
+  // THE LAW'S FREE-AXIS SHIFT (2026-10-21): wb_control_debug [117], the claw target's
+  // offset along the vehicle's horizontal nose [m] (wb_ee_anchor_free_axis_weight), when
+  // it was read, and its share along the push when the lag's origin was taken
+  double pl_free_off_{0.0};
+  std::optional<Clock::time_point> pl_free_off_t_;
+  double pl_bg_shift0_{0.0};
   // THE PUSH MONITOR (2026-10-21): plMonitorUpdate, push_pull/arrival_error [21..29]
   struct PlMonitor
   {
@@ -7487,6 +7866,12 @@ private:
   std::optional<VecN> q_meas_;
   Clock::time_point q_meas_time_{};   // when q_meas_ arrived (the drop gates and the aim need it fresh)
   VecN qdot_meas_{VecN::Zero()};
+  // the q3 rate guard's state (plQ3RateGuard)
+  std::optional<double> q3r_t_;
+  double q3r_q_{0.0};
+  double q3r_v_{0.0};
+  bool q3r_stamped_{false};
+  std::optional<double> pl_q3r_since_;
   int viz_decim_{0};
   int viz_decim_period_{5};
 
