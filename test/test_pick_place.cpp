@@ -461,6 +461,88 @@ TEST(PickPlace, TheHookGraspApproachesLevelAndThePlaceExitBacksOutFirst)
   EXPECT_EQ(legs.size(), static_cast<size_t>(kNumPickPlaceLegs));
 }
 
+TEST(PickPlace, TheInsertPlaceApproachesLevelFromBehindAndSlidesStraightIn)
+{
+  // the mail delivery (2026-10-23): an envelope gripped flat (wrist roll q4 =
+  // 90 deg, the jaws closing vertically) is slid through a mailbox's front
+  // mouth -- the place approaches from BEHIND at the goal's own height, the
+  // place "descent" is the level move in, and the exit backs out first
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  c.trim_settle_s = 2.0;                 // must NOT split the horizontal insert either
+  const VecN mail = (VecN() << 0.0, 36.0 * kDeg, 44.0 * kDeg, 90.0 * kDeg).finished();
+  c.pick_pose = c.place_pose = c.carry = mail;
+  c.sweep.lo = c.sweep.hi = mail;
+  c.pick_approach_back = 0.10;
+  c.place_exit_back = 0.10;
+  c.place_insert = true;
+  c.place_approach_back = 0.15;
+  PickPlaceTargets t = scene();
+  t.place << 1.6, -1.0, 1.0;             // the mouth, higher than a pillar top
+  PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  const auto nose = [](double phi) {return Vec3(-std::sin(phi), std::cos(phi), 0.0);};
+  const int kl = kExecutePlace;
+  const Vec3 n_l = nose(wp.goal[kl].phi);
+  // the place's ready point: 0.15 m behind the goal, at its height, same arm
+  EXPECT_LT((wp.goal[kl].x_b - wp.approach[kl].x_b - 0.15 * n_l).norm(), 1e-12);
+  EXPECT_LT((wp.ee[kl] - wp.approach_ee[kl] - 0.15 * n_l).norm(), 1e-9);
+  EXPECT_LT((wp.approach[kl].q - wp.goal[kl].q).norm(), 1e-12);
+  EXPECT_NEAR(wp.goal[kl].q(3), 90.0 * kDeg, 1e-12);
+
+  // the insert: one level segment, straight onto the (trimmed) goal
+  wp.goal[kl].x_b += Vec3(0.004, -0.003, 0.002);
+  const auto D = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, kl, wp.approach[kl]);
+  const auto * sd = dynamic_cast<const SequenceTrajectory *>(D.get());
+  EXPECT_TRUE(sd == nullptr || sd->segmentStarts().size() == 1u);
+  const WbReference d0 = D->eval(0.0), dT = D->eval(D->duration());
+  for (int i = 0; i <= 40; ++i) {
+    const WbReference a = D->eval(D->duration() * i / 40.0);
+    EXPECT_GT(a.r_ed(2), std::min(d0.r_ed(2), dT.r_ed(2)) - 0.003);
+    EXPECT_LT(a.r_ed(2), std::max(d0.r_ed(2), dT.r_ed(2)) + 0.003);
+    // and along the nose: the claw never strays sideways off the slide line
+    const Vec3 rel = a.r_ed - d0.r_ed;
+    EXPECT_LT((rel - rel.dot(n_l) * n_l).head<2>().norm(), 0.006);
+  }
+  EXPECT_LT((dT.x_cd - restReference(v->params, wp.goal[kl]).x_cd).norm(), 1e-6);
+
+  // the place exit: back 0.10 m at the hold's height, THEN up 0.20 m
+  const auto EX = planPickPlaceExit(*v, *planner, PlanOptions{}, c, kl, wp.goal[kl]);
+  const auto * se = dynamic_cast<const SequenceTrajectory *>(EX.get());
+  ASSERT_NE(se, nullptr);
+  ASSERT_EQ(se->segmentStarts().size(), 2u);
+  const double t1 = se->segmentStarts()[1];
+  const WbReference e0 = EX->eval(0.0), e1 = EX->eval(t1), eT = EX->eval(EX->duration());
+  EXPECT_LT((e1.r_ed - e0.r_ed + 0.10 * n_l).norm(), 1e-6);
+  EXPECT_LT((eT.r_ed - e1.r_ed - Vec3(0.0, 0.0, 0.20)).norm(), 1e-6);
+
+  // the mission dry run flies it: every leg, q4 at 90 deg from the pick on
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> exits;
+  const PickPlaceWaypoints wp2 = pickPlaceWaypoints(*v, c, t);
+  const auto legs = planPickPlaceMission(*v, *planner, PlanOptions{}, c, wp2, wp2.goal[kGoToStart], &exits);
+  ASSERT_EQ(legs.size(), static_cast<size_t>(kNumPickPlaceLegs));
+  EXPECT_NEAR(legs[kGoToPlaceStart]->eval(legs[kGoToPlaceStart]->duration()).q_d(3), 90.0 * kDeg, 1e-6);
+
+  // refused: an insert without a margin, and an insert that is also a drop
+  PickPlaceConfig bad = c;
+  bad.place_approach_back = 0.0;
+  try {
+    pickPlaceWaypoints(*v, bad, t);
+    ADD_FAILURE() << "an insert with no approach margin was accepted";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("pick_place_place_approach_back"), std::string::npos) << e.what();
+  }
+  bad = c;
+  bad.place_drop = true;
+  try {
+    pickPlaceWaypoints(*v, bad, t);
+    ADD_FAILURE() << "an insert that is also a drop was accepted";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("exclude each other"), std::string::npos) << e.what();
+  }
+}
+
 TEST(PickPlace, ADropPlaceEndsOnTheDropPointWithNoDescentAndBacksOut)
 {
   // the drop place (2026-10-14, user design): Ready To Place flies straight to

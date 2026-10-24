@@ -422,6 +422,14 @@ public:
     // climbs [m]. 0 = the vertical approach / exit (see PickPlaceConfig).
     declare_parameter<double>("pick_place_pick_approach_back", 0.0);
     declare_parameter<double>("pick_place_place_exit_back", 0.0);
+    // THE INSERT PLACE (2026-10-23, the mail-delivery task; see
+    // PickPlaceConfig::place_insert): true = Ready To Place holds
+    // pick_place_place_approach_back [m] BEHIND the place target at its own
+    // height (in front of the mailbox mouth), and Place slides the claw straight
+    // in along the nose; Exit To Place backs out pick_place_place_exit_back and
+    // climbs. Excludes pick_place_place_drop. false = unchanged.
+    declare_parameter<bool>("pick_place_place_insert", false);
+    declare_parameter<double>("pick_place_place_approach_back", 0.0);
     // DROP PLACE (2026-10-14, user design; see PickPlaceConfig::place_drop):
     // true = Ready To Place flies the claw straight to drop_height [m] above the
     // place claw target and the leg ends there; the arm GS's Place opens the
@@ -847,6 +855,8 @@ public:
     // (push_dir is the tangent at the grasp: mid-turn it points sideways or into the fin).
     // false = the anchor goes back to the CoM at once (unchanged).
     declare_parameter<bool>("push_pull_abort_release_world_held", false);
+    // (2026-10-22) the release wait on a MOCAP-GUARD abort [s]; < 0 = push_pull_abort_release_wait_s
+    declare_parameter<double>("push_pull_abort_mocap_release_wait_s", -1.0);
     // THE UNBUCKLE (2026-10-21, archive/box_abort_unbuckle_20261021): true = an abort held
     // on the MEASURED pose (push_pull_abort_from_measured) brings q2 / q3 back to the
     // push pose's once the jaws are open -- in the first motion leg after the release wait
@@ -902,6 +912,20 @@ public:
     declare_parameter<double>("push_pull_guard_q3_rate_min_deg_s", 5.0);
     declare_parameter<double>("push_pull_guard_q3_rate_persist_s", 0.05);
     declare_parameter<double>("push_pull_guard_q3_rate_filter_s", 0.02);
+    // THE q2 WALL IN THE q3 RATE GUARD (2026-10-24, the 10-23 hardware box push, Pegasus
+    // archive/wb_box_pushing_flight_20261023): the rate guard above projects q3 at its own
+    // speed, but when the arm STRETCHES q2 rises as q3 falls, and q2 cannot pass the arm
+    // controller's wall (min/max_position, +45 deg on the real arm: the U2D2 board). With the
+    // fold q2 + q3 held, the stretch stops there and q3 with it -- on 10-23 the guard fired at
+    // q3 18.0 deg falling at 67 deg/s (projected 4.6) while q2 rose to its wall and q3 stopped
+    // at 14.1. So the projection also projects q2 and takes back the part of its rise the wall
+    // forbids: q3_pred = q3 + tau*q3dot + max(0, q2 + tau*q2dot - q2_max) (exact for q3 = fold
+    // - q2 with q2 clipped at the wall). A real buckle -- q2 already pinned, q3 still falling
+    // -- gets no credit and trips as before (replayed on 67 Isaac runs: every buckle caught at
+    // the same moment). No credit once q2 is more than kPlQ2WallTolDeg past the wall (the wall
+    // is not holding). In the MODEL convention (= the arm's: arm_joint_sign q2 = +1 on every
+    // config). 0 = off (the rule above, unchanged).
+    declare_parameter<double>("push_pull_guard_q2_max_deg", 0.0);
     // THE BOX SAMPLE GATE (2026-10-21, the first hardware push): obj_0 mis-solved -- a 94-96
     // deg roll with the origin 61 mm off, or a 180 deg flip -- in runs of 1-25 samples, 80
     // samples over that flight, 2 of them with the claw on the box, where they reached both
@@ -1694,7 +1718,7 @@ private:
       q_meas_ = joint_sign_.cwiseProduct(q);
       q_meas_time_ = Clock::now();
       qdot_meas_ = joint_sign_.cwiseProduct(qd);
-      trip = plQ3RateGuard(t_s, stamped, (*q_meas_)(2));
+      trip = plQ3RateGuard(t_s, stamped, (*q_meas_)(1), (*q_meas_)(2));
     }
     if (trip) {
       auto resp = std::make_shared<Trigger::Response>();
@@ -1707,22 +1731,28 @@ private:
   // THE q3 RATE GUARD (push_pull_guard_q3_lookahead_s > 0 enables; the parameters'
   // comment has the why), with lock_ held, on every arm joint sample: true = abort now.
   // The rate is kept warm on every sample, armed or not, and starts again after a gap
-  // (>= 0.1 s), a clock step backwards or a change of time source.
-  bool plQ3RateGuard(double t, bool stamped, double q3)
+  // (>= 0.1 s), a clock step backwards or a change of time source. q2's rate is kept the same
+  // way, for the q2 wall (push_pull_guard_q2_max_deg).
+  static constexpr double kPlQ2WallTolDeg = 1.0;   // past the wall by more: no credit
+  bool plQ3RateGuard(double t, bool stamped, double q2, double q3)
   {
     if (q3r_t_.has_value()) {
       const double dt = t - *q3r_t_;
       if (stamped == q3r_stamped_ && dt <= 0.0 && dt > -1e-9) {return false;}   // a repeated sample
       if (stamped == q3r_stamped_ && dt > 0.0 && dt < 0.1) {
         const double tc = std::max(1e-3, get_parameter("push_pull_guard_q3_rate_filter_s").as_double());
-        q3r_v_ += (1.0 - std::exp(-dt / tc)) * ((q3 - q3r_q_) / dt - q3r_v_);
+        const double a = 1.0 - std::exp(-dt / tc);
+        q3r_v_ += a * ((q3 - q3r_q_) / dt - q3r_v_);
+        q2r_v_ += a * ((q2 - q2r_q_) / dt - q2r_v_);
       } else {
         q3r_v_ = 0.0;
+        q2r_v_ = 0.0;
         pl_q3r_since_.reset();
       }
     }
     q3r_t_ = t;
     q3r_q_ = q3;
+    q2r_q_ = q2;
     q3r_stamped_ = stamped;
     const double tau = get_parameter("push_pull_guard_q3_lookahead_s").as_double();
     const double lim = get_parameter("push_pull_guard_q3_min_deg").as_double();
@@ -1735,7 +1765,14 @@ private:
     }
     const double q3d = q3 * 180.0 / M_PI;
     const double vd = q3r_v_ * 180.0 / M_PI;
-    const double pred = q3d + tau * vd;
+    // the q2 wall (push_pull_guard_q2_max_deg): the part of q2's projected rise past it cannot
+    // happen, and with the fold held neither can that much of q3's fall
+    const double q2_max = get_parameter("push_pull_guard_q2_max_deg").as_double();
+    const double q2d = q2 * 180.0 / M_PI;
+    const double v2d = q2r_v_ * 180.0 / M_PI;
+    const double credit = (q2_max > 0.0 && q2d <= q2_max + kPlQ2WallTolDeg)
+      ? std::max(0.0, q2d + tau * v2d - q2_max) : 0.0;
+    const double pred = q3d + tau * vd + credit;
     if (pred < lim && vd < -get_parameter("push_pull_guard_q3_rate_min_deg_s").as_double()) {
       if (!pl_q3r_since_.has_value()) {pl_q3r_since_ = t;}
       if (t - *pl_q3r_since_ >= get_parameter("push_pull_guard_q3_rate_persist_s").as_double() - 1e-9) {
@@ -1746,6 +1783,12 @@ private:
         m.precision(2);
         m << tau << " s";
         m.precision(1);
+        if (credit > 0.0) {
+          m << " (" << credit << " deg of the fall stopped by q2's " << q2_max << " deg wall: q2 "
+            << q2d << " deg rising at " << v2d << " deg/s)";
+        } else if (q2_max > 0.0) {
+          m << " (q2 " << q2d << " deg)";
+        }
         m << " < " << lim << " deg (the arm folding toward its elbow-singular branch)";
         pl_guard_reason_ = m.str();
         pl_guard_tripped_ = true;
@@ -3374,6 +3417,8 @@ private:
     c->pick_approach_back = get_parameter("pick_place_pick_approach_back").as_double();
     c->place_exit_back = get_parameter("pick_place_place_exit_back").as_double();
     c->place_drop = get_parameter("pick_place_place_drop").as_bool();
+    c->place_insert = get_parameter("pick_place_place_insert").as_bool();
+    c->place_approach_back = get_parameter("pick_place_place_approach_back").as_double();
     c->drop_height = get_parameter("pick_place_drop_height").as_double();
     c->drop_altitude = get_parameter("pick_place_drop_altitude").as_double();
     c->drop_climb_lead = get_parameter("pick_place_drop_climb_lead").as_double();
@@ -4475,7 +4520,8 @@ private:
        std::to_string(static_cast<int>(std::lround(drop_shift * 1000.0))) +
        " mm from the release hold), " : std::string()) +
       (back_out ? "backing out " + std::to_string(static_cast<int>(std::lround(back_d * 100.0))) +
-       (cfg.place_drop ? " cm (away from the drop point), then " : " cm (out from under the arch), then ")
+       (cfg.place_drop ? " cm (away from the drop point), then " :
+        cfg.place_insert ? " cm (out of the mailbox mouth), then " : " cm (out from under the arch), then ")
        : std::string()) + "climbing " +
       std::to_string(static_cast<int>(std::lround(cfg.approach_dz * 100.0))) +
       " cm straight up to the clearance point";
@@ -4569,7 +4615,9 @@ private:
     m.precision(1);
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
-      m << name << ": descending onto the target (goal trimmed by [" << pp_descent_trim_(0) * 1e3 << ", "
+      const bool insert = leg == kExecutePlace && get_parameter("pick_place_place_insert").as_bool();
+      m << name << (insert ? ": sliding the claw in through the mouth" : ": descending onto the target")
+        << " (goal trimmed by [" << pp_descent_trim_(0) * 1e3 << ", "
         << pp_descent_trim_(1) * 1e3 << ", " << pp_descent_trim_(2) * 1e3 << "] mm, the hover error)";
     }
     resp->message = m.str();
@@ -5155,7 +5203,9 @@ private:
           << pp_last_err_ * 1e3 << " mm from the point above the target (tolerance "
           << get_parameter("pick_place_arrival_tol").as_double() * 1e3;
         if (get_parameter("pick_place_descent_on_request").as_bool()) {
-          m << " mm) -- press " << (*pp_flying_ == kExecutePick ? "Pick" : "Place") << " to descend";
+          const bool insert = *pp_flying_ == kExecutePlace && get_parameter("pick_place_place_insert").as_bool();
+          m << " mm) -- press " << (*pp_flying_ == kExecutePick ? "Pick" : insert ? "Insert" : "Place")
+            << (insert ? " to slide in" : " to descend");
         } else {
           m << " mm) -- descends once inside";
         }
@@ -5431,12 +5481,14 @@ private:
       "push_pull_arrival_tol", "push_pull_leg_start_tol", "push_pull_adjust_max",
       "push_pull_abort_climb", "push_pull_abort_release_wait_s", "push_pull_guard_tilt_deg",
       "push_pull_abort_from_measured", "push_pull_abort_back", "push_pull_abort_release_world_held",
+      "push_pull_abort_mocap_release_wait_s",
       "push_pull_abort_unbuckle",
       "push_pull_guard_persist_s", "push_pull_guard_force_n", "push_pull_guard_force_persist_s",
       "push_pull_guard_box_lag", "push_pull_guard_box_tilt_deg", "push_pull_guard_box_persist_s",
       "push_pull_guard_box_stale_s", "push_pull_guard_q3_min_deg",
       "push_pull_guard_q3_lookahead_s", "push_pull_guard_q3_rate_min_deg_s",
       "push_pull_guard_q3_rate_persist_s", "push_pull_guard_q3_rate_filter_s",
+      "push_pull_guard_q2_max_deg",
       "push_pull_box_gate_jump_m", "push_pull_box_gate_jump_deg",
       "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
       "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
@@ -6852,6 +6904,15 @@ private:
       climb = std::max(0.0, std::min(
           get_parameter("push_pull_abort_climb").as_double(), cfg.fence.max_z - from.x_b(2)));
       wait = touched ? get_parameter("push_pull_abort_release_wait_s").as_double() : 0.0;
+      // ... SHORTENED on a mocap-guard abort (2026-10-22, the valve): the odometry is then EKF2
+      // dead-reckoning and the law holds THAT still, so the real vehicle moves by its drift
+      // (Isaac, in contact: 50-90 mm/s) and the open claw with it -- every second at fin height
+      // sweeps it further into the handle (a 2 s wait yanked the rotor 100-120 deg and lost
+      // DIRECT, 2 of 2). Long enough for the jaws to clear the fin, then straight up.
+      if (touched && pl_mg_aborted_) {
+        const double mw = get_parameter("push_pull_abort_mocap_release_wait_s").as_double();
+        if (mw >= 0.0) {wait = std::min(wait, mw);}
+      }
       pl_abort_climb_ = climb;
       opts = planOptions();
       gen = ++plan_gen_;
@@ -6870,8 +6931,12 @@ private:
       pl_aborting_ = true;
       requestContact(false);
       // the free-handle abort keeps the claw world-held until the release wait ends
-      // (the worker schedules the hand-back when the abort plan starts)
-      pl_abort_keep_anchor_ = touched && wait > 0.0 && pp_anchor_world_ &&
+      // (the worker schedules the hand-back when the abort plan starts) -- but NOT on a
+      // mocap-guard abort (2026-10-22, the valve's first Isaac drone-mocap freeze): "the world"
+      // is then EKF2 dead-reckoning, 20/51/79/111 mm off at 1/1.5/2/2.5 s, and a claw held
+      // there made the arm absorb the phantom drift (q3 through 0 at 2.5 s, the vehicle left
+      // DIRECT and fell off the table). The claw follows the base (the CoM anchor) instead.
+      pl_abort_keep_anchor_ = touched && wait > 0.0 && pp_anchor_world_ && !pl_mg_aborted_ &&
         get_parameter("push_pull_abort_release_world_held").as_bool();
       pl_abort_anchor_due_.reset();
       if (!pl_abort_keep_anchor_) {restoreAnchor();}
@@ -7311,6 +7376,17 @@ private:
         restoreAnchor();
         RCLCPP_INFO(get_logger(), "push-and-pull ABORT: released -- the claw back to the CoM anchor");
       }
+      // a mocap fault confirmed DURING a world-held release (2026-10-22): the world is now
+      // EKF2 dead-reckoning -- hand the claw back to the CoM at once (see onPlAbort)
+      if (pl_abort_keep_anchor_ && pl_guard_sub_ && pl_mg_t_.has_value() &&
+        secondsSince(pl_mg_t_) <= 0.5 && pl_mg_state_ >= 2)
+      {
+        pl_abort_anchor_due_.reset();
+        pl_abort_keep_anchor_ = false;
+        restoreAnchor();
+        RCLCPP_WARN(get_logger(), "push-and-pull ABORT: %s during the world-held release -- the "
+          "claw back to the CoM anchor now", plMocapProblem().c_str());
+      }
     }
     if (feed_trip) {
       auto resp = std::make_shared<Trigger::Response>();
@@ -7338,6 +7414,29 @@ private:
         want = s == kPlGoToStart ? pl_wp_->approach_ee
                                  : s == kPlReady ? pl_wp_->grasp_ee : pl_wp_->pushed_ee;
       }
+      // THE LIVE HANDLE (2026-10-22, Pegasus archive/valve_turning_safety_20261022): a TURN's
+      // handle is free. Under the box push's hardware-like drift model the open jaws,
+      // descending on a wandering base, turned the valve 5-20 deg before the grasp in 4 of 6
+      // Isaac runs, and the jaws then closed 35-60 mm along the fin (half-length 20 mm): on its
+      // corner, and the turn that followed flipped the vehicle twice. Ready's error -- the arm
+      // GS's close gate -- is therefore taken against the grasp point turned with the rotor
+      // since the capture (the latest gate-accepted obj_0 sample, if fresh), so a handle that
+      // moved refuses the close instead of grasping its edge.
+      double yaw_live_d = 0.0;
+      if (claw && s == kPlReady && !pl_mocap_.empty() && pl_box_yaw_.has_value() &&
+        secondsSince(pl_mocap_.back().t) <= 0.5 &&
+        get_parameter("push_pull_turn_deg").as_double() != 0.0)
+      {
+        yaw_live_d = wrapPi(pl_mocap_.back().yaw - *pl_box_yaw_);
+        const Vec3 r = want - pl_wp_->axis;
+        want = pl_wp_->axis + Eigen::AngleAxisd(yaw_live_d, Vec3::UnitZ()) * r;
+        if (std::abs(yaw_live_d) > 3.0 * M_PI / 180.0) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+            "push-and-pull: the handle has turned %.1f deg since Get -- Ready's close gate follows "
+            "the live handle (the claw is %.0f mm from its grasp point); if the jaws do not close, "
+            "Exit, Get and Plan again", yaw_live_d * 180.0 / M_PI, (want - meas).norm() * 1e3);
+        }
+      }
       const Vec3 e = want - meas;
       const bool holding = !pl_flying_.has_value() && state_ == "HOLD";
       // the descent trim's samples: the claw's error while holding above
@@ -7355,7 +7454,7 @@ private:
       }
       const double tol = get_parameter("push_pull_arrival_tol").as_double();
       const bool within = e.norm() <= tol;
-      const double yb = pl_box_yaw_.value_or(0.0);
+      const double yb = pl_box_yaw_.value_or(0.0) + yaw_live_d;   // the live handle's axes
       const double axis = std::cos(yb) * e(0) + std::sin(yb) * e(1);
       pl_last_err_ = e.norm();
       // [11] the box's lag behind its plan [m], [12] its tilt [deg] (the box
@@ -7870,6 +7969,8 @@ private:
   std::optional<double> q3r_t_;
   double q3r_q_{0.0};
   double q3r_v_{0.0};
+  double q2r_q_{0.0};   // ... and q2's, for the q2 wall (push_pull_guard_q2_max_deg)
+  double q2r_v_{0.0};
   bool q3r_stamped_{false};
   std::optional<double> pl_q3r_since_;
   int viz_decim_{0};

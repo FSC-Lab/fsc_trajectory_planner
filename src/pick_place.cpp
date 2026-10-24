@@ -162,6 +162,15 @@ PickPlaceWaypoints pickPlaceWaypoints(
   checkPose(v, c.pick_pose, "pick pose", kExecutePick);
   checkPose(v, c.carry, "carry pose", kGoToPlaceStart);
   checkPose(v, c.place_pose, "place pose", kExecutePlace);
+  if (c.place_insert && c.place_drop) {
+    throw std::runtime_error(std::string(pickPlaceLegName(kExecutePlace)) +
+      ": the insert place and the drop place exclude each other (pick_place_place_insert, "
+      "pick_place_place_drop)");
+  }
+  if (c.place_insert && !(c.place_approach_back > 0.0)) {
+    throw std::runtime_error(std::string(pickPlaceLegName(kExecutePlace)) +
+      ": the insert place needs pick_place_place_approach_back > 0 (the arm GS's Insert Margin)");
+  }
   PickPlaceWaypoints wp;
   wp.goal[kGoToStart] = baseRest(t.start, c.home);
   // each claw target = its 4-D pose + the ONE ee_offset in that pose's frame;
@@ -206,6 +215,10 @@ PickPlaceWaypoints pickPlaceWaypoints(
       // the hook grasp: behind the target at its own height (model +y = the nose)
       const double phi = wp.goal[k].phi;
       wp.approach[k].x_b -= c.pick_approach_back * Vec3{-std::sin(phi), std::cos(phi), 0.0};
+    } else if (k == kExecutePlace && c.place_insert) {
+      // the insert: behind the mouth at its own height, slid in along the nose
+      const double phi = wp.goal[k].phi;
+      wp.approach[k].x_b -= c.place_approach_back * Vec3{-std::sin(phi), std::cos(phi), 0.0};
     } else if (k == kExecutePlace && c.place_drop) {
       // the drop: flown straight to the drop point (approach == goal), so the
       // leg completes there with no wait and no descent
@@ -356,8 +369,9 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
   const double side = (goal.x_b - from.x_b).head<2>().norm();
   std::unique_ptr<Trajectory> traj;
   try {
-    if (leg == kExecutePick && c.pick_approach_back > 0.0) {
-      // the hook grasp's approach is already level with the goal: fly straight in
+    if ((leg == kExecutePick && c.pick_approach_back > 0.0) || (leg == kExecutePlace && c.place_insert)) {
+      // the hook grasp's / the insert's approach is already level with the
+      // goal: fly straight in
       traj = transitionLeg(v, transition, opts, from, goal);
     } else if (c.trim_settle_s > 0.0 && side > c.trim_first_min) {
       // (a trim at or below trim_first_min is flown in the descent itself --

@@ -54,6 +54,15 @@ set_ee_anchor_com services that record what the planner asks for.
   [9i] (2026-10-22) the q3 RATE guard (push_pull_guard_q3_lookahead_s): a slow drift toward the
        limit and a fast dip that stops well above it abort nothing; a fast fold (150 deg/s)
        aborts while q3 is still above push_pull_guard_q3_min_deg
+  [9k] (2026-10-24) the q2 wall in the rate guard (push_pull_guard_q2_max_deg): the 10-23 stretch
+       -- q2 up / q3 down at 65 deg/s (faster under a low q3 limit, so the flown rule still trips)
+       with the fold held, until q2 meets its wall at q3 = fold - wall (15 deg) -- aborts nothing;
+       the same stretch with the key live-set to 0 (the flown rule) aborts; a fold with q2 pinned
+       at the wall still aborts while q3 is above the limit
+  [9j] (2026-10-22, the valve's drone-mocap freeze) a mocap-guard abort hands the claw to the
+       CoM anchor AT ONCE even with push_pull_abort_release_world_held (the valve's free-handle
+       release): "the world" is then EKF2 dead-reckoning; and a mocap fault confirmed DURING a
+       world-held release (a force-guard abort) ends the world hold early
   [10] SAFETY silences the stream
 
 Run with a scratch install first on the path and a private ROS domain:
@@ -307,6 +316,19 @@ def set_param(rig, name, value):
     assert rig.params.wait_for_service(timeout_sec=10)
     p = Parameter(name=name, value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE,
                                                   double_value=float(value)))
+    fut = rig.params.call_async(SetParameters.Request(parameters=[p]))
+    t0 = time.monotonic()
+    while not fut.done():
+        time.sleep(0.05)
+        assert time.monotonic() - t0 < 10, name
+    res = fut.result().results[0]
+    assert res.successful, (name, res.reason)
+
+
+def set_param_bool(rig, name, value):
+    assert rig.params.wait_for_service(timeout_sec=10)
+    p = Parameter(name=name, value=ParameterValue(type=ParameterType.PARAMETER_BOOL,
+                                                  bool_value=bool(value)))
     fut = rig.params.call_async(SetParameters.Request(parameters=[p]))
     t0 = time.monotonic()
     while not fut.done():
@@ -807,8 +829,8 @@ def main():
             print("[9g] skipped: the yaml sets no box sample gate (push_pull_box_gate_jump_m)")
 
         # [9h] the unbuckle (2026-10-21): the yaml's push_pull_abort_unbuckle. The arm on the
-        # handle buckles to the 10-21 trip pose (q2 44.9, q3 5 deg); the q3 guard (the yaml's
-        # push_pull_guard_q3_min_deg) aborts. The abort holds that MEASURED arm through the
+        # handle buckles to the 10-21 trip pose (q2 44.9, q3 5 deg; 2 deg under a lower limit);
+        # the q3 guard (the yaml's push_pull_guard_q3_min_deg) aborts. The abort holds that MEASURED arm through the
         # release wait (the jaws open), then the retreat -- before the climb -- brings q2 / q3 to
         # the push pose's with q1 / q4 untouched, and the fold ends home.
         q3_min = _yaml_num("push_pull_guard_q3_min_deg", 0.0)
@@ -817,7 +839,7 @@ def main():
             wait_s = _yaml_num("push_pull_abort_release_wait_s", 0.5)
             back_on_handle("9h")
             q_trip = rig.q.copy()
-            q_trip[1], q_trip[2] = math.radians(44.9), math.radians(5.0)
+            q_trip[1], q_trip[2] = math.radians(44.9), math.radians(min(5.0, q3_min - 2.0))
             rig.q = q_trip
             wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "q3 guard on a buckled arm")
             assert "q3" in rig.pl_status, rig.pl_status
@@ -902,6 +924,113 @@ def main():
             abort_done("9i")
         else:
             print("[9i] skipped: the yaml sets no push_pull_guard_q3_lookahead_s (or no q3 guard)")
+
+        # [9k] the q2 wall in the rate guard (2026-10-24): the yaml's push_pull_guard_q2_max_deg.
+        wall = _yaml_num("push_pull_guard_q2_max_deg", 0.0)
+        if tau > 0.0 and q3_min > 0.0 and wall > 0.0:
+            def move(to_q2, to_q3, rate_deg_s):
+                """q2 and q3 together toward (to_q2, to_q3) at rate_deg_s along the larger
+                excursion; stops on an abort. True = it aborted."""
+                q = rig.q.copy()
+                a2, a3 = math.degrees(q[1]), math.degrees(q[2])
+                span = max(abs(to_q2 - a2), abs(to_q3 - a3), 1e-9)
+                t0 = time.monotonic()
+                while True:
+                    if rig.pl_status.startswith("ABORTING"):
+                        return True
+                    f = min(1.0, rate_deg_s * (time.monotonic() - t0) / span)
+                    q[1] = math.radians(a2 + f * (to_q2 - a2))
+                    q[2] = math.radians(a3 + f * (to_q3 - a3))
+                    rig.q = q.copy()
+                    if f >= 1.0:
+                        time.sleep(0.5)
+                        return rig.pl_status.startswith("ABORTING")
+                    time.sleep(0.004)
+
+            back_on_handle("9k")
+            q_home = rig.q.copy()
+            q2_0, q3_0 = math.degrees(q_home[1]), math.degrees(q_home[2])
+            q3_end = q3_0 - (wall - q2_0)          # the fold held: q3 = fold - wall at the wall
+            assert q3_end > q3_min + 2.0, ("the push pose leaves no stretch room", q2_0, q3_0, wall)
+            # the 10-23 rate (65 deg/s), or faster when the limit is low: the rule WITHOUT the
+            # wall must see q3 + tau*q3_dot under the limit for ~2x its 0.05 s persistence, i.e.
+            # rate * (tau - 0.1) >= q3_end - q3_min
+            vs = max(65.0, 1.2 * (q3_end - q3_min) / max(tau - 0.1, 0.02))
+            # (a) the 10-23 stretch into the wall: no abort
+            assert not move(wall, q3_end, vs), ("the stretch into the q2 wall aborted", rig.pl_status)
+            assert rig.pl_status.startswith("DONE ready"), rig.pl_status
+            rig.q = q_home.copy()
+            time.sleep(0.5)
+            # (b) the same stretch, the flown rule (key 0): aborts
+            set_param(rig, "push_pull_guard_q2_max_deg", 0.0)
+            time.sleep(0.2)
+            aborted = move(wall, q3_end, vs)
+            set_param(rig, "push_pull_guard_q2_max_deg", wall)
+            assert aborted, "the flown rule did not abort the stretch -- the test does not exercise the wall"
+            assert "falling at" in rig.pl_status and "wall" not in rig.pl_status, rig.pl_status
+            print(f"[9k] stretch q2/q3 {q2_0:.0f}/{q3_0:.0f} -> {wall:.0f}/{q3_end:.0f} deg at {vs:.0f} deg/s: "
+                  f"no abort with the wall; the flown rule aborted: {rig.pl_status}")
+            abort_done("9k-b")
+            # (c) a buckle: q2 pinned at the wall, q3 folding at 150 deg/s -> aborts above the limit
+            back_on_handle("9k-c")
+            assert not move(wall, q3_0, 20.0), ("q2 alone up to its wall aborted", rig.pl_status)
+            time.sleep(0.3)
+            assert move(wall, -30.0, 150.0), "the fold with q2 pinned never aborted"
+            m = re.search(r"q3 (-?[0-9.]+) deg falling", rig.pl_status)
+            q3_trip = float(m.group(1))
+            assert q3_trip > q3_min, (q3_trip, rig.pl_status)
+            assert "stopped by q2" not in rig.pl_status, rig.pl_status
+            print(f"[9k] q2 pinned at {wall:.0f} deg, q3 folding at 150 deg/s: aborted at q3 {q3_trip:.1f} deg: "
+                  f"{rig.pl_status}")
+            abort_done("9k-c")
+        else:
+            print("[9k] skipped: the yaml sets no push_pull_guard_q2_max_deg (or no rate guard)")
+
+        # [9j] (2026-10-22) the valve's world-held release vs a mocap fault. Live-set the valve's
+        # push_pull_abort_release_world_held (read at the abort) and check two things against
+        # the recorded set_ee_anchor_com calls (True = the CoM anchor):
+        #   (a) a mocap-guard abort hands the claw to the CoM AT ONCE (the release is not
+        #       world-held: the world is EKF2 dead-reckoning);
+        #   (b) a force-guard abort keeps the claw world-held through its release wait -- and a
+        #       mocap fault confirmed inside that wait ends the world hold early.
+        WAIT_S = _yaml_num("push_pull_abort_release_wait_s", 0.0)
+        if WAIT_S >= 0.8:
+            set_param_bool(rig, "push_pull_abort_release_world_held", True)
+            back_on_handle("9j-a")
+            n_a = len(rig.anchor_calls)
+            rig.mg = [2.0, 2.0, 0.20]
+            wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "mocap guard (9j-a)")
+            t_ab = time.monotonic()
+            wait(lambda: True in rig.anchor_calls[n_a:], 0.6, "the CoM anchor at once on a mocap abort")
+            dt_a = time.monotonic() - t_ab
+            wait(lambda: rig.status.startswith("EXECUTING"), 10, "abort executing (9j-a)")
+            T = float(rig.status.split("T=")[1].rstrip("s"))
+            wait(lambda: rig.status == "HOLD", T + 20, "abort complete (9j-a)")
+            rig.mg = [0.0, 0.0, 0.01]
+            wait(lambda: rig.pl_status.startswith("ABORTED") and "HOVERING" not in rig.pl_status, 5,
+                 "mocap back (9j-a)")
+            land_abort()
+            print(f"[9j] (a) mocap abort with the world-held release on: the CoM anchor {dt_a:.2f} s "
+                  f"after ABORTING (the release wait is {WAIT_S:.1f} s)")
+            back_on_handle("9j-b")
+            n_a = len(rig.anchor_calls)
+            rig.force = np.array([0.0, 6.0, 0.0])
+            wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "force guard (9j-b)")
+            rig.force = np.zeros(3)
+            t_ab = time.monotonic()
+            time.sleep(0.4)
+            assert True not in rig.anchor_calls[n_a:], ("world hold dropped early", rig.anchor_calls[n_a:])
+            rig.mg = [2.0, 2.0, 0.20]
+            wait(lambda: True in rig.anchor_calls[n_a:], 0.5, "the CoM anchor once the mocap fails")
+            dt_b = time.monotonic() - t_ab
+            assert dt_b < WAIT_S - 0.2, dt_b
+            rig.mg = [0.0, 0.0, 0.01]
+            print(f"[9j] (b) force-guard abort: world-held for 0.4 s, the mocap fault then handed the "
+                  f"claw to the CoM at {dt_b:.2f} s (the scheduled hand-back is at {WAIT_S:.1f} s)")
+            abort_done("9j-b")
+            set_param_bool(rig, "push_pull_abort_release_world_held", False)
+        else:
+            print("[9j] skipped: the yaml's push_pull_abort_release_wait_s is under 0.8 s")
 
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))

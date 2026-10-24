@@ -131,6 +131,15 @@ struct PickPlaceConfig
   // the hold's height (the fingers slide out from under the arch), then climbs
   // approach_dz.
   double place_exit_back{0.0};
+  // THE INSERT PLACE (2026-10-23, the mail-delivery task: an envelope slid
+  // through a mailbox's front mouth). place_insert: execute_place's approach
+  // rest is place_approach_back BEHIND the place goal (along -nose) at the
+  // goal's own height -- the hook pick's approach, mirrored to the place -- and
+  // the place "descent" is the horizontal move in. Exit To Place then backs
+  // out place_exit_back and climbs approach_dz, as for the hook place. Refused
+  // with place_drop, and with place_approach_back <= 0. false = unchanged.
+  bool place_insert{false};
+  double place_approach_back{0.0};
   // EXIT TO PICK / PLACE duration [s] (2026-10-03); 0 = the leg bounds (a_max
   // 0.15 m/s^2: 3.2 s for a 0.20 m climb). Clamped to a payload that still
   // rests on its pillar the vehicle must lift it OFF fast: a min-snap climb
