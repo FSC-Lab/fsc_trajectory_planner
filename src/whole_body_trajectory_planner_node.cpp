@@ -138,6 +138,9 @@ const char * const kArmJointNames[kNumJoints] = {"joint1", "joint2", "joint3",
 // current_ee: a frozen mocap feed masquerading as a live drone pose is the
 // failure shape of the 2026-08-03 feedback-loss incident.
 constexpr double kOdomFreshS = 0.5;
+// the claw's speed for the settle checks is taken over this window (the arm GS's
+// close gate uses the same 0.3 s, push_pull_box_grip_speed_window_s)
+constexpr double kPlSettleSpeedWindowS = 0.3;
 // The capture is a REST spec; warn if the arm is still moving at capture.
 constexpr double kArmRestQdot = 0.05;
 
@@ -813,6 +816,29 @@ public:
     // Pair it with push_pull_descent_trim false: a trim measured CoM-anchored
     // is the base's wander, not the world-held claw's steady error.
     declare_parameter<bool>("push_pull_world_anchor_on_handle", false);
+    // THE HAND-OVER SETTLE (2026-10-24, Pegasus archive/wb_box_pushing_flight_20261024,
+    // README 7): with push_pull_world_anchor_on_handle the claw was WORLD-held the instant
+    // Ready ended. On hardware the base was then 28-36 mm off the grasp point along the push
+    // (its pitch error, ~0.7 mm per mrad) or still swinging, so the arm had to close the gap
+    // itself: q3 fell 13-19 deg at 47-62 deg/s and the q3 rate guard aborted (flights B, C;
+    // the jaws never closed). tol > 0: after Ready the claw keeps following the vehicle (the
+    // CoM anchor; the arm stays still) and is handed to the room only once it is within tol
+    // of the grasp point [m], within axis_tol across the handle [m] (0 = no check), slower
+    // than max_speed [m/s] over 0.3 s (0 = no check), all held dwell_s. It waits as long as it
+    // takes; the arm GS gives up (ABORT, jaws open) after push_pull_box_settle_wait_max_s.
+    // 0 = the immediate hand-over.
+    declare_parameter<double>("push_pull_handle_settle_tol", 0.0);
+    declare_parameter<double>("push_pull_handle_settle_axis_tol", 0.0);
+    declare_parameter<double>("push_pull_handle_settle_max_speed", 0.0);
+    declare_parameter<double>("push_pull_handle_settle_dwell_s", 0.0);
+    // THE READY SETTLE (2026-10-24, same record): Ready was allowed as soon as the claw was
+    // within push_pull_arrival_tol of the point above the handle -- on hardware 1.6-2.8 s after
+    // Go To Start, while its arrival overshoot (45-68 mm, every flight since 10-23) was still
+    // swinging the claw. max_speed > 0: Ready also needs the claw slower than this [m/s] over
+    // 0.3 s and within the arrival tolerance, held settle_s; refused with "wait for it to
+    // settle" (the arm GS's automatic Ready retries). 0 = off.
+    declare_parameter<double>("push_pull_ready_max_speed", 0.0);
+    declare_parameter<double>("push_pull_ready_settle_s", 0.0);
     // ... and through the PUSH (2026-10-04, after the first three flights):
     // true = the claw follows the PLANNED world path while the box is
     // clamped. With the CoM anchor a base offset drags the claw reference,
@@ -1467,6 +1493,7 @@ private:
         pl_aborting_ = false;
         pl_planning_ = false;
         pl_at_handle_ = false;
+        pl_handle_settling_ = false;
         pl_contact_ = false;
         pl_guard_tripped_ = false;
         pl_abort_keep_anchor_ = false;
@@ -2550,6 +2577,7 @@ private:
         if (pl_abort_plan_ && pl_abort_plan_ == plan_) {
           RCLCPP_WARN(get_logger(), "push-and-pull: ABORT complete -- holding, arm home.");
           pl_at_handle_ = false;
+          pl_handle_settling_ = false;
         }
         pl_abort_plan_.reset();
         if (pl_flying_.has_value() && pl_exec_plan_ && pl_exec_plan_ == plan_) {
@@ -5493,6 +5521,9 @@ private:
       "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
       "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
       "push_pull_world_anchor_on_handle",
+      "push_pull_handle_settle_tol", "push_pull_handle_settle_axis_tol",
+      "push_pull_handle_settle_max_speed", "push_pull_handle_settle_dwell_s",
+      "push_pull_ready_max_speed", "push_pull_ready_settle_s",
       "push_pull_contact_at_ready", "push_pull_contact_off_at_push_end",
       "push_pull_capture_window",
       "push_pull_capture_max_spread", "push_pull_capture_max_yaw_spread_deg", "push_pull_start_mark",
@@ -6417,6 +6448,15 @@ private:
     return m / static_cast<double>(pl_trim_buf_.size());
   }
 
+  // THE READY SETTLE (2026-10-24): the claw has been within the arrival tolerance and slower
+  // than push_pull_ready_max_speed for push_pull_ready_settle_s (the arrival tick tracks it)
+  bool plReadySettled() const
+  {
+    if (!pl_ready_settled_since_.has_value()) {return false;}
+    return std::chrono::duration<double>(Clock::now() - *pl_ready_settled_since_).count() >=
+           get_parameter("push_pull_ready_settle_s").as_double();
+  }
+
   double plResidual() const
   {
     if (pl_trim_buf_.empty()) {return pl_last_err_;}
@@ -6484,6 +6524,14 @@ private:
                                                                    : "the point above the handle")
             << " (> " << tol * 1e3 << " mm) -- wait for it to settle";
           err = w.str();
+        } else if (get_parameter("push_pull_ready_max_speed").as_double() > 0.0 && !plReadySettled()) {
+          const double held = pl_ready_settled_since_.has_value() ?
+            std::chrono::duration<double>(Clock::now() - *pl_ready_settled_since_).count() : 0.0;
+          w << "the claw is still moving (" << (std::isfinite(pl_claw_speed_) ? pl_claw_speed_ * 1e3 : -1.0)
+            << " mm/s; slower than " << get_parameter("push_pull_ready_max_speed").as_double() * 1e3
+            << " mm/s for " << std::setprecision(1) << held << " of "
+            << get_parameter("push_pull_ready_settle_s").as_double() << " s) -- wait for it to settle";
+          err = w.str();
         } else if (plTrim().norm() > get_parameter("push_pull_descent_trim_max").as_double()) {
           w << "the claw holds " << plTrim().norm() * 1e3 << " mm off the point above the handle on "
             "average (> push_pull_descent_trim_max " <<
@@ -6521,6 +6569,7 @@ private:
       pl_error_.clear();
       pl_aborted_ = false;
       pl_guard_tripped_ = false;
+      pl_handle_settling_ = false;
       switch (s) {
         case kPlReady:
           // the descent keeps the world-held claw requested on arrival above
@@ -6711,6 +6760,8 @@ private:
   {
     pl_completed_ = s;
     pl_flying_.reset();
+    pl_handle_settling_ = false;
+    pl_handle_settled_since_.reset();
     switch (s) {
       case kPlGoToStart:
         pl_at_handle_ = false;
@@ -6732,9 +6783,21 @@ private:
         if (!get_parameter("push_pull_world_anchor_ready").as_bool() &&
           get_parameter("push_pull_world_anchor_on_handle").as_bool())
         {
-          requestAnchor(false);
-          RCLCPP_INFO(get_logger(), "push-and-pull: on the handle -- the claw now WORLD-held "
-            "(push_pull_world_anchor_on_handle): pulled onto the grasp point before the jaws close");
+          const double tol = get_parameter("push_pull_handle_settle_tol").as_double();
+          if (tol > 0.0) {
+            // THE HAND-OVER SETTLE (2026-10-24): the room hold waits for the claw (the
+            // arrival tick, publishPlArrival)
+            pl_handle_settling_ = true;
+            pl_handle_settle_t0_ = Clock::now();
+            pl_handle_settled_since_.reset();
+            RCLCPP_INFO(get_logger(), "push-and-pull: on the handle -- the claw keeps following the "
+              "vehicle until it settles within %.0f mm of the grasp point (push_pull_handle_settle_tol), "
+              "then WORLD-held", tol * 1e3);
+          } else {
+            requestAnchor(false);
+            RCLCPP_INFO(get_logger(), "push-and-pull: on the handle -- the claw now WORLD-held "
+              "(push_pull_world_anchor_on_handle): pulled onto the grasp point before the jaws close");
+          }
         }
         if (get_parameter("push_pull_contact_at_ready").as_bool()) {
           requestContact(true);
@@ -6929,6 +6992,7 @@ private:
       pl_error_.clear();
       pl_aborted_ = true;
       pl_aborting_ = true;
+      pl_handle_settling_ = false;
       requestContact(false);
       // the free-handle abort keeps the claw world-held until the release wait ends
       // (the worker schedules the hand-back when the abort plan starts) -- but NOT on a
@@ -7396,6 +7460,7 @@ private:
     }
     Float64MultiArray m;
     bool changed = false;
+    bool settle_done = false;   // the hand-over settle ended (2026-10-24): republish info
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !pl_wp_.has_value()) {return;}
@@ -7457,6 +7522,68 @@ private:
       const double yb = pl_box_yaw_.value_or(0.0) + yaw_live_d;   // the live handle's axes
       const double axis = std::cos(yb) * e(0) + std::sin(yb) * e(1);
       pl_last_err_ = e.norm();
+      // THE SETTLE CHECKS (2026-10-24): the claw's speed over kPlSettleSpeedWindowS
+      const auto now_c = Clock::now();
+      if (s != pl_claw_hist_step_ || !claw) {
+        pl_claw_hist_.clear();
+        pl_claw_hist_step_ = s;
+      }
+      pl_claw_hist_.push_back({now_c, meas});
+      while (pl_claw_hist_.size() > 2 && std::chrono::duration<double>(
+          now_c - pl_claw_hist_.front().first).count() > kPlSettleSpeedWindowS + 0.5)
+      {
+        pl_claw_hist_.pop_front();
+      }
+      pl_claw_speed_ = std::numeric_limits<double>::quiet_NaN();
+      for (auto it = std::next(pl_claw_hist_.rbegin()); it != pl_claw_hist_.rend(); ++it) {
+        const double dt = std::chrono::duration<double>(now_c - it->first).count();
+        if (dt >= kPlSettleSpeedWindowS - 1e-3) {
+          pl_claw_speed_ = (meas - it->second).norm() / dt;
+          break;
+        }
+      }
+      // the Ready precondition: within the arrival tolerance and slow, held
+      const double rv = get_parameter("push_pull_ready_max_speed").as_double();
+      if (s == kPlGoToStart && holding && rv > 0.0 && plResidual() <= tol &&
+        std::isfinite(pl_claw_speed_) && pl_claw_speed_ <= rv)
+      {
+        if (!pl_ready_settled_since_.has_value()) {pl_ready_settled_since_ = now_c;}
+      } else {
+        pl_ready_settled_since_.reset();
+      }
+      // THE HAND-OVER SETTLE: after Ready, the room hold once the claw is close and slow
+      if (pl_handle_settling_) {
+        if (s != kPlReady || !holding || !pl_at_handle_ || pl_aborting_ || pl_abort_plan_) {
+          pl_handle_settling_ = false;        // a press, an abort or a mode change took over
+          pl_handle_settled_since_.reset();
+          settle_done = true;
+        } else {
+          const double stol = get_parameter("push_pull_handle_settle_tol").as_double();
+          const double atol = get_parameter("push_pull_handle_settle_axis_tol").as_double();
+          const double vmax = get_parameter("push_pull_handle_settle_max_speed").as_double();
+          const bool ok = e.norm() <= stol && (atol <= 0.0 || std::abs(axis) <= atol) &&
+            (vmax <= 0.0 || (std::isfinite(pl_claw_speed_) && pl_claw_speed_ <= vmax));
+          if (!ok) {
+            pl_handle_settled_since_.reset();
+          } else if (!pl_handle_settled_since_.has_value()) {
+            pl_handle_settled_since_ = now_c;
+          }
+          if (pl_handle_settled_since_.has_value() &&
+            std::chrono::duration<double>(now_c - *pl_handle_settled_since_).count() >=
+            get_parameter("push_pull_handle_settle_dwell_s").as_double())
+          {
+            pl_handle_settling_ = false;
+            pl_handle_settled_since_.reset();
+            requestAnchor(false);
+            RCLCPP_INFO(get_logger(), "push-and-pull: the claw settled %.0f mm from the grasp point "
+              "(%.1f mm across the handle, %.0f mm/s) %.1f s after Ready -- now WORLD-held "
+              "(push_pull_world_anchor_on_handle): the jaws may close", e.norm() * 1e3,
+              axis * 1e3, pl_claw_speed_ * 1e3, pl_handle_settle_t0_.has_value() ?
+              std::chrono::duration<double>(now_c - *pl_handle_settle_t0_).count() : 0.0);
+            settle_done = true;
+          }
+        }
+      }
       // [11] the box's lag behind its plan [m], [12] its tilt [deg] (the box
       // guards, 2026-10-16; 0 until they are armed)
       m.data = {static_cast<double>(s), claw ? 1.0 : 0.0, e.norm(), e(0), e(1), e(2), tol,
@@ -7469,7 +7596,9 @@ private:
       const PlMonitor & mo = pl_mon_;
       m.data.insert(m.data.end(), {mo.valid ? 1.0 : 0.0, mo.done ? 1.0 : 0.0, mo.t, mo.T,
           mo.settle, mo.travel, mo.plan_travel, mo.speed, mo.plan_speed});
-      if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding)) {
+      if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding) ||
+        pl_handle_settling_ || settle_done)
+      {
         pl_within_ = within;
         pl_err_step_ = s;
         changed = true;
@@ -7477,6 +7606,7 @@ private:
     }
     pl_arrival_pub_->publish(m);
     if (changed) {publishPlStatus();}
+    if (settle_done) {publishPlInfo();}
   }
 
   void publishPlStatus()
@@ -7526,6 +7656,13 @@ private:
         m << "DONE go_to_start next=ready (the gripper opens first) -- claw " << std::setprecision(0)
           << pl_last_err_ * 1e3 << " mm from the point above the handle (tolerance "
           << get_parameter("push_pull_arrival_tol").as_double() * 1e3 << " mm)";
+      } else if (pl_completed_ == kPlReady && pl_handle_settling_) {
+        // THE HAND-OVER SETTLE (2026-10-24): same first two words, so the arm GS's edges hold
+        m << "DONE ready next=push (settling: the claw " << std::setprecision(0) << pl_last_err_ * 1e3
+          << " mm from the grasp point, " << (std::isfinite(pl_claw_speed_) ? pl_claw_speed_ * 1e3 : -1.0)
+          << " mm/s; held by the room once within "
+          << get_parameter("push_pull_handle_settle_tol").as_double() * 1e3 << " mm and slower than "
+          << get_parameter("push_pull_handle_settle_max_speed").as_double() * 1e3 << " mm/s)";
       } else if (pl_completed_ == kPlReady) {
         m << "DONE ready next=push (CONTACT on: the gripper closes first)";
       } else if (pl_completed_ == kPlPush) {
@@ -7564,8 +7701,10 @@ private:
   // [79] / [80] its frame's origin x, y [m], [81] its frame's yaw [deg] (0 = world
   // axes, the typed table), [82..85] x_min, x_max, y_min, y_max in that frame [m],
   // [86] its top z [m] -- the plan's table when planned, else the one the box
-  // capture places, else the typed one (NaN when none); 87 values. NaN where
-  // there is nothing.
+  // capture places, else the typed one (NaN when none); then THE HAND-OVER SETTLE
+  // (2026-10-24, appended): [87] 1 = after Ready the room hold still waits for the
+  // claw to settle (push_pull_handle_settle_tol), [88] seconds it has waited; 89
+  // values. NaN where there is nothing.
   void publishPlInfo()
   {
     Float64MultiArray m;
@@ -7635,6 +7774,11 @@ private:
         m.data.push_back(derived ? 1.0 : 0.0);
         m.data.insert(m.data.end(), 8, nan);
       }
+      // [87] 1 = after Ready the room hold still waits for the claw to settle (the arm GS's
+      // close gate starts at 0), [88] seconds it has waited (2026-10-24)
+      m.data.push_back(pl_handle_settling_ ? 1.0 : 0.0);
+      m.data.push_back(pl_handle_settling_ && pl_handle_settle_t0_.has_value() ?
+        std::chrono::duration<double>(Clock::now() - *pl_handle_settle_t0_).count() : 0.0);
     }
     pl_info_pub_->publish(m);
   }
@@ -7947,6 +8091,17 @@ private:
   bool pl_unloaded_{false};                     // the push's unload has been started
   Vec3 pl_trim_{Vec3::Zero()};                  // the trim the last Ready used
   double pl_last_err_{0.0};
+  // THE SETTLE CHECKS (2026-10-24): the claw's recent positions (the arrival tick, 10 Hz;
+  // a new step restarts them), its speed over kPlSettleSpeedWindowS, since when the Ready
+  // condition has held (holding above the handle), and the deferred hand-over to the room
+  // after Ready (push_pull_handle_settle_tol)
+  std::deque<std::pair<Clock::time_point, Vec3>> pl_claw_hist_;
+  int pl_claw_hist_step_{-2};
+  double pl_claw_speed_{std::numeric_limits<double>::quiet_NaN()};
+  std::optional<Clock::time_point> pl_ready_settled_since_;
+  bool pl_handle_settling_{false};
+  std::optional<Clock::time_point> pl_handle_settle_t0_;
+  std::optional<Clock::time_point> pl_handle_settled_since_;
   bool pl_within_{false};
   int pl_err_step_{-1};
   unsigned pl_gen_{0};

@@ -20,6 +20,11 @@ set_ee_anchor_com services that record what the planner asks for.
        is the one the box places; with push_pull_go_to_start_bypass go_to_start comes
        near the table only at the approach height (round its box end, never across)
   [5] ready: refused 80 mm off; then the vertical descent onto the handle
+  [5r] (2026-10-24) with push_pull_ready_max_speed: refused while the claw swings above the
+       handle (inside the arrival tolerance), accepted once it is still for ready_settle_s
+  [5h] (2026-10-24) with push_pull_handle_settle_tol: after Ready the room hold waits while
+       the claw is far off or swinging (info [87] = 1, 'settling' in the status, no WORLD
+       anchor), and is requested once it is close and still
   [6] push: the planner asks for CONTACT and -- per push_pull_world_anchor_push
       -- keeps the WORLD anchor (true) or returns to the CoM (false); the reference
       holds still for the settle, then slides 0.50 m along -y with the arm and
@@ -153,6 +158,12 @@ TABLE_BOX_GAP = _yaml_num("push_pull_table_box_gap", 0.10)
 BYPASS = _yaml_bool("push_pull_go_to_start_bypass", False)
 WORLD_ANCHOR_READY = _yaml_bool("push_pull_world_anchor_ready", True)
 WORLD_ANCHOR_ON_HANDLE = _yaml_bool("push_pull_world_anchor_on_handle", False)
+# THE SETTLE GATES (2026-10-24): after Ready the room hold waits for the claw, and Ready itself
+# waits for the claw to stop moving above the handle
+SETTLE_TOL = _yaml_num("push_pull_handle_settle_tol", 0.0)
+SETTLE_VMAX = _yaml_num("push_pull_handle_settle_max_speed", 0.0)
+READY_VMAX = _yaml_num("push_pull_ready_max_speed", 0.0)
+READY_SETTLE_S = _yaml_num("push_pull_ready_settle_s", 0.0)
 CONTACT_OFF_AT_PUSH_END = _yaml_bool("push_pull_contact_off_at_push_end", False)
 # the push's profile (2026-10-17): > 0 = the cruise at push_distance / (T - ramp)
 PUSH_RAMP = _yaml_num("push_pull_push_ramp_s", 0.0)
@@ -212,6 +223,7 @@ class Rig(Node):
         self.free_off = 0.0        # [9f] the law's free-axis shift, wb_control_debug [117] [m]
         self.box_follow = None     # [9f] (box0, r_ed0): the box follows the streamed claw reference
         self.glitch_n = 0          # [9g] the next n box samples are the 10-21 mis-solve
+        self.wobble = None         # [5] (amplitude m, frequency Hz): the body swings along x
         self.rng = np.random.default_rng(0)
         self.create_timer(0.02, self.feed)
         self.create_timer(0.004, self.feed_force)    # the node's 250 Hz debug
@@ -228,7 +240,10 @@ class Rig(Node):
 
     def feed(self):
         o = Odometry()
-        o.pose.pose.position.x, o.pose.pose.position.y, o.pose.pose.position.z = map(float, self.odom_xyz)
+        xyz = self.odom_xyz.copy()
+        if self.wobble is not None:
+            xyz[0] += self.wobble[0] * math.sin(2.0 * math.pi * self.wobble[1] * time.monotonic())
+        o.pose.pose.position.x, o.pose.pose.position.y, o.pose.pose.position.z = map(float, xyz)
         o.pose.pose.orientation.w = 1.0
         self.odom.publish(o)
         a = VehicleAttitude()
@@ -354,6 +369,11 @@ def fly(rig, k, teleport=True):
     """Press step k, wait for EXECUTING then HOLD; the plant lands on the goal."""
     rig.refs.clear()
     r = call(rig, STEPS[k])
+    # the settle refusals are retried, as the arm GS's automatic Ready does (2026-10-24)
+    t_end = time.monotonic() + 6.0
+    while not r.success and "wait for it to settle" in r.message and time.monotonic() < t_end:
+        time.sleep(0.2)
+        r = call(rig, STEPS[k])
     assert r.success, f"{STEPS[k]}: {r.message}"
     wait(lambda: rig.status.startswith("EXECUTING"), 10, f"{STEPS[k]} EXECUTING")
     assert rig.pl_status.startswith("FLYING " + STEPS[k]), rig.pl_status
@@ -479,8 +499,45 @@ def main():
         r = call(rig, "ready")
         assert not r.success and "wait for it to settle" in r.message, r.message
         rig.teleport(0)
+        if READY_VMAX > 0.0:
+            # [5r] THE READY SETTLE (2026-10-24): on the point but swinging (+-10 mm at 1.5 Hz,
+            # up to 94 mm/s, inside the arrival tolerance) is refused as still moving; still for
+            # push_pull_ready_settle_s is accepted
+            rig.wobble = (0.010, 1.5)
+            time.sleep(1.2)
+            r = call(rig, "ready")
+            assert not r.success and "still moving" in r.message, r.message
+            print(f"[5r] ready refused while the claw swings: {r.message}")
+            rig.wobble = None
+            time.sleep(0.15)
+            r = call(rig, "ready")
+            assert not r.success and "still moving" in r.message, ("accepted before it settled", r.message)
         time.sleep(0.4)
-        T, refs, _ = fly(rig, 1)
+        T, refs, _ = fly(rig, 1, teleport=not (WORLD_ANCHOR_ON_HANDLE and SETTLE_TOL > 0.0))
+        if WORLD_ANCHOR_ON_HANDLE and SETTLE_TOL > 0.0:
+            # [5h] THE HAND-OVER SETTLE (2026-10-24): the rig still sits where Go To Start left
+            # it, ~0.19 m from the grasp point -- the room hold must wait (info [87]), the
+            # status says so, and no WORLD anchor is asked for
+            n_a = len(rig.anchor_calls)
+            wait(lambda: len(rig.info) >= 89 and rig.info[87] == 1.0, 3, "settling (info [87])")
+            time.sleep(0.8)
+            assert False not in rig.anchor_calls[n_a:], ("held in the room before settling", rig.anchor_calls)
+            assert "settling" in rig.pl_status, rig.pl_status
+            # on the grasp point but swinging: still waits
+            rig.teleport(1)
+            rig.wobble = (0.010, 1.5)
+            time.sleep(1.2)
+            assert False not in rig.anchor_calls[n_a:], ("held in the room while swinging", rig.anchor_calls)
+            assert rig.info[87] == 1.0
+            # still: handed to the room
+            rig.wobble = None
+            t0 = time.monotonic()
+            wait(lambda: False in rig.anchor_calls[n_a:], 3, "the WORLD anchor once settled")
+            dt = time.monotonic() - t0
+            wait(lambda: rig.info[87] == 0.0, 2, "info [87] cleared")
+            wait(lambda: "settling" not in rig.pl_status, 2, "status after the hand-over")
+            print(f"[5h] the room hold waited while the claw was 0.19 m off and while it swung; "
+                  f"handed over {dt:.2f} s after it went still; {rig.pl_status}")
         # straight down onto the handle, or diagonally along the nose (-y) with
         # the side margin: never ACROSS it (x)
         side = max(abs(m.r_ed.x - grasp[0]) for m in refs)
@@ -686,8 +743,13 @@ def main():
             wait(lambda: rig.pl_status.startswith("READY"), 20, f"READY ({tag})")
             fly(rig, 0)
             time.sleep(0.4)
+            n_h = len(rig.anchor_calls)
             fly(rig, 1)
             wait(lambda: rig.pl_status.startswith("DONE ready"), 5, f"on the handle ({tag})")
+            if WORLD_ANCHOR_ON_HANDLE and SETTLE_TOL > 0.0:
+                # the hand-over settle ([5h]): the room hold comes once the claw is still
+                wait(lambda: len(rig.info) >= 89 and rig.info[87] == 0.0
+                     and False in rig.anchor_calls[n_h:], 4, f"handed to the room ({tag})")
 
         def abort_done(tag):
             wait(lambda: rig.status.startswith("EXECUTING"), 10, f"abort executing ({tag})")
