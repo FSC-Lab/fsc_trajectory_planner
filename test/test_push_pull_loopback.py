@@ -726,9 +726,10 @@ def main():
 
         def land_abort():
             # the perfect plant on the abort's end hold: from the MEASURED pose (where the
-            # rig sat), 0.03 m back against the push (the nose is -y: back is +y), 0.30 m up,
-            # the arm home (push_pull_abort_from_measured / _abort_back / _abort_climb)
-            rig.odom_xyz = rig.odom_xyz + np.array([0.0, 0.03, 0.30])
+            # rig sat), the yaml's push_pull_abort_back against the push (the nose is -y: back
+            # is +y; 0 since 2026-10-25 -- straight up), 0.30 m up, the arm home
+            # (push_pull_abort_from_measured / _abort_back / _abort_climb)
+            rig.odom_xyz = rig.odom_xyz + np.array([0.0, _yaml_num("push_pull_abort_back", 0.0), 0.30])
             rig.q = HOME.copy()
             rig.yaw = -0.5 * math.pi
             time.sleep(0.3)
@@ -916,15 +917,21 @@ def main():
             # the release: the measured arm (the stream runs at 100 Hz)
             held = int(np.argmax(np.abs(Q - q_trip).max(axis=1) > 1e-6))
             assert held >= int(0.9 * wait_s * 100), (held, wait_s)
-            # q1 / q4 untouched until the fold; q2 / q3 at the push pose's while the claw is
-            # still within 5 cm of its height (the retreat, not the climb, carried it)
+            # q1 / q4 untouched until the fold; q2 / q3 at the push pose's. With a retreat leg
+            # (push_pull_abort_back > 0) the retreat carries it, the claw still within 5 cm of its
+            # height; with none (the straight climb, 2026-10-25) the climb carries it, done by
+            # the climb's top -- the claw rises while the arm folds back along the fin
             unb = q_trip.copy()
             unb[1], unb[2] = push_q[1], push_q[2]
             at_unb = np.where(np.abs(Q - unb).max(axis=1) < 1e-6)[0]
             assert len(at_unb), "the arm never reached the push pose's q2 / q3"
             i_u = int(at_unb[0])
             assert np.allclose(Q[:i_u + 1, [0, 3]], q_trip[[0, 3]], atol=1e-9), "q1 / q4 moved before the fold"
-            assert Z[i_u] - Z[0] < 0.05, ("unbuckled only in the climb", Z[i_u] - Z[0])
+            if _yaml_num("push_pull_abort_back", 0.0) > 0.0:
+                assert Z[i_u] - Z[0] < 0.05, ("unbuckled only in the climb", Z[i_u] - Z[0])
+            else:
+                # the climb (0.30 m) plus the fold's own rise of the claw on the body (~4 mm)
+                assert Z[i_u] - Z[0] <= 0.30 + 0.01, ("unbuckled after the climb", Z[i_u] - Z[0])
             assert np.min(Z[:i_u + 1]) > Z[0] - 1e-3, "the open claw dropped while unbuckling"
             assert np.allclose(Q[-1], HOME, atol=1e-6), Q[-1]
             wait(lambda: rig.pl_status.startswith("ABORTED"), 5, "ABORTED (9h)")
