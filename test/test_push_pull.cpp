@@ -696,6 +696,199 @@ TEST(PushPull, TheObstacleIsCheckedLikeTheTable)
   EXPECT_NO_THROW(pushPullWaypoints(*v, c, t));
 }
 
+// THE KEEP-OUTS PLACED FROM THE VALVE (2026-10-27, user: the box's table-from-box
+// for the valve): in the scene's layout (axis (1.20, 0) on a 0.80 m table, the start
+// in front along -x) they equal the typed ones the simulation flies; moved and turned
+// with the valve they follow it (the obstacle centred on the axis, the table's depth
+// along the line from the start, both tops from the axis height); a beam turned away
+// from the start, a start too close or too far, and a straight push are refused.
+TEST(PushPull, KeepoutsPlacedFromTheValve)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  PushPullConfig c = config(*v);
+  c.ee_offset << 0.160, 0.0006, 0.1790;
+  c.push_pose << 0.0, 5.0 * kDeg, 25.0 * kDeg, 0.0;
+  c.yaw_from_box = 0.5 * M_PI;
+  c.turn_angle = 0.5 * M_PI;
+  c.push_time = 12.0;
+  c.gear_depth = 0.2425;
+  c.keepouts_from_valve = true;
+  c.valve_reach = 0.2001;
+  c.valve_top_above = 0.054;
+  c.table = TableKeepOut{};       // ignored
+  c.obstacle = TableKeepOut{};
+  PushPullTargets t = scene();
+  t.box << 1.20, 0.0, 0.80;
+  t.box_yaw = M_PI;               // the fin toward the start
+  t.start.p << 0.0, 0.0, 1.0;
+  t.start_set = true;
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, t);
+  // the scene's typed keep-outs, corner for corner
+  for (const auto & l : {Vec3(wp.table.x_min, wp.table.y_min, 0), Vec3(wp.table.x_max, wp.table.y_max, 0)}) {
+    const Vec3 w = wp.table.toWorld(l);
+    EXPECT_NEAR(std::abs(w(0) - 1.20), 0.075, 1e-9);
+    EXPECT_NEAR(std::abs(w(1)), 0.50, 1e-9);
+  }
+  EXPECT_NEAR(wp.table.z_top, 0.80, 1e-12);
+  EXPECT_NEAR(wp.obstacle.toWorld(Vec3(wp.obstacle.x_min, wp.obstacle.y_min, 0))(0), 1.20 - 0.2001, 1e-9);
+  EXPECT_NEAR(wp.obstacle.toWorld(Vec3(wp.obstacle.x_max, wp.obstacle.y_max, 0))(1), 0.2001, 1e-9);
+  EXPECT_NEAR(wp.obstacle.z_top, 0.854, 1e-12);
+  // the mission against them dry-runs; every leg is checked against the plan's keep-outs
+  const auto planner = makePlanner("bspline");
+  EXPECT_NO_THROW(planPushPullMission(*v, *planner, PlanOptions{}, c, wp, hover()));
+
+  // the valve elsewhere and turned: the keep-outs go with it (a 0.72 m table here)
+  PushPullTargets u = t;
+  u.box << 0.40, 0.90, 0.72;
+  u.start.p << -0.60, 0.20, 1.0;
+  const double toward = std::atan2(u.start.p(1) - u.box(1), u.start.p(0) - u.box(0));
+  u.box_yaw = toward + 10.0 * kDeg;   // the fin 10 deg off the start's bearing
+  const PushPullWaypoints wu = pushPullWaypoints(*v, c, u);
+  EXPECT_NEAR(wu.table.ox, 0.40, 1e-12);
+  EXPECT_NEAR(wu.table.oy, 0.90, 1e-12);
+  EXPECT_NEAR(wu.table.z_top, 0.72, 1e-12);
+  EXPECT_NEAR(wu.obstacle.z_top, 0.774, 1e-12);
+  // the table's depth runs along the line to the start: the start is on its middle line
+  EXPECT_NEAR(wu.table.toLocal(u.start.p)(1), 0.0, 1e-9);
+  EXPECT_LT(wu.table.toLocal(u.start.p)(0), wu.table.x_min);
+  EXPECT_NEAR(wu.obstacle.toLocal(u.box).head<2>().norm(), 0.0, 1e-12);
+
+  auto refused = [&](PushPullTargets tt, const char * what, const char * needle) {
+      try {
+        pushPullWaypoints(*v, c, tt);
+        ADD_FAILURE() << what << " was accepted";
+      } catch (const std::runtime_error & e) {
+        EXPECT_NE(std::string(e.what()).find(needle), std::string::npos) << what << ": " << e.what();
+      }
+    };
+  PushPullTargets b = t;
+  b.box_yaw = M_PI + 60.0 * kDeg;
+  refused(b, "a beam 60 deg off the start", "points 60 deg away from the start");
+  b.box_yaw = 0.0;
+  refused(b, "a mocap body turned 180 deg", "points 180 deg away from the start");
+  b = t;
+  b.start.p << 0.80, 0.0, 1.0;
+  refused(b, "a start 0.40 m from the axis", "from the valve's axis");
+  b.start.p << -2.5, 0.0, 1.0;
+  refused(b, "a start 3.70 m from the axis", "from the valve's axis");
+  PushPullConfig s = c;
+  s.turn_angle = 0.0;
+  try {
+    pushPullWaypoints(*v, s, t);
+    ADD_FAILURE() << "a straight push with the valve's keep-outs was accepted";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("is for a turn"), std::string::npos) << e.what();
+  }
+}
+
+// THE VALVE'S MOCAP PIVOT (2026-10-28, user: obj_0 = the rigid body Motive creates
+// from the markers on Valve_Assembly_v2.stl, its DEFAULT pivot = their centroid,
+// [0.0720, -0.0093, 0.0851] m from the axis on the plate bottom in the rotor frame):
+// with push_pull_valve_axis_offset = minus that, the plan is the one obj_0-on-the-axis
+// gives -- the grasp point, the turn, the keep-outs -- at any beam yaw, and the TURNED
+// claw ends on the fin's circle about the TRUE axis; without the offset the turn is
+// about the centroid and the turned claw ends ~0.10 m off that circle. A straight push
+// IGNORES the offset (a valve session's value left set must not move the box push).
+TEST(PushPull, TheValveAxisOffsetPutsTheTurnOnTheShaft)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PushPullConfig c = config(*v);
+  c.ee_offset << 0.160, 0.0006, 0.1790;
+  c.push_pose << 0.0, 5.0 * kDeg, 25.0 * kDeg, 0.0;
+  c.yaw_from_box = 0.5 * M_PI;
+  c.turn_angle = 0.5 * M_PI;
+  c.push_time = 18.0;
+  c.gear_depth = 0.2425;
+  c.keepouts_from_valve = true;
+  c.valve_reach = 0.2001;
+  c.valve_top_above = 0.054;
+  c.fence.min_z = 0.25;                            // the valve yaml's: the Land hover at 0.30 m
+  const Vec3 centroid(0.0720, -0.0093, 0.0851);   // the markers' centroid, rotor frame
+  // the beam toward the start (the start on the beam's line): 180 deg in the scene's layout,
+  // 205 deg and 90 deg with the start moved round the valve
+  const Vec3 axis_true(0.675, 0.0, 0.80);         // the axis on the table top
+  for (const double yaw : {M_PI, M_PI + 25.0 * kDeg, 0.5 * M_PI}) {
+    PushPullTargets t = scene();
+    t.box = axis_true;
+    t.box_yaw = yaw;
+    t.start.p << axis_true(0) + 1.675 * std::cos(yaw), axis_true(1) + 1.675 * std::sin(yaw), 1.0;
+    t.start_set = true;
+    // the way home over the start mark (Adjust moves Land Start and Land there), the valve yaml's
+    t.land_start.p << t.start.p(0), t.start.p(1), 1.3;
+    t.land_start.yaw = yaw + M_PI;
+    t.land_start_set = true;
+    t.land.p << t.start.p(0), t.start.p(1), 0.30;
+    t.land.yaw = yaw + M_PI;
+    const PushPullWaypoints ref = pushPullWaypoints(*v, c, t);
+    PushPullTargets m = t;                         // obj_0 at the centroid, beam-aligned
+    m.box = t.box + Rz(yaw) * centroid;
+    PushPullConfig cm = c;
+    cm.valve_axis_offset = -centroid;
+    const PushPullWaypoints wp = pushPullWaypoints(*v, cm, m);
+    EXPECT_NEAR((wp.axis - axis_true).norm(), 0.0, 1e-12);
+    EXPECT_NEAR((wp.grasp_ee - ref.grasp_ee).norm(), 0.0, 1e-12);
+    EXPECT_NEAR((wp.pushed.x_b - ref.pushed.x_b).norm(), 0.0, 1e-12);
+    EXPECT_NEAR(wp.pushed.phi - ref.pushed.phi, 0.0, 1e-12);
+    EXPECT_NEAR(wp.table.ox - ref.table.ox, 0.0, 1e-12);
+    EXPECT_NEAR(wp.table.oy - ref.table.oy, 0.0, 1e-12);
+    EXPECT_NEAR(wp.table.yaw - ref.table.yaw, 0.0, 1e-12);
+    EXPECT_NEAR(wp.table.z_top, 0.80, 1e-12);
+    EXPECT_NEAR(wp.obstacle.z_top, 0.854, 1e-12);
+    EXPECT_NEAR((wp.obstacle.toLocal(axis_true)).head<2>().norm(), 0.0, 1e-12);
+    // the TURN LEG itself: its claw stays on the fin's 0.160 m circle about the true axis to its
+    // end, and the whole mission dry-runs against the keep-outs placed from the axis
+    const auto turn = planPushPullPush(*v, *planner, PlanOptions{}, cm, wp.grasp, wp.axis);
+    const double r_fin = std::hypot(wp.grasp_ee(0) - axis_true(0), wp.grasp_ee(1) - axis_true(1));
+    EXPECT_NEAR(r_fin, 0.1600, 1e-3);
+    for (const double f : {0.25, 0.5, 0.75, 1.0}) {
+      const WbReference rf = turn->eval(f * turn->duration());
+      // (the claw reference rides the acceleration tilt: sub-mm off the circle, the turn's own rule)
+      EXPECT_NEAR(std::hypot(rf.r_ed(0) - axis_true(0), rf.r_ed(1) - axis_true(1)), r_fin, 1e-3) << f;
+    }
+    // ... from the take-off hover over the start mark at 1.3 m, facing the valve (the experiment's)
+    RestSpec h = hover();
+    h.x_b << t.start.p(0), t.start.p(1), 1.3;
+    h.phi = yaw + M_PI - 0.5 * M_PI;
+    try {
+      planPushPullMission(*v, *planner, PlanOptions{}, cm, wp, h);
+    } catch (const std::exception & e) {
+      ADD_FAILURE() << "yaw " << yaw * 180.0 / M_PI << ": the mission threw: " << e.what();
+    }
+    // without the offset the centroid is taken for the axis AND the EE offset is applied from it:
+    // the grasp point, the turned claw and the whole circle are 72.6 mm off (the centroid's
+    // horizontal offset), and the table top 85 mm high
+    const PushPullWaypoints wrong = pushPullWaypoints(*v, c, m);
+    EXPECT_NEAR((wrong.grasp_ee - ref.grasp_ee).head<2>().norm(), centroid.head<2>().norm(), 1e-9);
+    const auto turn_bad = planPushPullPush(*v, *planner, PlanOptions{}, c, wrong.grasp, wrong.axis);
+    const Vec3 end_good = turn->eval(turn->duration()).r_ed, end_bad = turn_bad->eval(turn_bad->duration()).r_ed;
+    EXPECT_NEAR((end_bad - end_good).head<2>().norm(), centroid.head<2>().norm(), 1e-3);
+    EXPECT_NEAR(wrong.table.z_top, 0.80 + 0.0851, 1e-12);
+  }
+  // a straight push ignores the offset: the same waypoints as without it
+  PushPullConfig s = config(*v);
+  const PushPullWaypoints s0 = pushPullWaypoints(*v, s, scene());
+  s.valve_axis_offset = -centroid;
+  const PushPullWaypoints s1 = pushPullWaypoints(*v, s, scene());
+  EXPECT_NEAR((s1.grasp_ee - s0.grasp_ee).norm(), 0.0, 1e-12);
+  EXPECT_NEAR((s1.axis - s0.axis).norm(), 0.0, 1e-12);
+  EXPECT_NEAR((s1.pushed.x_b - s0.pushed.x_b).norm(), 0.0, 1e-12);
+  // a non-finite offset in a turn is refused
+  PushPullConfig nf = c;
+  nf.valve_axis_offset(0) = std::nan("");
+  PushPullTargets tn = scene();
+  tn.box = axis_true;
+  tn.box_yaw = M_PI;
+  tn.start.p << -1.0, 0.0, 1.0;
+  tn.start_set = true;
+  try {
+    pushPullWaypoints(*v, nf, tn);
+    ADD_FAILURE() << "a NaN valve axis offset was accepted";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("not finite"), std::string::npos) << e.what();
+  }
+}
+
 // THE WAY TO LAND START (2026-10-16, user: "simple but a safe transition"):
 // ONE transition from the exit hold to the typed Land Start (high), the
 // heading turning the typed 270 deg clockwise without ever turning back, the

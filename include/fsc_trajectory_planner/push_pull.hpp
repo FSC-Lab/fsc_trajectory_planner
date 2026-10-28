@@ -215,6 +215,35 @@ struct PushPullConfig
   // under its top): with bypass the way home flies over the pushed box, which is
   // then a keep-out up to there (2026-10-22)
   double handle_above_grasp{0.025};
+  // THE KEEP-OUTS PLACED FROM THE VALVE (2026-10-27, user: the box's table-from-
+  // box for the valve-turning task -- the lab table goes where the floor is flat):
+  // true = `table` and `obstacle` are replaced at Plan by footprints placed from
+  // the captured rotor (mocap obj_0: its origin ON the bearing axis at the plate-
+  // bottom plane, i.e. on the table top; +x along the beam toward the fin):
+  //   obstacle  the square of half side valve_reach about the axis (the beam's
+  //             swept circle), its top valve_top_above over the axis point;
+  //   table     table_length x table_depth, centred on the axis, its DEPTH along
+  //             the horizontal line from the start to the axis (the valve clamped
+  //             across the table's depth, in its middle), its top AT the axis point.
+  // Turns only. Plan refuses a start closer than valve_start_min or farther than
+  // valve_start_max from the axis, and a beam pointing more than valve_beam_tol
+  // away from the start (the layout rule: the fin toward the vehicle -- and the
+  // catch for a mocap body defined turned). false = the typed keep-outs (unchanged).
+  bool keepouts_from_valve{false};
+  double valve_reach{0.0};
+  double valve_top_above{0.0};
+  double valve_start_min{0.6};
+  double valve_start_max{3.0};
+  double valve_beam_tol{M_PI / 4.0};
+  // THE VALVE'S MOCAP PIVOT (2026-10-28, user: the markers on Valve_Assembly_v2.stl,
+  // obj_0 = the rigid body Motive creates from them, its DEFAULT pivot = the markers'
+  // centroid, 72.6 mm off the shaft). Turns only: obj_0 -> the bearing axis at the
+  // plate-bottom plane, in obj_0's frame (z up, +x along the beam toward the fin),
+  // turned with obj_0's yaw like ee_offset. The turn's centre, the live handle and
+  // the keep-outs placed from the valve start from obj_0 + Rz(yaw) * this, and in a
+  // turn ee_offset is measured FROM THAT AXIS POINT (the fin's own geometry, the
+  // same numbers as before). Zero = obj_0 defined on the axis (unchanged).
+  Vec3 valve_axis_offset{Vec3::Zero()};
 };
 
 // The start's extra room for the curve round the table [m]: the curve leaves the
@@ -225,6 +254,11 @@ constexpr double kBypassStartMargin = 0.05;
 // The table's footprint placed from the box (PushPullConfig::table_from_box).
 // Throws std::runtime_error when the sizes cannot describe a table under the box.
 TableKeepOut tableFromBox(const PushPullConfig & c, const Vec3 & box, double box_yaw);
+// The keep-outs placed from the valve (PushPullConfig::keepouts_from_valve): the
+// table about the captured axis, its depth along the line from `start`, and the
+// beam's swept square. Throw std::runtime_error when the sizes are not set.
+TableKeepOut tableFromValve(const PushPullConfig & c, const Vec3 & axis, const Vec3 & start);
+TableKeepOut obstacleFromValve(const PushPullConfig & c, const Vec3 & axis);
 
 struct PushPullTargets
 {
@@ -256,11 +290,15 @@ struct PushPullWaypoints
   Vec3 approach_ee{Vec3::Zero()}, grasp_ee{Vec3::Zero()}, pushed_ee{Vec3::Zero()};
   double drone_yaw{0.0};          // ACTUAL yaw at the box [rad]
   Vec3 push_dir{Vec3::Zero()};    // unit, horizontal, world: the nose at the box
-  Vec3 axis{Vec3::Zero()};        // the turn's axis (the captured body), world [m]
+  // the turn's axis, world [m]: the captured body + Rz(yaw) * valve_axis_offset
+  // (2026-10-28; the captured body itself before), on the plate-bottom plane
+  Vec3 axis{Vec3::Zero()};
   // the table the plan was made against (2026-10-22): the typed one, or the one
   // placed from the box -- every later step is checked against THIS, so it
   // stays when the capture is dropped (an abort that touched the box)
   TableKeepOut table;
+  // the obstacle likewise (2026-10-27: the typed one, or placed from the valve)
+  TableKeepOut obstacle;
 };
 
 // The waypoints. Throws std::runtime_error "<step>: <reason>" when one is

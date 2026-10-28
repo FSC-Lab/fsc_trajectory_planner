@@ -64,6 +64,8 @@ set_ee_anchor_com services that record what the planner asks for.
        with the fold held, until q2 meets its wall at q3 = fold - wall (15 deg) -- aborts nothing;
        the same stretch with the key live-set to 0 (the flown rule) aborts; a fold with q2 pinned
        at the wall still aborts while q3 is above the limit
+  [9l] (2026-10-25) the sideways box guard (push_pull_guard_box_cross, the arbitrary-time rig):
+       the box dragged 30 mm across the push passes a 45 mm limit, 60 mm aborts, named
   [9j] (2026-10-22, the valve's drone-mocap freeze) a mocap-guard abort hands the claw to the
        CoM anchor AT ONCE even with push_pull_abort_release_world_held (the valve's free-handle
        release): "the world" is then EKF2 dead-reckoning; and a mocap fault confirmed DURING a
@@ -222,6 +224,7 @@ class Rig(Node):
         self.mg_on = True          # [9e] stops it
         self.free_off = 0.0        # [9f] the law's free-axis shift, wb_control_debug [117] [m]
         self.box_follow = None     # [9f] (box0, r_ed0): the box follows the streamed claw reference
+        self.box_side = 0.0        # [9l] the box dragged sideways (world x, across the -y push) [m]
         self.glitch_n = 0          # [9g] the next n box samples are the 10-21 mis-solve
         self.wobble = None         # [5] (amplitude m, frequency Hz): the body swings along x
         self.rng = np.random.default_rng(0)
@@ -262,6 +265,7 @@ class Rig(Node):
         if self.box_follow is not None and self.refs:
             r = self.refs[-1][1].r_ed
             box = self.box_follow[0] + (np.array([r.x, r.y, r.z]) - self.box_follow[1])
+        box = box + np.array([self.box_side, 0.0, 0.0])
         noisy = box + self.rng.normal(0.0, 0.0005, 3)
         q = (1.0, 0.0, 0.0, 0.0)
         if self.glitch_n > 0:      # [9g] a 95 deg roll, the origin 61 mm off
@@ -850,6 +854,36 @@ def main():
               f"{rig.pl_status}")
         abort_done("9f")
         set_param(rig, "push_pull_guard_box_lag", 0.0)
+
+        # [9l] the sideways box guard (2026-10-25, push_pull_guard_box_cross; off in every
+        # whole-body yaml, 45 mm in the arbitrary-time rig's): the box follows the plan along the
+        # push and is dragged across it (world x) at 30 mm/s -- slow enough for the box sample gate.
+        # 30 mm passes, 60 mm aborts with the guard named.
+        set_param(rig, "push_pull_guard_box_cross", 0.045)
+        back_on_handle("9l")
+        rig.refs.clear()
+        r = call(rig, "push")
+        assert r.success, r.message
+        wait(lambda: rig.status.startswith("EXECUTING") and rig.refs, 10, "push executing (9l)")
+        r0 = rig.refs[-1][1].r_ed
+        rig.box_follow = (rig.box.copy(), np.array([r0.x, r0.y, r0.z]))
+        time.sleep(2.0)
+
+        def drag(to, rate=0.030):
+            while abs(rig.box_side - to) > 1e-4:
+                rig.box_side += max(-rate * 0.02, min(rate * 0.02, to - rig.box_side))
+                time.sleep(0.02)
+        drag(0.030)
+        time.sleep(1.0)
+        assert rig.pl_status.startswith("FLYING push"), rig.pl_status    # no trip at 30 mm
+        drag(0.060)
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 3, "sideways box guard")
+        assert "mm sideways" in rig.pl_status, rig.pl_status
+        rig.box_follow = None
+        rig.box_side = 0.0
+        print(f"[9l] the box dragged 30 mm sideways: no trip; to 60 mm: {rig.pl_status}")
+        abort_done("9l")
+        set_param(rig, "push_pull_guard_box_cross", 0.0)
 
         # [9g] the box sample gate (2026-10-21): the yaml's push_pull_box_gate_jump_m / _deg.
         # A 0.3 s run of the 10-21 mis-solve while pushing (15 samples at the rig's 50 Hz):

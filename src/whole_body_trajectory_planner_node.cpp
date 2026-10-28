@@ -792,6 +792,30 @@ public:
     // round the table's FAR end (2026-10-22): the box is a keep-out up to its
     // handle's top, this far above the grasp point [m]
     declare_parameter<double>("push_pull_handle_top_above_grasp", 0.025);
+    // THE KEEP-OUTS PLACED FROM THE VALVE (2026-10-27, user; PushPullConfig::
+    // keepouts_from_valve): true = push_pull_table AND push_pull_obstacle are IGNORED;
+    // at Plan the valve's keep-out is the square of half side push_pull_valve_reach about
+    // the captured axis (obj_0, its origin on the axis at the plate bottom = the table
+    // top), its top push_pull_valve_top_above over obj_0; the table push_pull_table_size
+    // [length, depth] centred on the axis, its depth along the line from the start, its
+    // top at obj_0. Adjust takes the start wherever the vehicle is (no push_pull_adjust_max);
+    // Plan refuses a start outside push_pull_valve_start_range [min, max] m from the axis
+    // and a beam more than push_pull_valve_beam_tol_deg from the start (0 = no check).
+    // Turns only. false = the typed keep-outs (unchanged).
+    declare_parameter<bool>("push_pull_keepouts_from_valve", false);
+    declare_parameter<double>("push_pull_valve_reach", 0.0);
+    declare_parameter<double>("push_pull_valve_top_above", 0.0);
+    declare_parameter<std::vector<double>>("push_pull_valve_start_range", std::vector<double>{0.6, 3.0});
+    declare_parameter<double>("push_pull_valve_beam_tol_deg", 45.0);
+    // THE VALVE'S MOCAP PIVOT (2026-10-28, user; PushPullConfig::valve_axis_offset):
+    // obj_0 -> the bearing axis at the plate-bottom plane, [x, y, z] in obj_0's frame
+    // (z up, +x along the beam toward the fin), turned with obj_0's yaw. Motive's DEFAULT
+    // pivot is the markers' centroid -- on Valve_Assembly_v2.stl's five markers
+    // [-0.0720, 0.0093, -0.0851] (72.6 mm off the shaft, 85 mm up). Turns only: the
+    // turn's centre, the live handle and the keep-outs placed from the valve are
+    // obj_0 + Rz(yaw) * this, and push_pull_ee_offset is measured from that axis point.
+    // [0, 0, 0] = obj_0 defined on the axis (unchanged).
+    declare_parameter<std::vector<double>>("push_pull_valve_axis_offset", std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter<double>("push_pull_fence_min_z", 0.6);
     declare_parameter<double>("push_pull_fence_max_z", 1.8);
     declare_parameter<std::vector<double>>(
@@ -918,6 +942,17 @@ public:
     // All 0 = off (unchanged).
     declare_parameter<double>("push_pull_guard_box_lag", 0.0);
     declare_parameter<double>("push_pull_guard_box_tilt_deg", 0.0);
+    // box_cross (2026-10-25, the arbitrary-time comparison rig,
+    // archive/box_pushing_arbitrary_time_20261024): the box's horizontal
+    // displacement ACROSS the push from where it sat when the push step started (the
+    // box guards' reference pose), above this [m], for box_persist_s. A straight
+    // push plans none, so all of it is the box being dragged sideways -- toward the
+    // table's side edge (a 160 mm box on a 150 mm table: its CoM is over the edge
+    // after 75 mm). That rig's base-relative arm admittance drags the box with the
+    // base's sideways swings (nominal up to 35 mm; once 90 mm, the box fell off the
+    // table after the tilt guard released it already over the edge). The whole-body
+    // and coordinated rigs drag it 2-5 mm. 0 = off (unchanged); not for a turn.
+    declare_parameter<double>("push_pull_guard_box_cross", 0.0);
     declare_parameter<double>("push_pull_guard_box_persist_s", 0.20);
     declare_parameter<double>("push_pull_guard_box_stale_s", 0.50);
     declare_parameter<double>("push_pull_guard_q3_min_deg", 0.0);
@@ -5451,6 +5486,22 @@ private:
     c->bypass = get_parameter("push_pull_go_to_start_bypass").as_bool();
     c->bypass_clearance = get_parameter("push_pull_bypass_clearance").as_double();
     c->handle_above_grasp = get_parameter("push_pull_handle_top_above_grasp").as_double();
+    c->keepouts_from_valve = get_parameter("push_pull_keepouts_from_valve").as_bool();
+    c->valve_reach = get_parameter("push_pull_valve_reach").as_double();
+    c->valve_top_above = get_parameter("push_pull_valve_top_above").as_double();
+    const auto vr = get_parameter("push_pull_valve_start_range").as_double_array();
+    if (vr.size() != 2 || !(vr[1] > vr[0])) {
+      *err = "push_pull_valve_start_range needs [min, max] m with max > min";
+      return false;
+    }
+    c->valve_start_min = vr[0];
+    c->valve_start_max = vr[1];
+    c->valve_beam_tol = get_parameter("push_pull_valve_beam_tol_deg").as_double() / 180.0 * M_PI;
+    if (!ppVec3("push_pull_valve_axis_offset", &c->valve_axis_offset, err)) {return false;}
+    if (!c->valve_axis_offset.allFinite()) {
+      *err = "push_pull_valve_axis_offset must be finite";
+      return false;
+    }
     return true;
   }
 
@@ -5465,10 +5516,26 @@ private:
     std::string err;
     const bool cfg_ok = plConfig(&c, &err);
     if (pl_wp_.has_value() || pl_leave_wp_.has_value()) {
-      *derived = cfg_ok && c.table_from_box;
+      *derived = cfg_ok && (c.table_from_box || c.keepouts_from_valve);
       return pl_wp_.has_value() ? pl_wp_->table : pl_leave_wp_->table;
     }
     if (!cfg_ok) {return std::nullopt;}
+    if (c.keepouts_from_valve) {
+      // the table placed from the valve (2026-10-27): the capture and the start mark
+      PushPullTargets tg;
+      std::string e2;
+      if (!pl_box_.has_value() || !ppBase("push_pull_start_mark", &tg.start, &e2)) {return std::nullopt;}
+      try {
+        *derived = true;
+        // the axis point (2026-10-28): obj_0 + Rz(yaw) * push_pull_valve_axis_offset
+        const double yb = pl_box_yaw_.value_or(0.0);
+        const Vec3 axis = *pl_box_ + Eigen::AngleAxisd(yb, Vec3::UnitZ()) * c.valve_axis_offset;
+        return tableFromValve(c, axis, tg.start.p);
+      } catch (const std::exception &) {
+        *derived = false;
+        return std::nullopt;
+      }
+    }
     if (!c.table_from_box) {return c.table;}
     if (!pl_box_.has_value()) {return std::nullopt;}
     try {
@@ -5513,6 +5580,7 @@ private:
       "push_pull_abort_unbuckle",
       "push_pull_guard_persist_s", "push_pull_guard_force_n", "push_pull_guard_force_persist_s",
       "push_pull_guard_box_lag", "push_pull_guard_box_tilt_deg", "push_pull_guard_box_persist_s",
+      "push_pull_guard_box_cross",
       "push_pull_guard_box_stale_s", "push_pull_guard_q3_min_deg",
       "push_pull_guard_q3_lookahead_s", "push_pull_guard_q3_rate_min_deg_s",
       "push_pull_guard_q3_rate_persist_s", "push_pull_guard_q3_rate_filter_s",
@@ -5592,7 +5660,7 @@ private:
         n == "push_pull_fence_xy")
       {
         len = 4;
-      } else if (n == "push_pull_ee_offset") {
+      } else if (n == "push_pull_ee_offset" || n == "push_pull_valve_axis_offset") {
         len = 3;
       } else if (n == "push_pull_table_size") {
         len = 2;
@@ -5604,6 +5672,33 @@ private:
       {
         r.successful = false;
         r.reason = n + " needs " + std::to_string(len) + " numbers";
+        return r;
+      }
+      // (2026-10-28) the valve's offsets must be finite: a NaN passes every keep-out check
+      if ((n == "push_pull_valve_axis_offset" || n == "push_pull_ee_offset") &&
+        std::any_of(p.as_double_array().begin(), p.as_double_array().end(),
+        [](double v) {return !std::isfinite(v);}))
+      {
+        r.successful = false;
+        r.reason = n + " must be finite";
+        return r;
+      }
+      // (2026-10-28) the layout rule's range, checked here too: plConfig refuses a bad one and
+      // every later step (Go To Land Start after an abort included) would fail on it
+      if (n == "push_pull_valve_start_range") {
+        const auto v = p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ?
+          p.as_double_array() : std::vector<double>{};
+        if (v.size() != 2 || !(v[1] > v[0]) || !(v[0] >= 0.0)) {
+          r.successful = false;
+          r.reason = n + " needs [min, max] m with 0 <= min < max";
+          return r;
+        }
+      }
+      if (n == "push_pull_valve_beam_tol_deg" &&
+        (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || !(p.as_double() >= 0.0)))
+      {
+        r.successful = false;
+        r.reason = n + " needs a number >= 0 (0 = no check)";
         return r;
       }
       if (std::none_of(std::begin(kGateOnly), std::end(kGateOnly),
@@ -5794,13 +5889,15 @@ private:
   {
     const double lag_lim = get_parameter("push_pull_guard_box_lag").as_double();
     const double tilt_lim = get_parameter("push_pull_guard_box_tilt_deg").as_double();
+    const double cross_lim = get_parameter("push_pull_guard_box_cross").as_double();
     const bool pushing = pl_flying_.has_value() && *pl_flying_ == kPlPush;
     const bool engaged = mode_direct_ && hold_.has_value() && (pl_at_handle_ || pushing) &&
       !pl_aborting_ && !pl_abort_plan_ && pl_wp_.has_value();
     const bool executing = pushing && state_ == "EXECUTING" && plan_ && exec_t0_.has_value();
-    if (!engaged || (!(lag_lim > 0.0) && !(tilt_lim > 0.0))) {
+    if (!engaged || (!(lag_lim > 0.0) && !(tilt_lim > 0.0) && !(cross_lim > 0.0))) {
       pl_bg_lag_since_.reset();
       pl_bg_tilt_since_.reset();
+      pl_bg_cross_since_.reset();
       if (!pl_at_handle_ && !pushing) {pl_bg_box0_.reset();}
       return false;
     }
@@ -5828,6 +5925,31 @@ private:
       }
     } else {
       pl_bg_tilt_since_.reset();
+    }
+    // cross: the box's horizontal displacement across the push since the push step
+    // started (2026-10-25)
+    if (cross_lim > 0.0 && get_parameter("push_pull_turn_deg").as_double() == 0.0) {
+      Vec3 uh = pl_wp_->push_dir;
+      uh.z() = 0.0;
+      Vec3 dp = p - *pl_bg_box0_;
+      dp.z() = 0.0;
+      pl_bg_cross_ = uh.norm() > 1e-9 ? (dp - dp.dot(uh.normalized()) * uh.normalized()).norm() : 0.0;
+      if (pl_bg_cross_ > cross_lim) {
+        if (!pl_bg_cross_since_.has_value()) {pl_bg_cross_since_ = Clock::now();}
+        if (secondsSince(pl_bg_cross_since_) >= persist) {
+          m.precision(0);
+          m << "the box was dragged " << pl_bg_cross_ * 1e3 << " mm sideways (> " << cross_lim * 1e3
+            << " mm: toward the table's edge)";
+          pl_guard_reason_ = m.str();
+          pl_guard_tripped_ = true;
+          pl_bg_cross_since_.reset();
+          return true;
+        }
+      } else {
+        pl_bg_cross_since_.reset();
+      }
+    } else {
+      pl_bg_cross_since_.reset();
     }
     // lag: the box against the PLANNED claw, along the push, while it flies
     if (!(lag_lim > 0.0) || !executing || get_parameter("push_pull_turn_deg").as_double() != 0.0) {
@@ -5983,7 +6105,8 @@ private:
     std::ostringstream m;
     m.setf(std::ios::fixed);
     const bool box_armed = get_parameter("push_pull_guard_box_lag").as_double() > 0.0 ||
-      get_parameter("push_pull_guard_box_tilt_deg").as_double() > 0.0;
+      get_parameter("push_pull_guard_box_tilt_deg").as_double() > 0.0 ||
+      get_parameter("push_pull_guard_box_cross").as_double() > 0.0;
     const double stale = get_parameter("push_pull_guard_box_stale_s").as_double();
     const double age = pl_mocap_.empty() ? 1e9 : secondsSince(pl_mocap_.back().t);
     // A FROZEN feed counts as a silent one (2026-10-19, the hardware box push):
@@ -6226,6 +6349,17 @@ private:
         << std::setprecision(1) << yaw * 180.0 / M_PI << " deg from " << pl_box_topic_ << " ("
         << pts.size() << " samples, spread " << spread * 1e3
         << " mm); the EE offset is applied in this box frame -- press Plan";
+      // (2026-10-28) in a turn: where the planner takes the valve's axis to be, to check by eye
+      // (obj_0 = the markers' centroid on hardware; the axis point is on the plate bottom)
+      const auto off = get_parameter("push_pull_valve_axis_offset").as_double_array();
+      if (get_parameter("push_pull_turn_deg").as_double() != 0.0 && off.size() == 3) {
+        const Vec3 o(off[0], off[1], off[2]);
+        const Vec3 ax = mean + Eigen::AngleAxisd(yaw, Vec3::UnitZ()) * o;
+        m.precision(3);
+        m << ". The VALVE'S AXIS (obj_0 + push_pull_valve_axis_offset [" << std::setprecision(4) << o(0)
+          << ", " << o(1) << ", " << o(2) << "]) at [" << std::setprecision(3) << ax(0) << ", " << ax(1)
+          << ", " << ax(2) << "] m -- on the shaft, at the plate bottom (= the table top)";
+      }
     }
     resp->success = true;
     resp->message = m.str();
@@ -6269,7 +6403,8 @@ private:
       // the table placed from the box (2026-10-22): the start is wherever the
       // vehicle is -- the table goes where the floor is flat, so a room-fixed mark
       // means nothing; Plan checks the start against the table instead
-      const bool from_box = get_parameter("push_pull_table_from_box").as_bool();
+      const bool from_box = get_parameter("push_pull_table_from_box").as_bool() ||
+        get_parameter("push_pull_keepouts_from_valve").as_bool();   // (2026-10-27, the valve)
       if (!from_box && off.norm() > max_off) {
         m << "offset [" << off(0) << ", " << off(1) << "] m is larger than " << max_off
           << " m -- is the vehicle on its start mark? Not adjusted";
@@ -6406,6 +6541,20 @@ private:
                 get_logger(), "push-and-pull planned: %.1f s of flight in six steps; the push slides "
                 "the box %.2f m along yaw %.1f deg.", whole->duration(), cfg.push_distance,
                 wp->drone_yaw * 180.0 / M_PI);
+            }
+            if (cfg.keepouts_from_valve) {
+              // the keep-outs placed from the valve (2026-10-27): to check by eye
+              const TableKeepOut & tb = wp->table;
+              const TableKeepOut & ob = wp->obstacle;
+              const Vec3 a = tb.toWorld(Vec3(tb.x_min, tb.y_min, 0.0));
+              const Vec3 b = tb.toWorld(Vec3(tb.x_min, tb.y_max, 0.0));
+              RCLCPP_INFO(
+                get_logger(), "push-and-pull: the keep-outs placed from the valve -- axis (%.3f, %.3f, "
+                "%.3f) = obj_0 + axis offset [%.4f, %.4f, %.4f]; the table %.2f x %.2f m centred on it, its "
+                "near edge (%.3f, %.3f)..(%.3f, %.3f), top %.3f m; the beam's swept square +-%.3f m, top "
+                "%.3f m", wp->axis(0), wp->axis(1), wp->axis(2), cfg.valve_axis_offset(0),
+                cfg.valve_axis_offset(1), cfg.valve_axis_offset(2), tb.y_max - tb.y_min,
+                tb.x_max - tb.x_min, a(0), a(1), b(0), b(1), tb.z_top, ob.x_max, ob.z_top);
             }
             if (cfg.table_from_box) {
               // the table placed from the box (2026-10-22): its corners, to check by eye
@@ -6555,6 +6704,7 @@ private:
       from = *hold_;
       wp = pl_wp_.has_value() ? *pl_wp_ : *pl_leave_wp_;   // leaving the table after an abort
       cfg.table = wp.table;   // the plan's table (2026-10-22: placed from the box, or typed)
+      cfg.obstacle = wp.obstacle;   // and obstacle (2026-10-27: placed from the valve, or typed)
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -6593,6 +6743,7 @@ private:
           pl_ey_buf_.clear();
           pl_bg_box0_.reset();       // the box guards: taken when the push executes
           pl_bg_lag_since_.reset();
+          pl_bg_cross_since_.reset();
           pl_mon_ = PlMonitor{};     // the push monitor: starts when the push executes
           break;
         case kPlExit:
@@ -6711,7 +6862,10 @@ private:
     PushPullConfig cfg;
     std::string err;
     if (!plConfig(&cfg, &err) || cfg.unload_time <= 0.0) {return false;}
-    if (pl_wp_.has_value()) {cfg.table = pl_wp_->table;}   // the plan's table (2026-10-22)
+    if (pl_wp_.has_value()) {   // the plan's table (2026-10-22) and obstacle (2026-10-27)
+      cfg.table = pl_wp_->table;
+      cfg.obstacle = pl_wp_->obstacle;
+    }
     pl_unloaded_ = true;
     const auto now = Clock::now();
     const double avg = get_parameter("push_pull_unload_avg_s").as_double();
@@ -7697,7 +7851,8 @@ private:
   // (NaN when the speed is not set); then THE TESTED RANGES (2026-10-21):
   // [73] / [74] the Push Distance's min / max [m], [75] / [76] the mean speed's
   // [m/s] (NaN = no range); then THE TABLE (2026-10-22, appended): [77] 1 = a
-  // table to check against, [78] 1 = placed from the box (push_pull_table_from_box),
+  // table to check against, [78] 1 = placed from the box (push_pull_table_from_box) or the
+  // valve (push_pull_keepouts_from_valve, 2026-10-27),
   // [79] / [80] its frame's origin x, y [m], [81] its frame's yaw [deg] (0 = world
   // axes, the typed table), [82..85] x_min, x_max, y_min, y_max in that frame [m],
   // [86] its top z [m] -- the plan's table when planned, else the one the box
@@ -8050,10 +8205,10 @@ private:
   // executing, and each condition's since-time
   std::optional<Vec3> pl_bg_box0_;
   Mat3 pl_bg_R0_{Mat3::Identity()};
-  std::optional<Clock::time_point> pl_bg_lag_since_, pl_bg_tilt_since_, pl_bg_q3_since_;
+  std::optional<Clock::time_point> pl_bg_lag_since_, pl_bg_tilt_since_, pl_bg_q3_since_, pl_bg_cross_since_;
   std::optional<Vec3> pl_bg_lag0_;               // the box when the push started executing
   unsigned pl_bg_lag_gen_{0};
-  double pl_bg_lag_{0.0}, pl_bg_tilt_{0.0};      // the last values (for the info line)
+  double pl_bg_lag_{0.0}, pl_bg_tilt_{0.0}, pl_bg_cross_{0.0};      // the last values (for the info line)
   // THE BOX SAMPLE GATE (2026-10-21): the last GOOD box sample, and the samples dropped
   std::optional<Clock::time_point> pl_gate_t_;
   Vec3 pl_gate_p_{Vec3::Zero()};

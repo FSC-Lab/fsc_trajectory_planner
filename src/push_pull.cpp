@@ -805,6 +805,46 @@ TableKeepOut tableFromBox(const PushPullConfig & c, const Vec3 & box, double box
   return t;
 }
 
+TableKeepOut tableFromValve(const PushPullConfig & c, const Vec3 & axis, const Vec3 & start)
+{
+  if (!(c.table_length > 0.0) || !(c.table_depth > 0.0)) {
+    std::ostringstream m;
+    m << "the table placed from the valve needs push_pull_table_size [length, depth] > 0 (have ["
+      << c.table_length << ", " << c.table_depth << "])";
+    throw std::runtime_error(m.str());
+  }
+  TableKeepOut t;
+  t.ox = axis(0);
+  t.oy = axis(1);
+  // x = the table's DEPTH, along the line from the start to the axis
+  t.yaw = std::atan2(axis(1) - start(1), axis(0) - start(0));
+  t.x_min = -0.5 * c.table_depth;
+  t.x_max = 0.5 * c.table_depth;
+  t.y_min = -0.5 * c.table_length;
+  t.y_max = 0.5 * c.table_length;
+  t.z_top = axis(2);
+  return t;
+}
+
+TableKeepOut obstacleFromValve(const PushPullConfig & c, const Vec3 & axis)
+{
+  if (!(c.valve_reach > 0.0) || !(c.valve_top_above > 0.0)) {
+    std::ostringstream m;
+    m << "the valve's keep-out needs push_pull_valve_reach > 0 and push_pull_valve_top_above > 0 "
+      "(have " << c.valve_reach << ", " << c.valve_top_above << ")";
+    throw std::runtime_error(m.str());
+  }
+  TableKeepOut o;
+  o.ox = axis(0);
+  o.oy = axis(1);
+  o.x_min = -c.valve_reach;
+  o.x_max = c.valve_reach;
+  o.y_min = -c.valve_reach;
+  o.y_max = c.valve_reach;
+  o.z_top = axis(2) + c.valve_top_above;
+  return o;
+}
+
 namespace
 {
 // One keep-out's check (the table, or the obstacle): see checkPathClearsTable.
@@ -888,6 +928,51 @@ PushPullWaypoints pushPullWaypoints(
     }
     c.table = tableFromBox(c, t.box, t.box_yaw);
   }
+  // THE TURN'S AXIS (2026-10-28): obj_0 + Rz(yaw) * valve_axis_offset -- the
+  // bearing axis on the plate-bottom plane when obj_0 is the markers' centroid
+  // (Motive's default pivot); obj_0 itself with a zero offset (unchanged). A
+  // straight push IGNORES the offset (it is the valve's: a planner switched
+  // from the Valve Turning tab to the Box Pushing tab keeps it set).
+  if (c.turn_angle != 0.0 && !c.valve_axis_offset.allFinite()) {
+    throw std::runtime_error("push: push_pull_valve_axis_offset is not finite");
+  }
+  const Vec3 axis = c.turn_angle != 0.0 ? Vec3(t.box + Rz(t.box_yaw) * c.valve_axis_offset) : t.box;
+  // THE KEEP-OUTS PLACED FROM THE VALVE (2026-10-27), and the layout they assume:
+  // the vehicle starts in front of the valve, the beam (obj_0 +x) toward it
+  if (c.keepouts_from_valve) {
+    if (c.turn_angle == 0.0) {
+      throw std::runtime_error(
+        "push: push_pull_keepouts_from_valve is for a turn (set push_pull_turn_deg, or "
+        "type push_pull_table / push_pull_obstacle)");
+    }
+    if (!t.start_set) {
+      throw std::runtime_error("layout: the keep-outs placed from the valve need the start mark");
+    }
+    const Vec3 to_start(t.start.p(0) - axis(0), t.start.p(1) - axis(1), 0.0);
+    const double d = to_start.norm();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(2);
+    if (d < c.valve_start_min || d > c.valve_start_max) {
+      m << "layout: the start (" << t.start.p(0) << ", " << t.start.p(1) << ") is " << d
+        << " m from the valve's axis (" << axis(0) << ", " << axis(1) << ") -- start the vehicle "
+        << c.valve_start_min << ".." << c.valve_start_max << " m in front of the valve "
+        "(push_pull_valve_start_range) and press Adjust on the ground; or is obj_0 the valve "
+        "(and push_pull_valve_axis_offset its pivot -> the axis)?";
+      throw std::runtime_error(m.str());
+    }
+    const Vec3 beam(std::cos(t.box_yaw), std::sin(t.box_yaw), 0.0);
+    const double off = std::acos(std::clamp(beam.dot(to_start) / d, -1.0, 1.0));
+    if (c.valve_beam_tol > 0.0 && off > c.valve_beam_tol) {
+      m << "layout: the beam (obj_0 +x, yaw " << std::setprecision(0) << t.box_yaw * kDeg
+        << " deg) points " << off * kDeg << " deg away from the start (push_pull_valve_beam_tol_deg "
+        << c.valve_beam_tol * kDeg << ") -- turn the beam so the fin faces the vehicle; "
+        "or is obj_0's frame defined turned (its +x must run along the beam toward the fin)?";
+      throw std::runtime_error(m.str());
+    }
+    c.table = tableFromValve(c, axis, t.start.p);
+    c.obstacle = obstacleFromValve(c, axis);
+  }
   checkPose(v, c.home, "home pose", kPlExit);
   checkPose(v, c.push_pose, "push pose", kPlReady);
   if (!(c.approach_dz > 0.0) && !(c.approach_back > 0.0)) {
@@ -906,8 +991,10 @@ PushPullWaypoints pushPullWaypoints(
   wp.push_dir = noseOf(phi);
   Vec3 r0e;
   armKinematics(c.push_pose, v.params, nullptr, &r0e, nullptr);
-  // the grasp point: the box CG + the ONE offset, turned with the box
-  wp.grasp_ee = t.box + Rz(t.box_yaw) * c.ee_offset;
+  // the grasp point: the box CG + the ONE offset, turned with the box -- in a
+  // turn the axis point + the offset (2026-10-28: the same as obj_0 + offset
+  // while the axis offset is zero)
+  wp.grasp_ee = (c.turn_angle != 0.0 ? axis : t.box) + Rz(t.box_yaw) * c.ee_offset;
   wp.grasp.phi = phi;
   wp.grasp.q = c.push_pose;
   wp.grasp.x_b = wp.grasp_ee - Rz(phi) * r0e;
@@ -915,13 +1002,13 @@ PushPullWaypoints pushPullWaypoints(
   wp.approach.x_b(2) += c.approach_dz;
   wp.approach.x_b -= c.approach_back * wp.push_dir;
   wp.approach_ee = clawOf(v, wp.approach);
-  wp.axis = t.box;
+  wp.axis = axis;
   wp.pushed = wp.grasp;
   if (c.turn_angle != 0.0) {
     // THE TURN: the grasp rest rotated about the captured body's vertical
     // axis; the nose must be along the turn's tangent at the handle, or the
     // jaws would drag the handle sideways instead of pushing it round
-    const Vec3 radial = wp.grasp_ee - t.box;
+    const Vec3 radial = wp.grasp_ee - axis;
     const double r = std::hypot(radial(0), radial(1));
     if (r < 0.02) {
       throw std::runtime_error(
@@ -942,7 +1029,7 @@ PushPullWaypoints pushPullWaypoints(
       throw std::runtime_error(m.str());
     }
     wp.pushed.phi = wp.grasp.phi + c.turn_angle;
-    wp.pushed.x_b = t.box + Rz(c.turn_angle) * (wp.grasp.x_b - t.box);
+    wp.pushed.x_b = axis + Rz(c.turn_angle) * (wp.grasp.x_b - axis);
     wp.pushed.x_b(2) = wp.grasp.x_b(2);
   } else {
     wp.pushed.x_b += c.push_distance * wp.push_dir;
@@ -998,6 +1085,7 @@ PushPullWaypoints pushPullWaypoints(
     wp.land_start.phi = t.land_start.yaw + yaw_shift - 0.5 * M_PI;
   }
   wp.table = c.table;
+  wp.obstacle = c.obstacle;
   // THE LAYOUT (2026-10-22, the table placed from the box): the vehicle starts
   // on the table's middle line, in front of it (the user's rule) -- a start off
   // that line means the box sits elsewhere than at the table's end, or its yaw
@@ -1278,6 +1366,7 @@ std::vector<std::shared_ptr<const Trajectory>> planPushPullMission(
 {
   PushPullConfig c = c_in;
   c.table = wp.table;   // the plan's table (2026-10-22: placed from the box, or typed)
+  c.obstacle = wp.obstacle;   // and obstacle (2026-10-27: placed from the valve, or typed)
   std::vector<std::shared_ptr<const Trajectory>> steps;
   steps.push_back(planPushPullGoToStart(v, transition, opts, c, wp, from));
   steps.push_back(planPushPullReady(v, transition, opts, c, wp, wp.approach));
