@@ -673,6 +673,18 @@ public:
     // down, unchanged. The exit climb [m]; 0 = push_pull_approach_dz.
     declare_parameter<double>("push_pull_approach_back", 0.0);
     declare_parameter<double>("push_pull_exit_dz", 0.0);
+    // (2026-10-28, Pegasus archive/wb_valve_turning_flight_20261028) THE EXIT'S
+    // ROOM-HELD CLIMB. The exit hands the claw back to the CoM anchor at its start;
+    // with the jaws open around a handle that cannot move sideways (a valve's fin)
+    // the vehicle's accumulated drift then reaches the open claw and presses a finger
+    // into the handle while it climbs (Isaac: 4 -> 11 N, the vehicle left DIRECT in
+    // 2 of 6 exits). > 0: a claw that is ROOM-held when the exit starts stays
+    // room-held until it has climbed this far [m] (measured: FK on the encoders,
+    // odometry, PX4 attitude), then the CoM anchor; _max_s caps the hold. A claw
+    // already on the CoM anchor (the box tab's release-first exit) is unaffected.
+    // 0 = the CoM anchor at the exit's start, as before.
+    declare_parameter<double>("push_pull_exit_world_held_dz", 0.0);
+    declare_parameter<double>("push_pull_exit_world_held_max_s", 4.0);
     // (2026-10-06) WHEN the law's contact phase flag switches. Default = the
     // 2026-10-04 timing: CONTACT on at the end of Ready (claw on the handle, jaws
     // still open), off at Exit (after the jaws opened). The gripper timing:
@@ -811,7 +823,8 @@ public:
     // obj_0 -> the bearing axis at the plate-bottom plane, [x, y, z] in obj_0's frame
     // (z up, +x along the beam toward the fin), turned with obj_0's yaw. Motive's DEFAULT
     // pivot is the markers' centroid -- on Valve_Assembly_v2.stl's five markers
-    // [-0.0720, 0.0093, -0.0851] (72.6 mm off the shaft, 85 mm up). Turns only: the
+    // [-0.0935, -0.0014, -0.0899] (93.5 mm off the shaft, 90 mm up; the redesigned layout,
+    // 2026-10-28 night -- the first was [-0.0720, 0.0093, -0.0851]). Turns only: the
     // turn's centre, the live handle and the keep-outs placed from the valve are
     // obj_0 + Rz(yaw) * this, and push_pull_ee_offset is measured from that axis point.
     // [0, 0, 0] = obj_0 defined on the axis (unchanged).
@@ -1533,6 +1546,8 @@ private:
         pl_guard_tripped_ = false;
         pl_abort_keep_anchor_ = false;
         pl_abort_anchor_due_.reset();
+        pl_exit_hold_z0_.reset();
+        pl_exit_hold_t0_.reset();
         pl_mg_aborted_ = false;
         ++pl_gen_;
         if (teleop_) {
@@ -5578,6 +5593,7 @@ private:
       "push_pull_abort_from_measured", "push_pull_abort_back", "push_pull_abort_release_world_held",
       "push_pull_abort_mocap_release_wait_s",
       "push_pull_abort_unbuckle",
+      "push_pull_exit_world_held_dz", "push_pull_exit_world_held_max_s",
       "push_pull_guard_persist_s", "push_pull_guard_force_n", "push_pull_guard_force_persist_s",
       "push_pull_guard_box_lag", "push_pull_guard_box_tilt_deg", "push_pull_guard_box_persist_s",
       "push_pull_guard_box_cross",
@@ -6720,6 +6736,8 @@ private:
       pl_aborted_ = false;
       pl_guard_tripped_ = false;
       pl_handle_settling_ = false;
+      pl_exit_hold_z0_.reset();
+      pl_exit_hold_t0_.reset();
       switch (s) {
         case kPlReady:
           // the descent keeps the world-held claw requested on arrival above
@@ -6746,11 +6764,24 @@ private:
           pl_bg_cross_since_.reset();
           pl_mon_ = PlMonitor{};     // the push monitor: starts when the push executes
           break;
-        case kPlExit:
+        case kPlExit: {
           // the gripper is open: no contact any more
           requestContact(false);
-          restoreAnchor();
+          // push_pull_exit_world_held_dz (2026-10-28): a room-held claw stays room-held
+          // until it has climbed clear of the handle (publishPlArrival hands it back)
+          const double hold_dz = get_parameter("push_pull_exit_world_held_dz").as_double();
+          const auto z0 = plClawZ();
+          if (hold_dz > 0.0 && pp_anchor_world_ && z0.has_value()) {
+            pl_exit_hold_z0_ = z0;
+            pl_exit_hold_t0_ = Clock::now();
+            RCLCPP_INFO(get_logger(), "push-and-pull exit: the claw stays room-held until it has "
+              "climbed %.0f mm (the open jaws clear of the handle), then the CoM anchor",
+              hold_dz * 1e3);
+          } else {
+            restoreAnchor();
+          }
           break;
+        }
         default:
           restoreAnchor();
       }
@@ -7157,6 +7188,8 @@ private:
       pl_abort_keep_anchor_ = touched && wait > 0.0 && pp_anchor_world_ && !pl_mg_aborted_ &&
         get_parameter("push_pull_abort_release_world_held").as_bool();
       pl_abort_anchor_due_.reset();
+      pl_exit_hold_z0_.reset();     // an abort in the exit's room-held climb owns the anchor now
+      pl_exit_hold_t0_.reset();
       if (!pl_abort_keep_anchor_) {restoreAnchor();}
       if (touched) {
         if (pl_wp_.has_value()) {pl_leave_wp_ = pl_wp_;}   // Go To Land Start stays flyable
@@ -7571,6 +7604,53 @@ private:
   // [s], [26] the box's travel along the push [m] (obj_0), [27] the claw
   // reference's [m], [28] the box's speed [m/s] (0.5 s window), [29] the claw
   // reference's [m/s].
+  // The claw's measured height [m] -- the arrival tick's claw (FK on the encoders,
+  // odometry position, PX4 attitude) -- with lock_ held; empty when a feed is stale.
+  std::optional<double> plClawZ() const
+  {
+    Vec3 x_b;
+    Mat3 r0;
+    if (!odomPair(&x_b, &r0) || odomAge() > kOdomFreshS || !q_meas_.has_value()) {
+      return std::nullopt;
+    }
+    Vec3 r0e;
+    armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
+    return (x_b + r0 * (vehicle_->r_model * r0e)).z();
+  }
+
+  // THE EXIT'S ROOM-HELD CLIMB (push_pull_exit_world_held_dz, 2026-10-28), with lock_ held,
+  // 10 Hz: hand the claw back to the CoM anchor once it has climbed clear of the handle, the
+  // hold has lasted _max_s, a confirmed mocap fault makes "the room" EKF2 dead-reckoning (the
+  // abort's 2026-10-22 rule), or the exit is no longer flying (completed, aborted, cut).
+  void plExitHoldCheck()
+  {
+    if (!pl_exit_hold_z0_.has_value()) {return;}
+    const bool flying = mode_direct_ && pl_flying_.has_value() && *pl_flying_ == kPlExit &&
+      !pl_aborting_ && !pl_abort_plan_;
+    const auto z = plClawZ();
+    const double climbed = z.has_value() ? *z - *pl_exit_hold_z0_ : 0.0;
+    const double held = secondsSince(pl_exit_hold_t0_);
+    const bool mocap_bad = pl_guard_sub_ && pl_mg_t_.has_value() && secondsSince(pl_mg_t_) <= 0.5 &&
+      pl_mg_state_ >= 2;
+    const char * why = nullptr;
+    if (!flying) {
+      why = "the exit is no longer flying";
+    } else if (mocap_bad) {
+      why = "a confirmed mocap fault (the room is EKF2 dead-reckoning)";
+    } else if (climbed >= get_parameter("push_pull_exit_world_held_dz").as_double()) {
+      why = "clear of the handle";
+    } else if (held >= get_parameter("push_pull_exit_world_held_max_s").as_double()) {
+      why = "the hold's time cap";
+    }
+    if (why == nullptr) {return;}
+    pl_exit_hold_z0_.reset();
+    pl_exit_hold_t0_.reset();
+    // an abort sets its own anchor (onPlAbort); leave that alone
+    if (!pl_aborting_ && !pl_abort_plan_) {restoreAnchor();}
+    RCLCPP_INFO(get_logger(), "push-and-pull exit: the claw climbed %.0f mm room-held in %.1f s "
+      "-- %s: the CoM anchor", climbed * 1e3, held, why);
+  }
+
   void publishPlArrival()
   {
     if (pl_box_point_clear_.exchange(false)) {
@@ -7605,6 +7685,7 @@ private:
         RCLCPP_WARN(get_logger(), "push-and-pull ABORT: %s during the world-held release -- the "
           "claw back to the CoM anchor now", plMocapProblem().c_str());
       }
+      plExitHoldCheck();
     }
     if (feed_trip) {
       auto resp = std::make_shared<Trigger::Response>();
@@ -8195,6 +8276,10 @@ private:
   double pl_abort_climb_{0.0};
   bool pl_abort_keep_anchor_{false};                         // abort_release_world_held in force
   std::optional<Clock::time_point> pl_abort_anchor_due_;     // when the claw goes back to the CoM
+  // push_pull_exit_world_held_dz in force (2026-10-28): the claw's measured height when the
+  // exit started, and when -- plExitHoldCheck hands it back to the CoM anchor
+  std::optional<double> pl_exit_hold_z0_;
+  std::optional<Clock::time_point> pl_exit_hold_t0_;
   std::shared_ptr<Trajectory> pl_abort_plan_;   // the abort in flight
   bool pl_contact_{false};                      // the contact phase flag requested
   bool pl_guard_armed_{true}, pl_guard_tripped_{false};
