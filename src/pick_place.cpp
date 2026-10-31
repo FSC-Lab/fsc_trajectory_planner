@@ -167,6 +167,10 @@ PickPlaceWaypoints pickPlaceWaypoints(
       ": the insert place and the drop place exclude each other (pick_place_place_insert, "
       "pick_place_place_drop)");
   }
+  if (c.place_insert && !(c.place_insert_pitch_deg >= 0.0 && c.place_insert_pitch_deg <= 60.0)) {
+    throw std::runtime_error(std::string(pickPlaceLegName(kExecutePlace)) +
+      ": the insertion line's pitch must be 0..60 deg down (pick_place_place_insert_pitch_deg)");
+  }
   if (c.place_insert && !(c.place_approach_back > 0.0)) {
     throw std::runtime_error(std::string(pickPlaceLegName(kExecutePlace)) +
       ": the insert place needs pick_place_place_approach_back > 0 (the arm GS's Insert Margin)");
@@ -216,9 +220,12 @@ PickPlaceWaypoints pickPlaceWaypoints(
       const double phi = wp.goal[k].phi;
       wp.approach[k].x_b -= c.pick_approach_back * Vec3{-std::sin(phi), std::cos(phi), 0.0};
     } else if (k == kExecutePlace && c.place_insert) {
-      // the insert: behind the mouth at its own height, slid in along the nose
+      // the insert: behind the mouth along the insertion line, slid in along it --
+      // level at pitch 0, else back AND up (the diagonal insert, 2026-10-30)
       const double phi = wp.goal[k].phi;
-      wp.approach[k].x_b -= c.place_approach_back * Vec3{-std::sin(phi), std::cos(phi), 0.0};
+      const double th = c.place_insert_pitch_deg * M_PI / 180.0;
+      wp.approach[k].x_b -= c.place_approach_back *
+        Vec3{-std::sin(phi) * std::cos(th), std::cos(phi) * std::cos(th), -std::sin(th)};
     } else if (k == kExecutePlace && c.place_drop) {
       // the drop: flown straight to the drop point (approach == goal), so the
       // leg completes there with no wait and no descent
@@ -370,8 +377,8 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
   std::unique_ptr<Trajectory> traj;
   try {
     if ((leg == kExecutePick && c.pick_approach_back > 0.0) || (leg == kExecutePlace && c.place_insert)) {
-      // the hook grasp's / the insert's approach is already level with the
-      // goal: fly straight in
+      // the hook grasp's / the insert's approach is already on the line into the
+      // goal (level, or the insert's pitched line): fly straight in
       traj = transitionLeg(v, transition, opts, from, goal);
     } else if (c.trim_settle_s > 0.0 && side > c.trim_first_min) {
       // (a trim at or below trim_first_min is flown in the descent itself --
@@ -396,17 +403,28 @@ std::unique_ptr<Trajectory> planPickPlaceDescent(
 
 std::unique_ptr<Trajectory> planPickPlaceAbort(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
-  const RestSpec & from, const RestSpec & goal, const VecN * release_q, double hold_s)
+  const RestSpec & from, const RestSpec & goal, const VecN * release_q, double hold_s,
+  const RestSpec * backout)
 {
+  std::vector<std::shared_ptr<const Trajectory>> segs;
+  const RestSpec * start = &from;
+  if (backout != nullptr) {
+    try {
+      segs.push_back(transitionLeg(v, transition, opts, from, *backout));
+    } catch (const std::exception & e) {
+      throw std::runtime_error(std::string("backing out: ") + e.what());
+    }
+    start = backout;
+  }
   if (release_q == nullptr) {
-    return transitionLeg(v, transition, opts, from, goal);
+    segs.push_back(transitionLeg(v, transition, opts, *start, goal));
+    return std::make_unique<SequenceTrajectory>(std::move(segs));
   }
   // the climbed point, arm in the release pose
   RestSpec release = goal;
   release.q = *release_q;
-  std::vector<std::shared_ptr<const Trajectory>> segs;
   try {
-    segs.push_back(transitionLeg(v, transition, opts, from, release));
+    segs.push_back(transitionLeg(v, transition, opts, *start, release));
   } catch (const std::exception & e) {
     throw std::runtime_error(std::string("to the release pose: ") + e.what());
   }

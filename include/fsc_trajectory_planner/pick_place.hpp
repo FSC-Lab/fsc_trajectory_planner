@@ -140,6 +140,12 @@ struct PickPlaceConfig
   // with place_drop, and with place_approach_back <= 0. false = unchanged.
   bool place_insert{false};
   double place_approach_back{0.0};
+  // THE DIAGONAL INSERT (2026-10-30, user design): the insertion line pitched
+  // this far DOWN [deg]. The approach rest is place_approach_back back ALONG
+  // the line (back and up), and the slide in goes forward and down along it --
+  // the envelope, held at the same pitch, moves along its own line. 0 = the
+  // level insert.
+  double place_insert_pitch_deg{0.0};
   // EXIT TO PICK / PLACE duration [s] (2026-10-03); 0 = the leg bounds (a_max
   // 0.15 m/s^2: 3.2 s for a 0.20 m climb). Clamped to a payload that still
   // rests on its pillar the vehicle must lift it OFF fast: a min-snap climb
@@ -307,10 +313,13 @@ bool pickPlaceExitEndsAtLandStart(const PickPlaceConfig & c, int leg);
 // then folds home in place: a payload still hanging on the open fingers (the
 // hook grasp's hanger: open fingers carry its arch) slides off claws that point
 // steeply down. Null = one move straight to `goal` (the earlier behaviour).
-// Throws on an infeasible segment.
+// With `backout` (non-null, 2026-10-30, the insert place) the vehicle first
+// flies from `from` to it, arm unchanged -- straight back out of the mailbox's
+// mouth -- and the rest starts there. Throws on an infeasible segment.
 std::unique_ptr<Trajectory> planPickPlaceAbort(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
-  const RestSpec & from, const RestSpec & goal, const VecN * release_q, double hold_s);
+  const RestSpec & from, const RestSpec & goal, const VecN * release_q, double hold_s,
+  const RestSpec * backout = nullptr);
 
 // Throws "<what>: the path leaves the geofence ..." when a sample of the body
 // origin along `traj` is outside `fence` -- or, for a bound the start itself

@@ -433,6 +433,16 @@ public:
     // climbs. Excludes pick_place_place_drop. false = unchanged.
     declare_parameter<bool>("pick_place_place_insert", false);
     declare_parameter<double>("pick_place_place_approach_back", 0.0);
+    // THE DIAGONAL INSERT (2026-10-30, user design; PickPlaceConfig::
+    // place_insert_pitch_deg): the insertion line pitched this far DOWN [deg] --
+    // the hold is the Insert Margin back AND up along it, the slide goes forward and
+    // down. 0 = the level insert.
+    declare_parameter<double>("pick_place_place_insert_pitch_deg", 0.0);
+    // ... and the insert's slide uses the descent trim only if this is true (and
+    // pick_place_descent_trim is): the trim averaged a still-decaying arrival
+    // overshoot as a standing offset and parked the claw 36-48 mm short in the
+    // mouth (Isaac wrist_fix2, 2026-10-30). true = as the other descents.
+    declare_parameter<bool>("pick_place_insert_descent_trim", true);
     // DROP PLACE (2026-10-14, user design; see PickPlaceConfig::place_drop):
     // true = Ready To Place flies the claw straight to drop_height [m] above the
     // place claw target and the leg ends there; the arm GS's Place opens the
@@ -459,6 +469,58 @@ public:
     // altitude climbs (or descends) to it, in one smooth curve [0.2, 1]
     declare_parameter<double>("pick_place_drop_climb_lead", 0.5);
     declare_parameter<std::vector<double>>("pick_place_drop_exit_offset", std::vector<double>{});
+    // PLACE START FROM THE PLACE POINT (2026-10-30, user request for the mail
+    // delivery: the pillar and the mailbox may stand anywhere in the room, their
+    // layout relative to each other the same, and the drone may start anywhere).
+    // [] = Place Start is the typed pick_place_place_start, moved by Adjust with
+    // the vehicle; else [dx, dy, dz, dyaw_deg] from the PLACE point in its own
+    // frame (dx, dy turned by its yaw): Place Start follows the place point -- the
+    // Mailbox Get -- and Adjust does NOT move it. Get and Plan write the result into
+    // pick_place_place_start, so the ground station's row shows what is flown.
+    declare_parameter<std::vector<double>>("pick_place_place_start_offset", std::vector<double>{});
+    // THE MAILBOX MUST BE MEASURED (2026-10-30, after a sim flight crashed into the
+    // mailbox: the Mailbox Get was never pressed, so the configured release point --
+    // the designed layout's -- lay inside the moved mailbox). true: Plan is refused
+    // until the place point has been set in this session (by the place Get or typed).
+    declare_parameter<bool>("pick_place_place_requires_get", false);
+    // THE WRONG-FRAME CHECK (2026-10-30): one localization frame serves both Gets, so
+    // a Get pressed with the frame still on the OTHER target writes a point next to
+    // the other one -- a Mailbox Get with the frame on the hat puts the release on the
+    // pick hat. > 0: a Get (and Plan) is refused when the pick and the place points
+    // would lie closer than this horizontally [m]. 0 = off.
+    declare_parameter<double>("pick_place_min_pick_place_dist", 0.0);
+    // THE AUTONOMOUS INSERT (2026-10-30, user request): with the insert place, the
+    // slide into the mouth starts by itself once the claw has held within
+    // pick_place_insert_auto_tol of the point in front of the mouth, slower than
+    // pick_place_drop_auto_claw_speed, for pick_place_insert_auto_dwell_s; once it is
+    // in, the release is the autonomous drop's (pick_place_drop_auto_wait_s, _dwell_s,
+    // _claw_tol, _claw_speed; the envelope carries no markers, so the payload gates are
+    // skipped) and publishes pick_place/drop_now, on which the arm GS's Mail Envelope
+    // tab opens the gripper. false = Insert by hand, the GS opens.
+    declare_parameter<bool>("pick_place_insert_auto", false);
+    declare_parameter<double>("pick_place_insert_auto_tol", 0.015);
+    declare_parameter<double>("pick_place_insert_auto_dwell_s", 1.0);
+    // ... and the insert's own wrist-roll gate [deg] (2026-10-30, the user's windowed
+    // rehearsal hovered at the release point and never opened): the drop's 3 deg
+    // (pick_place_drop_auto_q4_tol_deg) sits INSIDE the wrist's standing band at
+    // q4 = 90. With the heading gains of the 2026-10-16 j4 fix (K_q4 ~ 0.45 N.m/rad) and
+    // j4's static friction (~55 mN.m sim, ~45 hardware) plus the envelope's ~24 mN.m on
+    // j4, the wrist parks anywhere within ~9-10 deg of 90; it sat 3.7-4.5 deg off through
+    // that whole hold. A rolled envelope already in the mouth is released safely; the gate
+    // only catches a wrist twisted well past that band (the envelope caught on a lip).
+    declare_parameter<double>("pick_place_insert_auto_q4_tol_deg", 12.0);
+    // ... and its own claw gates (2026-10-30, user decision): the drop's 20 mm ball,
+    // 30 mm/s and 2 s wait were copied from the basket drop. What the envelope needs
+    // is its centre of mass past the mouth's lip and the jaws clear of the wall, so the
+    // claw is gated in a WINDOW along the insertion line -- release_short [m] short of
+    // the release point to release_long past it -- and within release_off_axis [m] of
+    // the line; slower than release_speed [m/s]; no earlier than release_wait_s [s]
+    // after the slide (pick_place_drop_auto_dwell_s still applies).
+    declare_parameter<double>("pick_place_insert_auto_release_wait_s", 1.0);
+    declare_parameter<double>("pick_place_insert_auto_release_short", 0.015);
+    declare_parameter<double>("pick_place_insert_auto_release_long", 0.020);
+    declare_parameter<double>("pick_place_insert_auto_release_off_axis", 0.030);
+    declare_parameter<double>("pick_place_insert_auto_release_speed", 0.05);
     // ... and how far Exit To Place first climbs straight up from the drop point
     // before the level move [m] (user 2026-10-14: "climb up a little bit higher")
     declare_parameter<double>("pick_place_drop_exit_climb", 0.10);
@@ -629,6 +691,22 @@ public:
     // carry some position noise (the Isaac emulator's position_noise_std,
     // 0.5 mm in the pick-and-place sim yamls) or a resting payload is refused.
     declare_parameter<double>("pick_place_capture_max_yaw_spread_deg", 10.0);
+    // THE LOCATOR FRAME (2026-10-29, the mail delivery, user design): obj_0 is
+    // not the payload but a printed frame with five markers, set on the pick
+    // hat and then on the mailbox's top before the flight, its rigid body made
+    // in Motive with the DEFAULT pivot (the markers' centroid) and the frame's
+    // axes. Each row's Get then measures that frame and adds its offset:
+    //   [] = off (Get writes obj_0 itself, as before), else [dx, dy, dz] or
+    //   [dx, dy, dz, dyaw_deg] in obj_0's frame, turned with its yaw.
+    // pick_place_pick_locator: capture_pick writes obj_0 + Rz(yaw)*d, yaw +
+    // dyaw (the envelope where the frame's slot puts it). pick_place_place_
+    // locator: get_place writes obj_0 + Rz(yaw)*d AND the yaw, yaw + dyaw (the
+    // mailbox's heading -- the frame's flats fix it), instead of keeping the
+    // typed yaw. Read at Get only: a change never makes a plan stale. The
+    // numbers come from the frame's design (Pegasus archive/mail_delivery_
+    // 20261023/cad/make_localization_frame.py).
+    declare_parameter<std::vector<double>>("pick_place_pick_locator", std::vector<double>{});
+    declare_parameter<std::vector<double>>("pick_place_place_locator", std::vector<double>{});
 
     // --- push-and-pull mode (push_pull.hpp) --------------------------------
     // The box: a mocap body (CG + yaw), captured by capture_box (the arm GS's
@@ -3497,6 +3575,7 @@ private:
     c->place_drop = get_parameter("pick_place_place_drop").as_bool();
     c->place_insert = get_parameter("pick_place_place_insert").as_bool();
     c->place_approach_back = get_parameter("pick_place_place_approach_back").as_double();
+    c->place_insert_pitch_deg = get_parameter("pick_place_place_insert_pitch_deg").as_double();
     c->drop_height = get_parameter("pick_place_drop_height").as_double();
     c->drop_altitude = get_parameter("pick_place_drop_altitude").as_double();
     c->drop_climb_lead = get_parameter("pick_place_drop_climb_lead").as_double();
@@ -3599,7 +3678,88 @@ private:
       *err = "capture " + missing + " first";
       return false;
     }
+    const auto ps = get_parameter("pick_place_place_start_offset").as_double_array();
+    if (ps.size() == 4) {
+      t->place_start = ppPlaceStartAt(t->place, t->place_yaw, ps);
+    }
     return true;
+  }
+
+  // pick_place_min_pick_place_dist: "" when `target` (the k-th point, about to be
+  // written) is far enough from the other point, else the refusal. Under the lock.
+  std::string ppTooCloseToOther(int k, const Vec3 & target) const
+  {
+    const double min_d = get_parameter("pick_place_min_pick_place_dist").as_double();
+    if (!(min_d > 0.0)) {return "";}
+    std::optional<Vec3> other;
+    if (k == kExecutePick) {
+      if (pp_capture_[kExecutePlace].has_value()) {
+        other = *pp_capture_[kExecutePlace];
+      } else {
+        const auto v = get_parameter("pick_place_place_point").as_double_array();
+        if (v.size() >= 3) {other = Vec3{v[0], v[1], v[2]};}
+      }
+    } else if (pp_capture_[kExecutePick].has_value()) {
+      other = *pp_capture_[kExecutePick];
+    }
+    if (!other.has_value()) {return "";}
+    const double d = (target - *other).head<2>().norm();
+    if (d >= min_d) {return "";}
+    const bool insert = get_parameter("pick_place_place_insert").as_bool();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(2);
+    m << (k == kExecutePick ? (insert ? "Envelope" : "Pick") : (insert ? "Mailbox" : "Place"))
+      << " NOT changed: it reads [" << target(0) << ", " << target(1) << ", " << target(2) << "] m, only " << d
+      << " m from the " << (k == kExecutePick ? (insert ? "Mailbox target" : "place point") : (insert ? "envelope" : "pick point"))
+      << " (needs " << min_d << ") -- ";
+    if (k == kExecutePick) {
+      m << "is the frame still on the " << (insert ? "mailbox" : "place target") << "? Set it on the pick hat, then Get";
+    } else {
+      m << "is the frame still on the pick hat? Set it on the " << (insert ? "mailbox's top" : "place target")
+        << ", then Get";
+    }
+    return m.str();
+  }
+
+  // Place Start = the place point + pick_place_place_start_offset [dx, dy, dz,
+  // dyaw_deg], dx and dy turned by the place point's yaw (2026-10-30).
+  static BasePose ppPlaceStartAt(const Vec3 & place, double place_yaw, const std::vector<double> & d)
+  {
+    BasePose b;
+    const double c = std::cos(place_yaw), s = std::sin(place_yaw);
+    b.p = place + Vec3{c * d[0] - s * d[1], s * d[0] + c * d[1], d[2]};
+    b.yaw = place_yaw + d[3] * M_PI / 180.0;
+    return b;
+  }
+
+  // Write the Place Start that follows the place point into pick_place_place_start
+  // (the ground station's row), when pick_place_place_start_offset is set and the
+  // value differs. NOT from a parameter callback (rclcpp refuses a set there): from
+  // the Mailbox Get and from Plan. Returns a note for the reply, "" when nothing moved.
+  std::string ppSyncPlaceStart()
+  {
+    const auto d = get_parameter("pick_place_place_start_offset").as_double_array();
+    const auto pp = get_parameter("pick_place_place_point").as_double_array();
+    if (d.size() != 4 || (pp.size() != 3 && pp.size() != 4)) {return "";}
+    const double yaw_deg = pp.size() == 4 ? pp[3] : 0.0;
+    const BasePose b = ppPlaceStartAt(Vec3{pp[0], pp[1], pp[2]}, yaw_deg * M_PI / 180.0, d);
+    const std::vector<double> v{b.p(0), b.p(1), b.p(2), yaw_deg + d[3]};
+    const auto cur = get_parameter("pick_place_place_start").as_double_array();
+    bool same = cur.size() == 4;
+    for (size_t i = 0; same && i < 4; ++i) {same = std::abs(cur[i] - v[i]) < 1e-4;}
+    if (same) {return "";}
+    const auto res = set_parameters({rclcpp::Parameter("pick_place_place_start", v)});
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(3);
+    if (res.empty() || !res.front().successful) {
+      m << "; Place Start NOT moved to follow the place point" << (res.empty() ? "" : ": " + res.front().reason);
+    } else {
+      m << "; Place Start follows it: [" << v[0] << ", " << v[1] << ", " << v[2] << "] m, yaw "
+        << std::setprecision(1) << v[3] << " deg";
+    }
+    return m.str();
   }
 
   rcl_interfaces::msg::SetParametersResult onPpParams(const std::vector<rclcpp::Parameter> & ps)
@@ -3610,6 +3770,7 @@ private:
     // a new pick point: applied at the end, once every parameter of this set
     // is accepted (this callback runs BEFORE the value is stored)
     const rclcpp::Parameter * pick_point = nullptr;
+    bool place_point = false;
     for (const auto & p : ps) {
       const std::string & n = p.get_name();
       if (n.rfind("pick_place_", 0) != 0) {continue;}
@@ -3657,6 +3818,16 @@ private:
           r.successful = false;
           r.reason = n + " needs [] or [dx, dy, yaw_deg]";
         }
+      } else if (n == "pick_place_place_start_offset") {
+        // [] = the typed Place Start, else [dx, dy, dz, dyaw_deg] from the place point
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (!p.as_double_array().empty() && p.as_double_array().size() != 4) ||
+          !std::all_of(p.as_double_array().begin(), p.as_double_array().end(),
+          [](double x) {return std::isfinite(x);}))
+        {
+          r.successful = false;
+          r.reason = n + " needs [] or [dx, dy, dz, dyaw_deg], all finite";
+        }
       } else if (n == "pick_place_abort_release_pose_deg") {
         // [] = straight home, else the 4 joints [deg]
         if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
@@ -3672,6 +3843,16 @@ private:
         {
           r.successful = false;
           r.reason = n + " needs [x, y, z, yaw_deg]";
+        } else {
+          place_point = true;
+        }
+      } else if (n == "pick_place_pick_locator" || n == "pick_place_place_locator") {
+        // [] = off, else [dx, dy, dz] or [dx, dy, dz, dyaw_deg], finite (2026-10-29)
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          !ppLocatorOk(p.as_double_array()))
+        {
+          r.successful = false;
+          r.reason = n + " needs [], [dx, dy, dz] or [dx, dy, dz, dyaw_deg], all finite";
         }
       } else if (n == "pick_place_pick_point") {
         // [] = not captured, else [x, y, z, yaw_deg], all finite (2026-10-10)
@@ -3695,9 +3876,14 @@ private:
         n != "pick_place_world_anchor_pick" && n != "pick_place_world_anchor_place" &&
         n != "pick_place_descent_on_request" && n != "pick_place_guard_tilt_deg" &&
         n != "pick_place_descent_trim" && n != "pick_place_descent_trim_window_s" &&
-        n != "pick_place_descent_trim_max" &&
+        n != "pick_place_descent_trim_max" && n != "pick_place_insert_descent_trim" &&
         n != "pick_place_guard_persist_s" && n != "pick_place_abort_release_pose_deg" &&
         n != "pick_place_abort_release_hold_s" &&
+        // the locator offsets are read by Get, never baked into the plan
+        n != "pick_place_pick_locator" && n != "pick_place_place_locator" &&
+        // the autonomous insert's gates and the measured-place check: read at run time
+        n.rfind("pick_place_insert_auto", 0) != 0 && n != "pick_place_place_requires_get" &&
+        n != "pick_place_min_pick_place_dist" &&
         // the autonomous drop's gates and the basket aim are read at the
         // drop hold / at Ready To Drop, never baked into the plan
         n.rfind("pick_place_drop_auto", 0) != 0 && n.rfind("pick_place_drop_aim_", 0) != 0)
@@ -3719,6 +3905,7 @@ private:
       // the set after this: rclcpp runs the on-set callbacks newest first and
       // this one was registered first, so it is the last to run.
       if (pick_point != nullptr) {ppSetPickCapture(pick_point->as_double_array());}
+      if (place_point) {pp_place_measured_ = true;}
       ppInvalidate();
       pp_params_dirty_ = true;   // published from the 10 Hz timer, once the values are set
     }
@@ -3740,6 +3927,14 @@ private:
       }
     }
     return true;
+  }
+
+  // pick_place_{pick,place}_locator: [] (off), [dx, dy, dz] or [dx, dy, dz,
+  // dyaw_deg], finite (2026-10-29).
+  static bool ppLocatorOk(const std::vector<double> & v)
+  {
+    if (!v.empty() && v.size() != 3 && v.size() != 4) {return false;}
+    return std::all_of(v.begin(), v.end(), [](double x) {return std::isfinite(x);});
   }
 
   // The pick capture from a (checked) pick_place_pick_point value. Called
@@ -3901,6 +4096,34 @@ private:
     return true;
   }
 
+  // A measured body through a locator offset: the target's position and yaw
+  // [rad] = the body + Rz(yaw) * [dx, dy, dz], yaw + dyaw. false = the
+  // locator is off (or malformed: the parameter callback refuses those, but a
+  // launch-file value is not checked by it) -- the body is the target.
+  bool ppThroughLocator(const char * param, const PpAverage & a, Vec3 * p, double * yaw,
+    std::string * note) const
+  {
+    const auto d = get_parameter(param).as_double_array();
+    if (d.empty() || !ppLocatorOk(d)) {
+      *p = a.mean;
+      *yaw = a.yaw;
+      return false;
+    }
+    const double c = std::cos(a.yaw), s = std::sin(a.yaw);
+    *p = a.mean + Vec3{c * d[0] - s * d[1], s * d[0] + c * d[1], d[2]};
+    *yaw = a.yaw + (d.size() == 4 ? d[3] * M_PI / 180.0 : 0.0);
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(3);
+    m << "the LOCATOR FRAME " << ppBody(kExecutePick) << " at [" << a.mean(0) << ", " << a.mean(1)
+      << ", " << a.mean(2) << "] m, yaw " << std::setprecision(1) << a.yaw * 180.0 / M_PI
+      << " deg, + " << param << " [" << std::setprecision(4) << d[0] << ", " << d[1] << ", " << d[2];
+    if (d.size() == 4) {m << ", " << std::setprecision(1) << d[3] << " deg";}
+    m << "]";
+    *note = m.str();
+    return true;
+  }
+
   void onPpCapture(int k, Trigger::Response::SharedPtr resp)
   {
     std::ostringstream m;
@@ -3924,13 +4147,26 @@ private:
         return;
       }
       const bool was_planned = pp_wp_.has_value();
+      // the pick through the LOCATOR FRAME (2026-10-29): obj_0 is the frame,
+      // the target its offset (off = the body itself)
+      Vec3 target = a.mean;
+      double target_yaw = a.yaw;
+      std::string loc_note;
+      const bool located = k == kExecutePick &&
+        ppThroughLocator("pick_place_pick_locator", a, &target, &target_yaw, &loc_note);
+      if (const std::string why = ppTooCloseToOther(k, target); !why.empty()) {
+        resp->success = false;
+        resp->message = why;
+        return;
+      }
       if (k == kExecutePick) {
         // the pick capture has a parameter twin (2026-10-10): write it, as
         // onPpAdjust writes the drone points -- onPpParams sets the capture
         // from it and makes the plan stale, and the arm GS's Pick boxes follow
         // the parameter event
         const auto res = set_parameters({rclcpp::Parameter("pick_place_pick_point",
-              std::vector<double>{a.mean(0), a.mean(1), a.mean(2), a.yaw * 180.0 / M_PI})});
+              std::vector<double>{target(0), target(1), target(2),
+                wrapPi(target_yaw) * 180.0 / M_PI})});
         if (res.empty() || !res.front().successful) {
           resp->success = false;
           resp->message = "pick NOT captured: pick_place_pick_point not set" +
@@ -3938,13 +4174,18 @@ private:
           return;
         }
       }
-      pp_capture_[k] = a.mean;
-      pp_capture_yaw_[k] = a.yaw;
+      pp_capture_[k] = target;
+      pp_capture_yaw_[k] = k == kExecutePick ? wrapPi(target_yaw) : target_yaw;
       ppInvalidate();
       m.precision(3);
-      m << "captured " << kPpPoint[k] << " at [" << a.mean(0) << ", " << a.mean(1) << ", " << a.mean(2)
-        << "] m, yaw " << std::setprecision(1) << a.yaw * 180.0 / M_PI << " deg from " << pp_topic_[k]
-        << " (" << a.n << " samples, spread " << a.spread * 1e3 << " mm)";
+      m << "captured " << kPpPoint[k] << " at [" << target(0) << ", " << target(1) << ", " << target(2)
+        << "] m, yaw " << std::setprecision(1) << wrapPi(target_yaw) * 180.0 / M_PI << " deg from ";
+      if (located) {
+        m << loc_note << " (" << pp_topic_[k] << ", ";
+      } else {
+        m << pp_topic_[k] << " (";
+      }
+      m << a.n << " samples, spread " << a.spread * 1e3 << " mm)";
       if (k == kExecutePick) {m << "; the EE offset is applied in this object frame";}
       if (k != kExecutePick && k != kExecutePlace) {m << "; x, y replace the nominal pose";}
       if (was_planned) {m << " -- the plan is stale, press Plan";}
@@ -3990,10 +4231,26 @@ private:
         return;
       }
       const auto old = get_parameter("pick_place_place_point").as_double_array();
-      const double yaw_deg = old.size() == 4 ? old[3] : 0.0;   // a 3-value point is yaw 0
+      double yaw_deg = old.size() == 4 ? old[3] : 0.0;   // a 3-value point is yaw 0
+      // the place through the LOCATOR FRAME (2026-10-29): obj_0 is the frame on
+      // the target's top; the place point is its offset AND the yaw is the
+      // frame's (+ dyaw), written as the value nearest the typed one so a typed
+      // turn keeps its direction
+      Vec3 target = a.mean;
+      double target_yaw = a.yaw;
+      std::string loc_note;
+      const bool located = ppThroughLocator("pick_place_place_locator", a, &target, &target_yaw, &loc_note);
+      if (const std::string why = ppTooCloseToOther(kExecutePlace, target); !why.empty()) {
+        resp->success = false;
+        resp->message = why;
+        return;
+      }
+      if (located) {
+        yaw_deg += wrapPi(target_yaw - yaw_deg * M_PI / 180.0) * 180.0 / M_PI;
+      }
       const bool was_planned = pp_wp_.has_value();
       const auto res = set_parameters({rclcpp::Parameter("pick_place_place_point",
-            std::vector<double>{a.mean(0), a.mean(1), a.mean(2), yaw_deg})});   // onPpParams: plan made stale
+            std::vector<double>{target(0), target(1), target(2), yaw_deg})});   // onPpParams: plan made stale
       if (res.empty() || !res.front().successful) {
         resp->success = false;
         resp->message = "Place NOT changed: pick_place_place_point not set" +
@@ -4001,13 +4258,19 @@ private:
         return;
       }
       m.precision(3);
-      m << "place point set to [" << a.mean(0) << ", " << a.mean(1) << ", " << a.mean(2)
-        << "] m from " << pp_topic_[k] << " (" << a.n << " samples, spread "
-        << std::setprecision(1) << a.spread * 1e3 << " mm); yaw kept at " << yaw_deg
-        << " deg; z is the payload's RESTING height -- lower it by 0.02 m for the release";
+      m << "place point set to [" << target(0) << ", " << target(1) << ", " << target(2) << "] m";
+      if (located) {
+        m << ", yaw " << std::setprecision(1) << yaw_deg << " deg, from " << loc_note << " (" << a.n
+          << " samples, spread " << a.spread * 1e3 << " mm) -- the target itself, nothing to correct by hand";
+      } else {
+        m << " from " << pp_topic_[k] << " (" << a.n << " samples, spread "
+          << std::setprecision(1) << a.spread * 1e3 << " mm); yaw kept at " << yaw_deg
+          << " deg; z is the payload's RESTING height -- lower it by 0.02 m for the release";
+      }
       if (pp_capture_[kExecutePlace].has_value()) {
         m << "; NOTE a capture_place capture is active and wins over this point";
       }
+      m << ppSyncPlaceStart();
       if (was_planned) {m << " -- the plan is stale, press Plan";}
     }
     resp->success = true;
@@ -4070,10 +4333,14 @@ private:
       // what the legs fly to, and a second Adjust with the vehicle unmoved
       // measures ~0 against the moved Start. Place is never moved.
       std::vector<rclcpp::Parameter> moved;
-      // (the drop exit is an offset from the place point: not moved either)
+      // (the drop exit is an offset from the place point: not moved either, and
+      // neither is a Place Start that follows the place point, 2026-10-30)
+      const bool place_start_follows =
+        get_parameter("pick_place_place_start_offset").as_double_array().size() == 4;
       for (const char * name : {"pick_place_start", "pick_place_place_start",
           "pick_place_land_start", "pick_place_land"})
       {
+        if (place_start_follows && std::string(name) == "pick_place_place_start") {continue;}
         auto v = get_parameter(name).as_double_array();
         if (v.size() != 4) {
           resp->success = false;
@@ -4099,7 +4366,9 @@ private:
       ppInvalidate();
       m << "drone points moved by [" << off(0) << ", " << off(1) << ", " << off(2) << "] m, yaw "
         << std::setprecision(1) << yoff * 180.0 / M_PI
-        << " deg (written into Start, Place Start, Land Start, Land; Place and the drop exit not moved); press Plan";
+        << " deg (written into Start, " << (place_start_follows ? "" : "Place Start, ")
+        << "Land Start, Land; Place" << (place_start_follows ? ", Place Start (it follows Place)" : "")
+        << " and the drop exit not moved); press Plan";
     }
     resp->success = true;
     resp->message = m.str();
@@ -4111,6 +4380,14 @@ private:
 
   void onPpPlan(Trigger::Response::SharedPtr resp)
   {
+    // a Place Start that follows the place point: the row shows what is planned
+    // (a typed place point may have changed since the last Get)
+    bool idle = false;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      idle = !pp_flying_.has_value() && state_ != "EXECUTING";
+    }
+    if (idle) {ppSyncPlaceStart();}   // (onPpParams refuses the set while a leg flies)
     PickPlaceTargets tg;
     PickPlaceConfig cfg;
     PlanOptions opts;
@@ -4140,6 +4417,30 @@ private:
         resp->success = false;
         resp->message = err;
         return;
+      }
+      if (get_parameter("pick_place_place_requires_get").as_bool() && !pp_place_measured_ &&
+        !pp_capture_[kExecutePlace].has_value())
+      {
+        resp->success = false;
+        resp->message = cfg.place_insert
+          ? "the Mailbox target is still the configured one -- set the frame on the mailbox and press "
+            "the Mailbox Get (or type the point) first"
+          : "the place point is still the configured one -- press its Get (or type it) first";
+        return;
+      }
+      {
+        const double min_d = get_parameter("pick_place_min_pick_place_dist").as_double();
+        const double d = (tg.pick - tg.place).head<2>().norm();
+        if (min_d > 0.0 && d < min_d) {
+          std::ostringstream m;
+          m.setf(std::ios::fixed);
+          m.precision(2);
+          m << "the pick and the place points are only " << d << " m apart (needs " << min_d
+            << ") -- one Get read the frame on the wrong target: redo the two Gets";
+          resp->success = false;
+          resp->message = m.str();
+          return;
+        }
       }
       opts = planOptions();
       from = *hold_;
@@ -4337,6 +4638,7 @@ private:
     double climb = 0.0;
     std::optional<VecN> release;
     double release_hold = 0.0;
+    std::optional<RestSpec> backout;   // the insert: out of the mouth first
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       if (!mode_direct_ || !hold_.has_value()) {
@@ -4382,12 +4684,34 @@ private:
         from.x_b = ref.x_cd - Rz(from.phi) * r0c;   // x_c continuous
         cut = true;
       }
+      // THE INSERT (2026-10-30): with the claw at or in the mailbox's mouth -- the
+      // insert leg, its hold or its exit -- back straight out along the nose by the
+      // Insert Margin, arm unchanged, BEFORE the climb: a climb from inside the
+      // mouth drives the jaws into its top lip
+      pp_abort_back_ = 0.0;
+      if (pp_wp_.has_value() && get_parameter("pick_place_place_insert").as_bool() &&
+        ((pp_flying_.has_value() && *pp_flying_ == kExecutePlace) ||
+        (pp_completed_ == kExecutePlace && !pp_exited_[kExecutePlace]) ||
+        (pp_exiting_.has_value() && *pp_exiting_ == kExecutePlace)))
+      {
+        pp_abort_back_ = get_parameter("pick_place_place_approach_back").as_double();
+        backout = from;
+        // back out along the insertion line, the slide reversed (2026-10-30): the
+        // diagonal insert's envelope, still in the jaws, comes out along its own line
+        Vec3 out = pp_wp_->approach[kExecutePlace].x_b - pp_wp_->goal[kExecutePlace].x_b;
+        if (out.norm() > 1e-6) {
+          out.normalize();
+        } else {
+          out = -Vec3{-std::sin(from.phi), std::cos(from.phi), 0.0};
+        }
+        backout->x_b += pp_abort_back_ * out;
+      }
       // the climb is clipped at the fence ceiling (audit H3): repeated presses
       // never take the vehicle out of the volume
       climb = std::max(0.0, std::min(
           get_parameter("pick_place_abort_climb").as_double(),
           get_parameter("pick_place_fence_max_z").as_double() - from.x_b(2)));
-      goal.x_b = from.x_b + Vec3{0.0, 0.0, climb};
+      goal.x_b = (backout.has_value() ? backout->x_b : from.x_b) + Vec3{0.0, 0.0, climb};
       pp_abort_climb_ = climb;
       goal.phi = from.phi;
       goal.q = home_pose_;
@@ -4417,12 +4741,13 @@ private:
     publishPpStatus();
     publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, from, goal, opts, gen, release, release_hold]() {
+    worker_ = std::thread([this, from, goal, opts, gen, release, release_hold, backout]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
           traj = planPickPlaceAbort(*vehicle_, *planner_, opts, from, goal,
-            release.has_value() ? &*release : nullptr, release_hold);
+            release.has_value() ? &*release : nullptr, release_hold,
+            backout.has_value() ? &*backout : nullptr);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -4509,7 +4834,12 @@ private:
       // the vehicle back 0.1-0.15 m (measured in Isaac), and an exit planned
       // from the hold would first pull it back to the release point. Heading
       // and arm stay the hold's; odometry is fresh (checked above).
-      if (cfg.place_drop && leg == kExecutePlace && odom_p_.has_value()) {
+      // THE INSERT TOO (2026-10-30, the mail crash): 3 cm behind the hold after
+      // the release, the exit planned from the hold pulled the vehicle toward
+      // the mailbox first; it overshot 6 cm, the open jaws met the front wall
+      // and the climb caught them. From the measured pose the back-out only
+      // moves away from the mouth.
+      if ((cfg.place_drop || cfg.place_insert) && leg == kExecutePlace && odom_p_.has_value()) {
         drop_shift = (*odom_p_ - from.x_b).norm();
         from.x_b = *odom_p_;
       }
@@ -4610,6 +4940,16 @@ private:
 
   // What the descent gate checks (lock_ held): the claw's current error, less
   // the trim when it is on (the steady part the descent will cancel).
+  // Whether the waiting claw leg's descent is trimmed (lock_ held): the descent
+  // trim, except the insert's slide when pick_place_insert_descent_trim is false.
+  bool descentTrimOn() const
+  {
+    if (!get_parameter("pick_place_descent_trim").as_bool()) {return false;}
+    return !(pp_flying_.has_value() && *pp_flying_ == kExecutePlace &&
+           get_parameter("pick_place_place_insert").as_bool() &&
+           !get_parameter("pick_place_insert_descent_trim").as_bool());
+  }
+
   double descentResidual() const
   {
     if (pp_trim_buf_.empty()) {return pp_last_err_;}
@@ -4620,7 +4960,7 @@ private:
   // zero when disabled or with under half a window of samples.
   Vec3 descentTrim() const
   {
-    if (!get_parameter("pick_place_descent_trim").as_bool() || pp_trim_buf_.size() < 2) {
+    if (!descentTrimOn() || pp_trim_buf_.size() < 2) {
       return Vec3::Zero();
     }
     const double span = std::chrono::duration<double>(
@@ -4667,8 +5007,7 @@ private:
         m.setf(std::ios::fixed);
         m.precision(0);
         m << "the claw is " << descentResidual() * 1e3 << " mm from "
-          << (get_parameter("pick_place_descent_trim").as_bool() ? "its trimmed point above the target"
-                                                                 : "the point above the target")
+          << (descentTrimOn() ? "its trimmed point above the target" : "the point above the target")
           << " (> " << tol * 1e3 << " mm) -- wait for it to settle";
         err = m.str();
       } else if (descentTrim().norm() > get_parameter("pick_place_descent_trim_max").as_double()) {
@@ -4814,7 +5153,16 @@ private:
       const bool settled = dwelt && !pp_flying_.has_value() && state_ == "HOLD";
       pp_last_err_ = e.norm();
       if (claw && evalDropAuto(meas, e, &drop_now)) {gate_changed = true;}
-      if (pp_phase_ == kPpWait && state_ == "HOLD" &&
+      const bool ins_auto = claw && leg == kExecutePlace && pp_phase_ == kPpWait && state_ == "HOLD" &&
+        get_parameter("pick_place_place_insert").as_bool() && get_parameter("pick_place_insert_auto").as_bool();
+      if (ins_auto) {
+        if (evalInsertAuto(meas, e)) {descend = true;}
+      } else {
+        pp_ins_ok_since_.reset();
+        pp_ins_prev_.clear();
+        pp_ins_text_.clear();
+      }
+      if (!ins_auto && pp_phase_ == kPpWait && state_ == "HOLD" &&
         !get_parameter("pick_place_descent_on_request").as_bool())
       {
         const double wait_max = get_parameter("pick_place_approach_wait_max").as_double();
@@ -4859,12 +5207,103 @@ private:
     if (timed_out) {publishPpInfo();}
   }
 
+  // THE AUTONOMOUS INSERT (pick_place_insert_auto): while holding in front of the
+  // mouth, true once the claw has held within pick_place_insert_auto_tol of that
+  // point, slower than pick_place_drop_auto_claw_speed, for _dwell_s. Called under
+  // the lock at 10 Hz; a gap in the evaluation restarts the dwell.
+  bool evalInsertAuto(const Vec3 & claw, const Vec3 & e)
+  {
+    const auto now = Clock::now();
+    const double tol = get_parameter("pick_place_insert_auto_tol").as_double();
+    const double dwell = get_parameter("pick_place_insert_auto_dwell_s").as_double();
+    const double vmax = get_parameter("pick_place_drop_auto_claw_speed").as_double();
+    if (!pp_ins_prev_.empty() &&
+      std::chrono::duration<double>(now - pp_ins_prev_.back().first).count() > 0.25)
+    {
+      pp_ins_ok_since_.reset();           // a gap restarts the dwell
+    }
+    const double v = clawSpeed(&pp_ins_prev_, claw, now);
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m << "auto insert: ";
+    const double q_age = secondsSince(q_meas_time_);
+    bool ok = false;
+    if (q_age > 0.25) {
+      m << std::setprecision(2) << "arm joint states " << q_age << " s old";
+    } else if (e.norm() > tol) {
+      m << std::setprecision(0) << "claw " << e.norm() * 1e3 << " mm from the point in front of the mouth (gate "
+        << tol * 1e3 << ")";
+    } else if (!(v <= vmax)) {
+      m << std::setprecision(2) << "claw moving " << v << " m/s (gate " << vmax << ")";
+    } else {
+      ok = true;
+    }
+    if (!ok) {
+      pp_ins_ok_since_.reset();
+      pp_ins_text_ = m.str();
+      return false;
+    }
+    if (!pp_ins_ok_since_.has_value()) {pp_ins_ok_since_ = now;}
+    const double held = secondsSince(pp_ins_ok_since_);
+    if (held + 1e-9 < dwell) {
+      m << std::setprecision(1) << "aligned and still for " << held << " of " << dwell << " s";
+      pp_ins_text_ = m.str();
+      return false;
+    }
+    RCLCPP_INFO(get_logger(), "pick-and-place: AUTO INSERT -- claw %.0f mm from the point in front of the "
+      "mouth, %.3f m/s, for %.1f s: sliding in", e.norm() * 1e3, v, held);
+    pp_ins_ok_since_.reset();
+    pp_ins_prev_.clear();
+    pp_ins_text_.clear();
+    return true;
+  }
+
+  // The claw's speed for the autonomous insert / drop gates (2026-10-30), over the
+  // samples of the last 0.5 s: the LARGER of its least-squares velocity and its
+  // spread as a speed (2 x the largest deviation from the samples' mean / the span).
+  // A two-sample speed read the 10 Hz samples' few-mm jitter as 0.05-0.08 m/s on a
+  // claw holding within 15 mm (sim, layout_auto1), so the 0.03 m/s gate never held;
+  // a displacement over 0.5 s alone was blind to a ~1 Hz swing (drop_auto_check).
+  // The fit rejects jitter, the spread catches a swing. NaN until 4 samples span
+  // 0.4 s; a gap > 0.25 s starts afresh.
+  static double clawSpeed(std::deque<std::pair<Clock::time_point, Vec3>> * buf, const Vec3 & claw,
+    Clock::time_point now)
+  {
+    constexpr double kWindow = 0.5;
+    const auto age = [&](const Clock::time_point & t) {
+        return std::chrono::duration<double>(now - t).count();
+      };
+    if (!buf->empty() && age(buf->back().first) > 0.25) {buf->clear();}
+    buf->emplace_back(now, claw);
+    while (!buf->empty() && age(buf->front().first) > kWindow + 1e-6) {buf->pop_front();}
+    const double span = age(buf->front().first);
+    if (buf->size() < 4 || span < 0.4) {return std::numeric_limits<double>::quiet_NaN();}
+    double tm = 0.0;
+    Vec3 xm = Vec3::Zero();
+    for (const auto & s : *buf) {
+      tm += -age(s.first);
+      xm += s.second;
+    }
+    tm /= static_cast<double>(buf->size());
+    xm /= static_cast<double>(buf->size());
+    double stt = 0.0, rmax = 0.0;
+    Vec3 stx = Vec3::Zero();
+    for (const auto & s : *buf) {
+      const double dtm = -age(s.first) - tm;
+      stt += dtm * dtm;
+      stx += dtm * (s.second - xm);
+      rmax = std::max(rmax, (s.second - xm).norm());
+    }
+    const double fit = stt > 1e-9 ? (stx / stt).norm() : 0.0;
+    return std::max(fit, 2.0 * rmax / span);
+  }
+
   // Called under the lock: a new drop hold (or none) -- nothing released yet.
   void resetDropAuto()
   {
     pp_drop_ok_since_.reset();
     pp_drop_fired_ = false;
-    pp_drop_claw_prev_.reset();
+    pp_drop_claw_prev_.clear();
     pp_drop_last_eval_.reset();
     pp_drop_text_.clear();
   }
@@ -5043,14 +5482,18 @@ private:
   bool evalDropAuto(const Vec3 & claw, const Vec3 & e, std::string * fire)
   {
     const std::string before = pp_drop_text_;
-    const bool holding = get_parameter("pick_place_drop_auto").as_bool() &&
-      get_parameter("pick_place_place_drop").as_bool() && pp_wp_.has_value() &&
+    // (2026-10-30) the INSERT releases through the same gates when
+    // pick_place_insert_auto is on -- minus the payload's, the envelope has no markers
+    const bool insert = get_parameter("pick_place_place_insert").as_bool() &&
+      get_parameter("pick_place_insert_auto").as_bool();
+    const bool holding = ((get_parameter("pick_place_drop_auto").as_bool() &&
+      get_parameter("pick_place_place_drop").as_bool()) || insert) && pp_wp_.has_value() &&
       pp_completed_ == kExecutePlace && !pp_flying_.has_value() && !pp_exiting_.has_value() &&
       !pp_exited_[kExecutePlace] && pp_at_table_ && !pp_aborting_ && !pp_abort_plan_ &&
       !pp_aborted_ && pp_drop_hold_t0_.has_value() && state_ == "HOLD";
     if (!holding) {
       pp_drop_ok_since_.reset();
-      pp_drop_claw_prev_.reset();
+      pp_drop_claw_prev_.clear();
       pp_drop_last_eval_.reset();
       if (!pp_drop_fired_) {pp_drop_text_.clear();}
       return pp_drop_text_ != before;
@@ -5062,24 +5505,35 @@ private:
     // tick after a gap, nor on a speed averaged across it
     if (pp_drop_last_eval_.has_value() && secondsSince(pp_drop_last_eval_) > 0.25) {
       pp_drop_ok_since_.reset();
-      pp_drop_claw_prev_.reset();
+      pp_drop_claw_prev_.clear();
     }
     pp_drop_last_eval_ = now;
-    const double wait = get_parameter("pick_place_drop_auto_wait_s").as_double();
+    const double wait = get_parameter(
+      insert ? "pick_place_insert_auto_release_wait_s" : "pick_place_drop_auto_wait_s").as_double();
     const double dwell = get_parameter("pick_place_drop_auto_dwell_s").as_double();
     const double claw_tol = get_parameter("pick_place_drop_auto_claw_tol").as_double();
-    const double claw_vmax = get_parameter("pick_place_drop_auto_claw_speed").as_double();
+    const double claw_vmax = get_parameter(
+      insert ? "pick_place_insert_auto_release_speed" : "pick_place_drop_auto_claw_speed").as_double();
+    // the insert's claw WINDOW (2026-10-30): along the insertion line (the slide's
+    // direction, approach -> release) and off it, the claw against the release point
+    const double ins_short = get_parameter("pick_place_insert_auto_release_short").as_double();
+    const double ins_long = get_parameter("pick_place_insert_auto_release_long").as_double();
+    const double ins_off_tol = get_parameter("pick_place_insert_auto_release_off_axis").as_double();
+    double ins_along = 0.0, ins_off = 0.0;
+    if (insert) {
+      Vec3 u = pp_wp_->ee[kExecutePlace] - pp_wp_->approach_ee[kExecutePlace];
+      u = u.norm() > 1e-6 ? Vec3(u.normalized()) : Vec3::UnitX();
+      const Vec3 dm = -e;                   // the claw less the release point
+      ins_along = dm.dot(u);
+      ins_off = (dm - ins_along * u).norm();
+    }
     const double pay_tol = get_parameter("pick_place_drop_auto_payload_tol").as_double();
     const double pay_vmax = get_parameter("pick_place_drop_auto_payload_speed").as_double();
-    const double q4_tol = get_parameter("pick_place_drop_auto_q4_tol_deg").as_double();
+    const double q4_tol = get_parameter(
+      insert ? "pick_place_insert_auto_q4_tol_deg" : "pick_place_drop_auto_q4_tol_deg").as_double();
 
     // the claw's speed, between two arrival ticks
-    double claw_v = std::numeric_limits<double>::quiet_NaN();
-    if (pp_drop_claw_prev_.has_value()) {
-      const double dt = std::chrono::duration<double>(now - pp_drop_claw_prev_->first).count();
-      if (dt > 1e-3) {claw_v = (claw - pp_drop_claw_prev_->second).norm() / dt;}
-    }
-    pp_drop_claw_prev_ = std::make_pair(now, claw);
+    const double claw_v = clawSpeed(&pp_drop_claw_prev_, claw, now);
 
     // the payload's own mocap body: its newest UN-flipped sample, fresh, not
     // frozen, and its speed over ~0.1 s
@@ -5093,7 +5547,9 @@ private:
     }
     PickPlaceTargets tg;
     std::string terr;
-    if (pp_topic_[kExecutePick].empty()) {
+    if (insert) {
+      // no payload gate
+    } else if (pp_topic_[kExecutePick].empty()) {
       pay_why = "no payload body (pick_place_pick_topic is empty)";
     } else if (last == nullptr || secondsSince(last->t) > 0.25) {
       pay_why = ppBody(kExecutePick) + " not tracked (no fresh sample)";
@@ -5129,7 +5585,7 @@ private:
 
     std::ostringstream m;
     m.setf(std::ios::fixed);
-    m << "auto drop: ";
+    m << (insert ? "auto release: " : "auto drop: ");
     const double held = secondsSince(pp_drop_hold_t0_);
     bool ok = false;
     const double q_age = secondsSince(q_meas_time_);
@@ -5138,19 +5594,26 @@ private:
       m << std::setprecision(1) << "waiting " << held << " of " << wait << " s";
     } else if (q_age > 0.25) {
       m << std::setprecision(2) << "arm joint states " << q_age << " s old (the claw and q4 are unknown)";
-    } else if (!aimed && e.norm() > claw_tol) {
+    } else if (insert && (ins_along < -ins_short || ins_along > ins_long)) {
+      m << std::setprecision(0) << "claw " << std::abs(ins_along) * 1e3 << " mm "
+        << (ins_along < 0.0 ? "short of" : "past") << " the release point along the insertion line "
+        << "(window -" << ins_short * 1e3 << " / +" << ins_long * 1e3 << ")";
+    } else if (insert && ins_off > ins_off_tol) {
+      m << std::setprecision(0) << "claw " << ins_off * 1e3 << " mm off the insertion line (gate "
+        << ins_off_tol * 1e3 << ")";
+    } else if (!insert && !aimed && e.norm() > claw_tol) {
       // aimed at the basket, the payload gate below IS the position gate: the
       // claw only has to be still (its target already carries the measured hang)
       m << std::setprecision(0) << "claw " << e.norm() * 1e3 << " mm from the drop target (gate "
         << claw_tol * 1e3 << ")";
     } else if (!(claw_v <= claw_vmax)) {
       m << std::setprecision(2) << "claw moving " << claw_v << " m/s (gate " << claw_vmax << ")";
-    } else if (!pay_why.empty()) {
+    } else if (!insert && !pay_why.empty()) {
       m << pay_why;
-    } else if (pay_err > pay_tol) {
+    } else if (!insert && pay_err > pay_tol) {
       m << std::setprecision(0) << "payload " << pay_err * 1e3 << " mm from the drop point (gate "
         << pay_tol * 1e3 << ")";
-    } else if (!(pay_v <= pay_vmax)) {
+    } else if (!insert && !(pay_v <= pay_vmax)) {
       m << std::setprecision(2) << "payload moving " << pay_v << " m/s (gate " << pay_vmax << ")";
     } else if (q4_err > q4_tol) {
       m << std::setprecision(1) << "wrist q4 " << q4_err << " deg off (gate " << q4_tol << ")";
@@ -5167,14 +5630,22 @@ private:
       } else {
         std::ostringstream r;
         r.setf(std::ios::fixed);
-        r << std::setprecision(0) << "claw " << e.norm() * 1e3 << " mm, payload " << pay_err * 1e3
-          << " mm from the drop point, " << std::setprecision(2) << "claw " << claw_v
-          << " m/s, payload " << pay_v << " m/s, " << std::setprecision(1) << "q4 " << q4_err
-          << " deg off, " << held << " s after the leg";
+        if (insert) {
+          r << std::setprecision(0) << "claw " << ins_along * 1e3 << " mm along / " << ins_off * 1e3
+            << " mm off the release point, " << std::setprecision(2) << claw_v << " m/s, "
+            << std::setprecision(1) << "q4 " << q4_err
+            << " deg off, " << held << " s after the slide";
+        } else {
+          r << std::setprecision(0) << "claw " << e.norm() * 1e3 << " mm, payload " << pay_err * 1e3
+            << " mm from the drop point, " << std::setprecision(2) << "claw " << claw_v
+            << " m/s, payload " << pay_v << " m/s, " << std::setprecision(1) << "q4 " << q4_err
+            << " deg off, " << held << " s after the leg";
+        }
         *fire = r.str();
         pp_drop_fired_ = true;
         m << "RELEASE signalled (" << r.str() << ") -- the arm GS opens the gripper";
-        RCLCPP_INFO(get_logger(), "pick-and-place: AUTO DROP -- %s", r.str().c_str());
+        RCLCPP_INFO(get_logger(), "pick-and-place: %s -- %s", insert ? "AUTO RELEASE" : "AUTO DROP",
+          r.str().c_str());
       }
     }
     pp_drop_text_ = m.str();
@@ -5272,7 +5743,11 @@ private:
         m << "NOT IN DIRECT";
       } else if (pp_aborting_ || pp_abort_plan_) {
         m << "ABORTING" << (pp_guard_tripped_ ? " (SAFETY GUARD: " + pp_guard_reason_ + ")" : std::string())
-          << " -- gripper open, arm " << (pp_abort_release_ ? "to the release pose then home" : "home")
+          << " -- gripper open, ";
+        if (pp_abort_back_ > 0.0) {
+          m << "backing " << std::setprecision(2) << pp_abort_back_ << " m out of the mouth, then ";
+        }
+        m << "arm " << (pp_abort_release_ ? "to the release pose then home" : "home")
           << ", climbing " << std::setprecision(2) << pp_abort_climb_ << " m";
       } else if (pp_planning_) {
         m << "PLANNING";
@@ -5280,7 +5755,13 @@ private:
         m << "WAITING " << pickPlaceLegName(*pp_flying_) << ": claw " << std::setprecision(0)
           << pp_last_err_ * 1e3 << " mm from the point above the target (tolerance "
           << get_parameter("pick_place_arrival_tol").as_double() * 1e3;
-        if (get_parameter("pick_place_descent_on_request").as_bool()) {
+        const bool ins_auto = *pp_flying_ == kExecutePlace && get_parameter("pick_place_place_insert").as_bool() &&
+          get_parameter("pick_place_insert_auto").as_bool();
+        if (ins_auto) {
+          m << " mm) -- slides in by itself once the claw is still within " << std::setprecision(0)
+            << get_parameter("pick_place_insert_auto_tol").as_double() * 1e3 << " mm";
+          if (!pp_ins_text_.empty()) {m << " -- " << pp_ins_text_;}
+        } else if (get_parameter("pick_place_descent_on_request").as_bool()) {
           const bool insert = *pp_flying_ == kExecutePlace && get_parameter("pick_place_place_insert").as_bool();
           m << " mm) -- press " << (*pp_flying_ == kExecutePick ? "Pick" : insert ? "Insert" : "Place")
             << (insert ? " to slide in" : " to descend");
@@ -8183,9 +8664,16 @@ private:
   std::optional<Clock::time_point> pp_drop_hold_t0_;
   std::optional<Clock::time_point> pp_drop_ok_since_;
   bool pp_drop_fired_{false};
-  std::optional<std::pair<Clock::time_point, Vec3>> pp_drop_claw_prev_;
+  std::deque<std::pair<Clock::time_point, Vec3>> pp_drop_claw_prev_;   // its speed's samples
   std::optional<Clock::time_point> pp_drop_last_eval_;   // a gap restarts the dwell
   std::string pp_drop_text_;
+  // the place point set in this session (pick_place_place_requires_get), the
+  // autonomous insert's gate state, and an abort's back-out [m] (shown)
+  bool pp_place_measured_{false};
+  std::optional<Clock::time_point> pp_ins_ok_since_;
+  std::deque<std::pair<Clock::time_point, Vec3>> pp_ins_prev_;
+  std::string pp_ins_text_;
+  double pp_abort_back_{0.0};
   // aiming the drop at the basket (pick_place_drop_aim_payload): the basket -
   // claw offset in the VEHICLE frame (x forward, y left) sampled at Drop Start,
   // the world shift currently applied to the drop leg's rest (undone before a

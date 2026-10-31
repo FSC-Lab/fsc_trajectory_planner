@@ -1364,3 +1364,61 @@ TEST(PickPlace, TheBackMarginSetsTheDropsBackOutIndependentlyOfTheSideMargin)
   s.place_drop = false;
   EXPECT_NEAR(pickPlaceExitBack(s), 0.10, 1e-12);
 }
+
+TEST(PickPlace, TheDiagonalInsertHoldsBackAndUpAndSlidesAlongItsPitchedLine)
+{
+  // the diagonal insert (2026-10-30, user design): the envelope held with the claw
+  // pitched down 25 deg goes in along its own line -- the hold is the Insert Margin
+  // back AND up along that line, the slide forward and down along it, and the arm
+  // reaches the more unfolded insert pose on the way to the hold
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = config(*v);
+  c.approach_dz = 0.20;
+  const VecN carry = (VecN() << 0.0, 36.0 * kDeg, 44.0 * kDeg, 90.0 * kDeg).finished();
+  const VecN insert = (VecN() << 0.0, 20.0 * kDeg, 45.0 * kDeg, 90.0 * kDeg).finished();
+  c.pick_pose = c.carry = carry;
+  c.place_pose = insert;
+  c.sweep.lo = c.sweep.hi = carry;
+  c.pick_approach_back = 0.10;
+  c.place_exit_back = 0.10;
+  c.place_insert = true;
+  c.place_approach_back = 0.15;
+  c.place_insert_pitch_deg = 25.0;
+  PickPlaceTargets t = scene();
+  t.place << 1.6, -1.0, 1.0;
+  PickPlaceWaypoints wp = pickPlaceWaypoints(*v, c, t);
+  const int kl = kExecutePlace;
+  const double phi = wp.goal[kl].phi, th = 25.0 * kDeg;
+  const Vec3 u(-std::sin(phi) * std::cos(th), std::cos(phi) * std::cos(th), -std::sin(th));
+  EXPECT_LT((wp.goal[kl].x_b - wp.approach[kl].x_b - 0.15 * u).norm(), 1e-12);
+  EXPECT_LT((wp.ee[kl] - wp.approach_ee[kl] - 0.15 * u).norm(), 1e-9);
+  EXPECT_NEAR(wp.approach[kl].x_b(2) - wp.goal[kl].x_b(2), 0.15 * std::sin(th), 1e-12);
+  EXPECT_LT((wp.goal[kl].q - insert).norm(), 1e-12);
+
+  // the slide: the claw stays on the pitched line from the hold to the release
+  const auto D = planPickPlaceDescent(*v, *planner, PlanOptions{}, c, wp, kl, wp.approach[kl]);
+  const WbReference d0 = D->eval(0.0), dT = D->eval(D->duration());
+  EXPECT_LT((dT.r_ed - d0.r_ed - 0.15 * u).norm(), 1e-6);
+  for (int i = 0; i <= 40; ++i) {
+    const Vec3 rel = D->eval(D->duration() * i / 40.0).r_ed - d0.r_ed;
+    EXPECT_LT((rel - rel.dot(u) * u).norm(), 0.006) << "off the insertion line at sample " << i;
+  }
+
+  // the mission plans; Ready To Insert ends on the insert pose (from the carry pose)
+  std::array<std::shared_ptr<const Trajectory>, kNumPickPlaceLegs> exits;
+  const auto legs = planPickPlaceMission(*v, *planner, PlanOptions{}, c, wp, wp.goal[kGoToStart], &exits);
+  ASSERT_EQ(legs.size(), static_cast<size_t>(kNumPickPlaceLegs));
+  EXPECT_LT((legs[kGoToPlaceStart]->eval(legs[kGoToPlaceStart]->duration()).q_d - carry).norm(), 1e-6);
+  EXPECT_LT((legs[kl]->eval(legs[kl]->duration()).q_d - insert).norm(), 1e-6);
+
+  // refused: a pitch outside 0..60 deg
+  PickPlaceConfig bad = c;
+  bad.place_insert_pitch_deg = 70.0;
+  try {
+    pickPlaceWaypoints(*v, bad, t);
+    ADD_FAILURE() << "a 70 deg insertion line was accepted";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("pick_place_place_insert_pitch_deg"), std::string::npos) << e.what();
+  }
+}
