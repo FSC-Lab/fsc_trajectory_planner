@@ -64,12 +64,20 @@ set_ee_anchor_com services that record what the planner asks for.
        with the fold held, until q2 meets its wall at q3 = fold - wall (15 deg) -- aborts nothing;
        the same stretch with the key live-set to 0 (the flown rule) aborts; a fold with q2 pinned
        at the wall still aborts while q3 is above the limit
+  [9m] (2026-10-30) the sway guard (push_pull_guard_sway_speed): a 31 mm/s CoM-error swing does
+       not trip, a 251 mm/s one does, and its abort hands the claw to the CoM anchor at once
+       even with the valve's world-held release on.
   [9l] (2026-10-25) the sideways box guard (push_pull_guard_box_cross, the arbitrary-time rig):
        the box dragged 30 mm across the push passes a 45 mm limit, 60 mm aborts, named
   [9j] (2026-10-22, the valve's drone-mocap freeze) a mocap-guard abort hands the claw to the
        CoM anchor AT ONCE even with push_pull_abort_release_world_held (the valve's free-handle
        release): "the world" is then EKF2 dead-reckoning; and a mocap fault confirmed DURING a
        world-held release (a force-guard abort) ends the world hold early
+  [9o] (2026-10-31) the flight node's emergency abort (push_pull/emergency_abort): ABORTING named
+       as the flight node's, the configured release (world-held release on: no CoM anchor in the
+       first 0.5 s), a second call answered "already aborting".
+  [9n] (2026-10-30) the law's EE heading error and the node's free-axis heading radius reach
+       arrival_error [30]/[31]; a turn whose sense disagrees with the radius is refused at Plan
   [10] SAFETY silences the stream
 
 Run with a scratch install first on the path and a private ROS domain:
@@ -211,7 +219,7 @@ class Rig(Node):
         self.create_service(SetBool, CONTACT_SRV, self.on_contact)
         self.create_service(SetBool, ANCHOR_SRV, self.on_anchor)
         self.cli = {n: self.create_client(Trigger, f"whole_body_planner/push_pull/{n}")
-                    for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort", "release"]}
+                    for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort", "emergency_abort", "release"]}
         self.params = self.create_client(SetParameters, "whole_body_trajectory_planner/set_parameters")
         self.getp = self.create_client(GetParameters, "whole_body_trajectory_planner/get_parameters")
         self.odom_xyz = np.array([*(START + OFFSET), 0.0])
@@ -223,10 +231,13 @@ class Rig(Node):
         self.mg = [0.0, 0.0, 0.01]  # [9d] the mocap guard: state, cause, age
         self.mg_on = True          # [9e] stops it
         self.free_off = 0.0        # [9f] the law's free-axis shift, wb_control_debug [117] [m]
+        self.head_err_deg = 0.0    # [9n] the law's EE heading error, wb_control_debug [27]
+        self.free_radius = 0.0     # [9n] the node's free-axis heading radius, wb_control_debug [118]
         self.box_follow = None     # [9f] (box0, r_ed0): the box follows the streamed claw reference
         self.box_side = 0.0        # [9l] the box dragged sideways (world x, across the -y push) [m]
         self.glitch_n = 0          # [9g] the next n box samples are the 10-21 mis-solve
         self.wobble = None         # [5] (amplitude m, frequency Hz): the body swings along x
+        self.com_sway = None       # [9m] (amplitude m, frequency Hz): the law's CoM error swings along x
         self.rng = np.random.default_rng(0)
         self.create_timer(0.02, self.feed)
         self.create_timer(0.004, self.feed_force)    # the node's 250 Hz debug
@@ -281,9 +292,15 @@ class Rig(Node):
             self.guard_pub.publish(g)
 
     def feed_force(self):
-        data = [0.0] * 118
+        data = [0.0] * 120
         data[97:100] = list(map(float, self.force))
         data[117] = float(self.free_off)
+        data[27] = math.sin(math.radians(self.head_err_deg))   # [9n] the law's EE heading error (a sine)
+        data[118] = float(self.free_radius)                    # [9n] the free-axis heading radius
+        if self.com_sway is not None:   # [9m] x_cd [45..47] fixed, x_c [48..50] swinging about it
+            a, f = self.com_sway
+            data[45:48] = [1.0, 0.0, 1.0]
+            data[48:51] = [1.0 + a * math.sin(2.0 * math.pi * f * time.monotonic()), 0.0, 1.0]
         d = Float32MultiArray()
         d.data = data
         self.force_pub.publish(d)
@@ -553,6 +570,16 @@ def main():
             assert rig.anchor_calls and rig.anchor_calls[-1] is False, rig.anchor_calls
         wait(lambda: rig.pl_status.startswith("DONE ready next=push"), 5, "DONE ready")
         print(f"[5] ready T={T:.1f}s, claw sideways {side * 1e3:.2f} mm on the way down; {rig.pl_status}")
+        # [9n] (2026-10-30) with the claw on the handle the arrival stream carries the law's EE heading
+        # error [30] (the Valve tab's close gate) and the node's free-axis heading radius [31]
+        rig.head_err_deg = 12.0
+        rig.free_radius = -0.16
+        wait(lambda: rig.arrival is not None and len(rig.arrival) > 31 and
+             abs(rig.arrival[30] - 12.0) < 0.5 and abs(rig.arrival[31] + 0.16) < 1e-6, 3,
+             "arrival_error [30]/[31] (9n)")
+        rig.head_err_deg = 0.0
+        rig.free_radius = 0.0
+        print("[9n] on the handle: arrival_error [30] 12.0 deg (the law's heading error), [31] -0.16 m")
 
         # [6] push: contact on, the anchor the yaml asks for (world-held: a
         # repeated WORLD request, or none), settle then slide along -y, arm and
@@ -1134,6 +1161,78 @@ def main():
             set_param_bool(rig, "push_pull_abort_release_world_held", False)
         else:
             print("[9j] skipped: the yaml's push_pull_abort_release_wait_s is under 0.8 s")
+
+        # [9m] (2026-10-30) the sway guard (push_pull_guard_sway_speed) and the abort it calls.
+        # The law's CoM error swings along x: 10 mm at 0.5 Hz (31 mm/s) must not trip; 80 mm at
+        # 0.5 Hz (251 mm/s) must, and that abort must hand the claw to the CoM anchor AT ONCE
+        # even with the world-held release on (the 10-29 crash: the room hold pulled the
+        # stretched arm against the vehicle running away).
+        sway = _yaml_num("push_pull_guard_sway_speed", 0.0)
+        live = sway <= 0.0
+        if live:
+            sway = 0.15
+            set_param(rig, "push_pull_guard_sway_speed", sway)
+        set_param_bool(rig, "push_pull_abort_release_world_held", True)
+        back_on_handle("9m")
+        rig.com_sway = (0.010, 0.5)
+        time.sleep(2.5)
+        assert rig.pl_status.startswith("DONE ready"), ("a 31 mm/s sway tripped", rig.pl_status)
+        n_a = len(rig.anchor_calls)
+        rig.com_sway = (0.080, 0.5)
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "the sway guard (9m)")
+        t_ab = time.monotonic()
+        assert "sways" in rig.pl_status, rig.pl_status
+        rig.com_sway = None
+        wait(lambda: True in rig.anchor_calls[n_a:], 0.6, "the CoM anchor at once on a sway abort")
+        dt_m = time.monotonic() - t_ab
+        assert False not in rig.anchor_calls[n_a:], ("held in the room on a sway abort", rig.anchor_calls[n_a:])
+        print(f"[9m] the sway guard at {sway * 1e3:.0f} mm/s{' (live-set)' if live else ''}: no trip at "
+              f"31 mm/s; tripped at 251 mm/s, the CoM anchor {dt_m:.2f} s after ABORTING: {rig.pl_status}")
+        abort_done("9m")
+        set_param_bool(rig, "push_pull_abort_release_world_held", False)
+        if live:
+            set_param(rig, "push_pull_guard_sway_speed", 0.0)
+
+        # [9o] (2026-10-31) the flight node's EMERGENCY ABORT (push_pull/emergency_abort, called by
+        # the whole-body node's tilt / drift watchdog instead of SAFETY): ABORTING named as the
+        # flight node's, and the task's CONFIGURED release -- with the world-held release on, the
+        # claw stays room-held while the jaws open (NOT the arm / sway guards' anchor drop)
+        set_param_bool(rig, "push_pull_abort_release_world_held", True)
+        back_on_handle("9o")
+        n_a = len(rig.anchor_calls)
+        r = call(rig, "emergency_abort")
+        assert r.success, ("the emergency abort refused", r.message)
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 5, "ABORTING (9o)")
+        assert "flight node" in rig.pl_status, rig.pl_status
+        time.sleep(0.5)
+        assert True not in rig.anchor_calls[n_a:], ("the CoM anchor at once on an emergency abort",
+                                                     rig.anchor_calls[n_a:])
+        r2 = call(rig, "emergency_abort")
+        assert not r2.success and "already aborting" in r2.message, ("a second call", r2.message)
+        print(f"[9o] the emergency abort: room-held for >= 0.5 s after ABORTING (the configured release), "
+              f"a second call answered '{r2.message}': {rig.pl_status}")
+        abort_done("9o")
+        set_param_bool(rig, "push_pull_abort_release_world_held", False)
+
+        # [9n] (2026-10-30) the free-axis heading: the law's EE heading error reaches arrival_error
+        # [30] (the Valve tab's close gate), the node's radius [31]; a turn whose sense disagrees
+        # with the node's signed radius is refused at Plan, the right sense passes that check
+        rig.free_radius = -0.16
+        time.sleep(0.3)
+        set_param(rig, "push_pull_turn_deg", 90.0)
+        r = call(rig, "plan")
+        assert not r.success and "heading radius" in r.message and "counter-clockwise" in r.message, \
+            ("a clockwise radius against a counter-clockwise turn", r.message)
+        msg_wrong = r.message
+        rig.free_radius = 0.16
+        time.sleep(0.3)
+        r = call(rig, "plan")
+        assert "heading radius" not in r.message, ("the right sense refused", r.message)
+        set_param(rig, "push_pull_turn_deg", 0.0)
+        rig.head_err_deg = 0.0
+        rig.free_radius = 0.0
+        print(f"[9n] the wrong sense refused at Plan: "
+              f"{msg_wrong}; the right sense passes it (then: {r.message})")
 
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))

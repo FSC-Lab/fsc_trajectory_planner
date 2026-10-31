@@ -1094,6 +1094,20 @@ public:
     declare_parameter<double>("push_pull_box_gate_jump_deg", 0.0);
     declare_parameter<double>("push_pull_guard_force_n", 5.0);
     declare_parameter<double>("push_pull_guard_force_persist_s", 0.30);
+    // THE SWAY GUARD (2026-10-30, the 10-29 hardware valve crash, Pegasus archive
+    // valve_safety_fixes_20261030): with the claw on the handle the whole vehicle can sway
+    // against the clamp in a growing 0.45-0.6 Hz mode the arm absorbs until it buckles (3 of 3
+    // hardware valve contacts). This aborts on its SPEED: the horizontal rate of the law's own
+    // CoM error (wb_control_debug x_c [48..50] - x_cd [45..47]), first-order low-passed over
+    // sway_filter_s, above sway_speed [m/s] for sway_persist_s. The error itself does not
+    // separate (Isaac's completed turns reach 50-150 mm of slow in-turn offset); its rate does:
+    // replayed at 0.15 m/s / 0.25 s / 0.2 s, none of the 99 recorded Isaac valve contacts trips
+    // (the worst completed one peaks at 0.149 m/s -- a thin margin), and both unstable hardware
+    // contacts trip 3.0 s before they ended (10-29: 3.0 s before the collapse). The abort lets go
+    // of the room hold at once (see onPlAbort). 0 = off (unchanged).
+    declare_parameter<double>("push_pull_guard_sway_speed", 0.0);
+    declare_parameter<double>("push_pull_guard_sway_filter_s", 0.25);
+    declare_parameter<double>("push_pull_guard_sway_persist_s", 0.20);
     // PATH FOLLOWING FOR THE TURN (2026-10-18; push_pull_turn_deg != 0 only):
     // true = the turn is flown at a GOVERNED PROGRESS (ProgressGovernor) in
     // place of the wall clock -- the same rigid rotation, its schedule slowed or
@@ -1378,6 +1392,27 @@ public:
             pl_guard_tripped_ = false;    // the operator's abort, not a guard's
           }
           onPlAbort(r);
+        });
+      // THE FLIGHT NODE'S EMERGENCY ABORT (2026-10-31, user: "for an emergency it should
+      // abort, not switch to SAFETY directly"). The whole-body node calls this when its
+      // tilt / drift watchdog trips during a contact step (system_wd_abort_service): the
+      // abort the tilt guard runs -- this task's configured release (the valve: the claw
+      // room-held while the jaws open), climb, arm home -- while the law keeps flying.
+      // Without it the node reverted to SAFETY with the claw at the handle, and the
+      // automatic arm fold then swept the open claw through it (Isaac: 60 N on the fin,
+      // the vehicle thrown 3.3 m). NOT the arm / sway guards' anchor drop: a tilt trip
+      // alone is no stretched arm, and a CoM-held open claw rode the vehicle's wander back
+      // into the fin during the release wait (Isaac vs_emerg: the wrist to -77 deg, 25 deg
+      // of tilt); a stretched arm trips the q3 / sway guards first, which do drop it.
+      pl_trigger(prefix + "/push_pull/emergency_abort", [this](Trigger::Response::SharedPtr r) {
+          {
+            std::lock_guard<std::recursive_mutex> lk(lock_);
+            pl_guard_reason_ = "the flight node's DIRECT watchdog (an emergency: an abort instead of SAFETY)";
+            pl_guard_tripped_ = true;
+          }
+          onPlAbort(r);
+          RCLCPP_ERROR(get_logger(), "push-and-pull SAFETY GUARD: %s -- %s", pl_guard_reason_.c_str(),
+            r->message.c_str());
         });
       // the release-window fix (2026-10-17): the station calls it as it opens the gripper
       pl_trigger(prefix + "/push_pull/release", [this](Trigger::Response::SharedPtr r) {onPlRelease(r);});
@@ -1947,6 +1982,7 @@ private:
         m << " < " << lim << " deg (the arm folding toward its elbow-singular branch)";
         pl_guard_reason_ = m.str();
         pl_guard_tripped_ = true;
+        pl_abort_drop_anchor_ = true;
         pl_q3r_since_.reset();
         return true;
       }
@@ -6082,6 +6118,7 @@ private:
       "push_pull_guard_q3_lookahead_s", "push_pull_guard_q3_rate_min_deg_s",
       "push_pull_guard_q3_rate_persist_s", "push_pull_guard_q3_rate_filter_s",
       "push_pull_guard_q2_max_deg",
+      "push_pull_guard_sway_speed", "push_pull_guard_sway_filter_s", "push_pull_guard_sway_persist_s",
       "push_pull_box_gate_jump_m", "push_pull_box_gate_jump_deg",
       "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
       "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
@@ -6661,6 +6698,7 @@ private:
             "elbow-singular branch)";
           pl_guard_reason_ = m.str();
           pl_guard_tripped_ = true;
+          pl_abort_drop_anchor_ = true;
           pl_bg_q3_since_.reset();
           return true;
         }
@@ -6955,6 +6993,38 @@ private:
            static_cast<bool>(pp_abort_plan_);
   }
 
+  // THE FREE-AXIS HEADING INTERLOCK (2026-10-30, the 10-29 report's item 9): the node turns its EE
+  // heading target by the free-axis offset / wb_ee_anchor_free_axis_heading_radius (sent as
+  // wb_control_debug [118]). A turn the other way, or about a handle of another radius, would
+  // twist the grip instead of relieving it. "" = fine (or the node does not send it). lock_ held.
+  std::string plFreeHeadingProblem(const PushPullConfig & cfg) const
+  {
+    if (cfg.turn_angle == 0.0 || secondsSince(pl_free_radius_t_) > 1.0 || pl_free_radius_ == 0.0) {
+      return "";
+    }
+    const double r = std::hypot(cfg.ee_offset(0), cfg.ee_offset(1));
+    const double hint = r > 1e-3 ? r : std::abs(pl_free_radius_);   // the value to suggest
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(3);
+    if ((pl_free_radius_ > 0.0) != (cfg.turn_angle > 0.0)) {
+      m << "the whole-body node's free-axis heading radius " << pl_free_radius_ << " m is for a "
+        << (pl_free_radius_ > 0.0 ? "counter-clockwise" : "clockwise") << " turn, this turn is "
+        << (cfg.turn_angle > 0.0 ? "counter-clockwise" : "clockwise")
+        << " -- its heading target would turn the wrong way; set wb_ee_anchor_free_axis_heading_radius "
+        << (cfg.turn_angle > 0.0 ? hint : -hint) << " in the node's yaml and relaunch it";
+      return m.str();
+    }
+    if (r > 1e-3 && std::abs(std::abs(pl_free_radius_) - r) > 0.25 * r) {
+      m << "the whole-body node's free-axis heading radius " << pl_free_radius_
+        << " m does not match the handle's (" << r << " m, push_pull_ee_offset) -- set "
+        << "wb_ee_anchor_free_axis_heading_radius " << (cfg.turn_angle > 0.0 ? r : -r)
+        << " in the node's yaml and relaunch it";
+      return m.str();
+    }
+    return "";
+  }
+
   void onPlPlan(Trigger::Response::SharedPtr resp)
   {
     PushPullTargets tg;
@@ -6981,6 +7051,7 @@ private:
         err = "another mode is flying -- wait for it";
       }
       if (err.empty()) {plConfig(&cfg, &err);}
+      if (err.empty()) {err = plFreeHeadingProblem(cfg);}
       if (err.empty()) {plTargets(&tg, &err);}
       if (!err.empty()) {
         resp->success = false;
@@ -7193,6 +7264,9 @@ private:
         if (!pl_at_handle_) {err = "the claw is not on the handle -- nothing to exit";}
       }
       if (err.empty()) {plConfig(&cfg, &err);}
+      // the free-axis heading interlock again before the claw goes onto the handle (Plan may
+      // have run before the node's full debug arrived)
+      if (err.empty() && (s == kPlReady || s == kPlPush)) {err = plFreeHeadingProblem(cfg);}
       if (!err.empty()) {
         resp->success = false;
         resp->message = std::string(name) + ": " + err;
@@ -7550,8 +7624,11 @@ private:
     Vec3 retreat = Vec3::Zero();
     bool measured = false;
     std::optional<VecN> unbuckle;
+    bool drop_anchor = false;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
+      // set by the guard that called this (sway, q3): consumed by every abort, run or refused
+      drop_anchor = std::exchange(pl_abort_drop_anchor_, false);
       if (!mode_direct_ || !hold_.has_value()) {
         resp->success = false;
         resp->message = "not in whole-body DIRECT -- use the drone ground station";
@@ -7666,8 +7743,13 @@ private:
       // is then EKF2 dead-reckoning, 20/51/79/111 mm off at 1/1.5/2/2.5 s, and a claw held
       // there made the arm absorb the phantom drift (q3 through 0 at 2.5 s, the vehicle left
       // DIRECT and fell off the table). The claw follows the base (the CoM anchor) instead.
+      // ... and NOT when the guard that fired means the vehicle is running away from the
+      // clamped claw (the sway guard, the q3 guards; 2026-10-30, the 10-29 hardware valve
+      // crash): the room hold then pulls the stretched arm against the base -- there the arm
+      // torques railed at +-3 N.m and the tilt went 8 -> 15 deg in the 0.6 s before the
+      // watchdog. The claw follows the base (the CoM anchor) from the first tick of the abort.
       pl_abort_keep_anchor_ = touched && wait > 0.0 && pp_anchor_world_ && !pl_mg_aborted_ &&
-        get_parameter("push_pull_abort_release_world_held").as_bool();
+        !drop_anchor && get_parameter("push_pull_abort_release_world_held").as_bool();
       pl_abort_anchor_due_.reset();
       pl_exit_hold_z0_.reset();     // an abort in the exit's room-held climb owns the anchor now
       pl_exit_hold_t0_.reset();
@@ -7734,7 +7816,8 @@ private:
     std::ostringstream m;
     m.setf(std::ios::fixed);
     m.precision(2);
-    m << "ABORT: contact off, " << (wait > 0.0 ? (pl_abort_keep_anchor_ ? "release (claw world-held) " : "release ") : "")
+    m << "ABORT: contact off, " << (wait > 0.0 ? (pl_abort_keep_anchor_ ? "release (claw world-held) " :
+      drop_anchor ? "release (the claw follows the vehicle at once) " : "release ") : "")
       << (retreat.norm() > 1e-3 ? "back " : "") << "then up " << climb << " m and the "
       << "arm home, from " << (measured ? "the MEASURED pose" : cut ? "the point the step was cut at" : "the hold");
     if (retreat.norm() > 1e-3) {m << " (back " << retreat.norm() << " m against the push first)";}
@@ -8014,6 +8097,14 @@ private:
         pl_free_off_ = msg.data[117];
         pl_free_off_t_ = now;
       }
+      if (std::isfinite(msg.data[27])) {
+        pl_head_err_deg_ = std::asin(std::clamp(static_cast<double>(msg.data[27]), -1.0, 1.0)) * 180.0 / M_PI;
+        pl_head_err_t_ = now;
+      }
+      if (msg.data.size() > 118 && std::isfinite(msg.data[118])) {
+        pl_free_radius_ = msg.data[118];
+        pl_free_radius_t_ = now;
+      }
       // the unload's input: the law's task error while the push flies
       const Vec3 ey{msg.data[24], msg.data[25], msg.data[26]};
       if (pl_flying_.has_value() && *pl_flying_ == kPlPush && ey.allFinite()) {
@@ -8039,7 +8130,54 @@ private:
       const bool armed = limit > 0.0 && mode_direct_ &&
         (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush)) &&
         !pl_aborting_ && !pl_abort_plan_;
-      if (!armed || pl_force_f_.norm() <= limit) {
+      // THE SWAY GUARD (push_pull_guard_sway_speed): the rate of the horizontal CoM error,
+      // kept warm on every sample (a new contact starts from the free-flight value)
+      if (msg.data.size() > 50) {
+        const Vec3 xcd{msg.data[45], msg.data[46], msg.data[47]};
+        const Vec3 xc{msg.data[48], msg.data[49], msg.data[50]};
+        if (xcd.allFinite() && xc.allFinite()) {
+          const Eigen::Vector2d e = (xc - xcd).head<2>();
+          if (pl_sway_t_.has_value()) {
+            const double ds = std::chrono::duration<double>(now - *pl_sway_t_).count();
+            if (ds > 0.0 && ds < 0.1) {
+              const double tc = std::max(1e-3, get_parameter("push_pull_guard_sway_filter_s").as_double());
+              // = v += (ds/tc)(de/ds - v) for small ds: a burst of samples cannot blow it up
+              pl_sway_v_ += (1.0 - std::exp(-ds / tc)) * ((e - pl_sway_e_) / ds - pl_sway_v_);
+            } else if (ds >= 0.1) {
+              pl_sway_v_.setZero();      // a gap: start again
+            }
+          }
+          pl_sway_e_ = e;
+          pl_sway_t_ = now;
+        }
+      }
+      const double sway_lim = get_parameter("push_pull_guard_sway_speed").as_double();
+      const bool sway_armed = sway_lim > 0.0 && mode_direct_ &&
+        (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush)) &&
+        !pl_aborting_ && !pl_abort_plan_ && secondsSince(pl_sway_t_) < 0.1;
+      if (!sway_armed || pl_sway_v_.norm() <= sway_lim) {
+        pl_sway_since_.reset();
+      } else {
+        if (!pl_sway_since_.has_value()) {pl_sway_since_ = now;}
+        if (!trip && secondsSince(pl_sway_since_) >=
+          get_parameter("push_pull_guard_sway_persist_s").as_double())
+        {
+          std::ostringstream m;
+          m.setf(std::ios::fixed);
+          m.precision(0);
+          m << "the vehicle sways " << pl_sway_v_.norm() * 1e3 << " mm/s against its CoM reference (> "
+            << sway_lim * 1e3 << " mm/s; CoM error " << pl_sway_e_.norm() * 1e3
+            << " mm): the clamped contact is going unstable";
+          pl_guard_reason_ = m.str();
+          pl_guard_tripped_ = true;
+          pl_abort_drop_anchor_ = true;
+          pl_sway_since_.reset();
+          trip = true;
+        }
+      }
+      if (trip) {
+        pl_force_since_.reset();
+      } else if (!armed || pl_force_f_.norm() <= limit) {
         pl_force_since_.reset();
       } else {
         if (!pl_force_since_.has_value()) {pl_force_since_ = now;}
@@ -8084,7 +8222,8 @@ private:
   // included), [24] its planned duration [s] (settle + push), [25] the settle
   // [s], [26] the box's travel along the push [m] (obj_0), [27] the claw
   // reference's [m], [28] the box's speed [m/s] (0.5 s window), [29] the claw
-  // reference's [m/s].
+  // reference's [m/s]. (2026-10-30) [30] the law's EE heading error [deg], [31] the node's
+  // free-axis heading radius [m] (NaN when stale / not sent).
   // The claw's measured height [m] -- the arrival tick's claw (FK on the encoders,
   // odometry position, PX4 attitude) -- with lock_ held; empty when a feed is stale.
   std::optional<double> plClawZ() const
@@ -8312,6 +8451,11 @@ private:
       const PlMonitor & mo = pl_mon_;
       m.data.insert(m.data.end(), {mo.valid ? 1.0 : 0.0, mo.done ? 1.0 : 0.0, mo.t, mo.T,
           mo.settle, mo.travel, mo.plan_travel, mo.speed, mo.plan_speed});
+      // [30] the law's EE heading error [deg] (wb_control_debug [27]; NaN when stale) -- the
+      // Valve tab's close gate (2026-10-30); [31] the node's free-axis heading radius [m]
+      // ([118]; NaN when the node does not send it)
+      m.data.push_back(secondsSince(pl_head_err_t_) < 0.25 ? pl_head_err_deg_ : std::nan(""));
+      m.data.push_back(secondsSince(pl_free_radius_t_) < 1.0 ? pl_free_radius_ : std::nan(""));
       if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding) ||
         pl_handle_settling_ || settle_done)
       {
@@ -8774,6 +8918,13 @@ private:
   std::optional<Clock::time_point> pl_guard_since_;
   std::string pl_guard_reason_;
   Vec3 pl_force_f_{Vec3::Zero()};               // the low-passed F_hat [N]
+  // THE SWAY GUARD (2026-10-30): the last horizontal CoM error, its low-passed rate, when it
+  // was read, and since when the rate is over the limit
+  Eigen::Vector2d pl_sway_e_{Eigen::Vector2d::Zero()}, pl_sway_v_{Eigen::Vector2d::Zero()};
+  std::optional<Clock::time_point> pl_sway_t_, pl_sway_since_;
+  // set by the guards that mean "the vehicle is running away from the clamped claw" (the
+  // sway guard, the q3 guards): that abort lets go of the room hold at once (onPlAbort)
+  bool pl_abort_drop_anchor_{false};
   // the box guards (2026-10-16): the box's pose when the push started
   // executing, and each condition's since-time
   std::optional<Vec3> pl_bg_box0_;
@@ -8795,6 +8946,13 @@ private:
   // it was read, and its share along the push when the lag's origin was taken
   double pl_free_off_{0.0};
   std::optional<Clock::time_point> pl_free_off_t_;
+  // THE FREE-AXIS HEADING (2026-10-30): the law's EE heading error (wb_control_debug [27], as
+  // degrees) for the Valve tab's close gate, and the node's signed heading radius ([118]) for the
+  // turn's interlock (plFreeHeadingProblem)
+  double pl_head_err_deg_{std::nan("")};
+  std::optional<Clock::time_point> pl_head_err_t_;
+  double pl_free_radius_{0.0};
+  std::optional<Clock::time_point> pl_free_radius_t_;
   double pl_bg_shift0_{0.0};
   // THE PUSH MONITOR (2026-10-21): plMonitorUpdate, push_pull/arrival_error [21..29]
   struct PlMonitor
