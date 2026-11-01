@@ -213,6 +213,8 @@ class Rig(Node):
         self.status = self.pl_status = self.info = self.arrival = None
         self.refs = []
         self.contact_calls, self.anchor_calls = [], []
+        # (2026-11-02) the planner's grasp event, called as the arm GS does
+        self.grasp_cli = self.create_client(SetBool, NS + "/whole_body_planner/push_pull/grasp")
         self.fast_calls = []                   # (2026-11-01) requests through the FAST hand-back
         self.create_subscription(String, "whole_body_planner/status",
                                  lambda m: setattr(self, "status", m.data), LATCHED)
@@ -366,6 +368,16 @@ def get_param(rig, name):
         time.sleep(0.05)
         assert time.monotonic() - t0 < 10, name
     return np.array(fut.result().values[0].double_array_value)
+
+
+def get_param_bool(rig, name):
+    assert rig.getp.wait_for_service(timeout_sec=10)
+    fut = rig.getp.call_async(GetParameters.Request(names=[name]))
+    t0 = time.monotonic()
+    while not fut.done():
+        time.sleep(0.05)
+        assert time.monotonic() - t0 < 10, name
+    return bool(fut.result().values[0].bool_value)
 
 
 def set_param(rig, name, value):
@@ -1258,6 +1270,14 @@ def main():
         # 22 cm with the claw room-held above the handle, the arm folded through q3 = 0 on the Ready
         # descent, no guard armed). Live-set on this yaml: the room hold before Ready, the base gate,
         # the leash, the descent guard, the arm guards before the handle.
+        # (2026-11-02) the fast hand-back is VALVE ONLY (push_pull_fast_hand_back, default off): on
+        # a yaml without it every guard abort above ([9h] q3, [9i] fold, [9k] stretch, [9m] sway)
+        # handed the claw back through the NORMAL service, as the 10-27 box flew
+        if not get_param_bool(rig, "push_pull_fast_hand_back"):
+            assert rig.fast_calls == [], ("a guard abort used the FAST hand-back without the valve key",
+                                          rig.fast_calls)
+            print("[9p] no guard abort used the FAST hand-back (push_pull_fast_hand_back false: the 10-27 box)")
+        set_param_bool(rig, "push_pull_fast_hand_back", True)
         set_param_bool(rig, "push_pull_world_anchor_ready", True)
         set_param(rig, "push_pull_ready_max_com_err", 0.030)
         set_param(rig, "push_pull_ready_max_com_speed", 0.060)
@@ -1364,6 +1384,40 @@ def main():
             set_param(rig, k, _yaml_num(k, 0.0))
         set_param_bool(rig, "push_pull_guard_arm_before_handle", _yaml_bool("push_pull_guard_arm_before_handle", False))
         set_param_bool(rig, "push_pull_world_anchor_ready", WORLD_ANCHOR_READY)
+        set_param_bool(rig, "push_pull_fast_hand_back", _yaml_bool("push_pull_fast_hand_back", False))
+
+        # [9q] (2026-11-02) THE GRASP EVENT (push_pull/grasp, valve only): the arm GS reports the jaws
+        # closed on the handle in a valve static hold. Refused unless the yaml enables it, on a
+        # straight push, and away from the handle -- and it never touches the anchor. (Its happy path
+        # needs a valve: the Isaac static-hold flight, Pegasus archive/valve_box_isolation_20261102.)
+        def grasp(on):
+            assert rig.grasp_cli.wait_for_service(timeout_sec=5)
+            fut = rig.grasp_cli.call_async(SetBool.Request(data=on))
+            t0 = time.monotonic()
+            while not fut.done():
+                time.sleep(0.02)
+                assert time.monotonic() - t0 < 5, "push_pull/grasp"
+            return fut.result()
+        n_c, n_a = len(rig.contact_calls), len(rig.anchor_calls)
+        msgs = []
+        if not _yaml_bool("push_pull_grasp_event", False):
+            r = grasp(True)
+            assert not r.success and "belongs to valve turning" in r.message, r.message
+            msgs.append(r.message)
+        set_param_bool(rig, "push_pull_grasp_event", True)
+        r = grasp(True)
+        assert not r.success and "straight push" in r.message, r.message
+        msgs.append(r.message)
+        set_param(rig, "push_pull_turn_deg", -30.0)
+        for on in (True, False):
+            r = grasp(on)
+            assert not r.success and "not on the handle" in r.message, r.message
+        msgs.append(r.message)
+        set_param(rig, "push_pull_turn_deg", 0.0)
+        set_param_bool(rig, "push_pull_grasp_event", _yaml_bool("push_pull_grasp_event", False))
+        assert rig.contact_calls[n_c:] == [] and rig.anchor_calls[n_a:] == [], \
+            (rig.contact_calls[n_c:], rig.anchor_calls[n_a:])
+        print("[9q] grasp event refusals: " + " | ".join(msgs))
 
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))

@@ -1020,6 +1020,17 @@ public:
     // (push_dir is the tangent at the grasp: mid-turn it points sideways or into the fin).
     // false = the anchor goes back to the CoM at once (unchanged).
     declare_parameter<bool>("push_pull_abort_release_world_held", false);
+    // THE FAST HAND-BACK, VALVE ONLY (2026-11-02, Pegasus archive/valve_box_isolation_20261102):
+    // true = a guard abort that drops the room hold (the q3 / sway guards) and the room-hold
+    // leash ask the whole-body node's set_ee_anchor_com_fast (2026-11-01); false (the default)
+    // = the normal blend, as every box push flew up to 2026-10-27.
+    declare_parameter<bool>("push_pull_fast_hand_back", false);
+    // THE GRASP EVENT, VALVE ONLY (2026-11-02): true = push_pull/grasp is served -- the arm
+    // ground station reports the jaws closed on the handle (data true: the contact phase on)
+    // and about to open (data false: off), so a static hold has a planner event at the grasp
+    // and the contact flag is never inferred from the gripper's position. Refused on a
+    // straight push (push_pull_turn_deg 0): the box's contact starts at the Push press.
+    declare_parameter<bool>("push_pull_grasp_event", false);
     // (2026-10-22) the release wait on a MOCAP-GUARD abort [s]; < 0 = push_pull_abort_release_wait_s
     declare_parameter<double>("push_pull_abort_mocap_release_wait_s", -1.0);
     // THE UNBUCKLE (2026-10-21, archive/box_abort_unbuckle_20261021): true = an abort held
@@ -1458,6 +1469,10 @@ public:
         });
       // the release-window fix (2026-10-17): the station calls it as it opens the gripper
       pl_trigger(prefix + "/push_pull/release", [this](Trigger::Response::SharedPtr r) {onPlRelease(r);});
+      // the grasp event (2026-11-02, valve only: push_pull_grasp_event)
+      pl_grasp_srv_ = create_service<SetBool>(
+        prefix + "/push_pull/grasp",
+        [this](const SetBool::Request::SharedPtr q, SetBool::Response::SharedPtr r) {onPlGrasp(q->data, r);});
       for (int k = 0; k < kNumPushPullSteps; ++k) {
         pl_trigger(
           prefix + "/push_pull/" + pushPullStepName(k),
@@ -6195,6 +6210,7 @@ private:
       "push_pull_arrival_tol", "push_pull_leg_start_tol", "push_pull_adjust_max",
       "push_pull_abort_climb", "push_pull_abort_release_wait_s", "push_pull_guard_tilt_deg",
       "push_pull_abort_from_measured", "push_pull_abort_back", "push_pull_abort_release_world_held",
+      "push_pull_fast_hand_back", "push_pull_grasp_event",
       "push_pull_abort_mocap_release_wait_s",
       "push_pull_abort_unbuckle",
       "push_pull_exit_world_held_dz", "push_pull_exit_world_held_max_s",
@@ -7731,6 +7747,50 @@ private:
     RCLCPP_INFO(get_logger(), "push-and-pull %s", resp->message.c_str());
   }
 
+  // THE GRASP EVENT (2026-11-02, valve turning; Pegasus archive/valve_box_isolation_20261102).
+  // The 10-27 box push changed its phase only on planner events: the contact flag came on at
+  // the Push press, which the arm ground station sends on the jaws' stall. A valve STATIC HOLD
+  // has no Push, so until now the flight node read the gripper's own position instead -- and
+  // a closed empty gripper reads like a grasp. Here the station reports the jaws closed on the
+  // handle (true: the contact phase on) and about to open (false: off, the claw stays where it
+  // is held); the contact flag is never inferred from the jaw position. Refused unless the
+  // valve has a plan (push_pull_grasp_event, a turn), the claw is room-held on the handle after
+  // Ready and nothing is flying. A Turn after a grasp sets the flag again (unchanged).
+  void onPlGrasp(bool closed, SetBool::Response::SharedPtr resp)
+  {
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    std::string err;
+    if (!get_parameter("push_pull_grasp_event").as_bool()) {
+      err = "push_pull_grasp_event is false -- the grasp event belongs to valve turning";
+    } else if (get_parameter("push_pull_turn_deg").as_double() == 0.0) {
+      err = "a straight push -- the box's contact starts at the Push press";
+    } else if (!mode_direct_ || !hold_.has_value()) {
+      err = "not in whole-body DIRECT";
+    } else if (pl_flying_.has_value() || pl_aborting_ || pl_abort_plan_) {
+      err = std::string(pl_flying_.has_value() ? pushPullStepName(*pl_flying_) : "the abort") +
+        " is in flight -- wait for it, or Abort";
+    } else if (!pl_at_handle_) {
+      err = "the claw is not on the handle";
+    } else if (closed && pl_completed_ != kPlReady) {
+      err = "the grasp comes after Ready";
+    } else if (closed && (pl_handle_settling_ || !pp_anchor_world_)) {
+      err = "the claw is not held in the room yet -- wait for the hand-over";
+    }
+    if (!err.empty()) {
+      resp->success = false;
+      resp->message = std::string("grasp ") + (closed ? "on" : "off") + ": " + err;
+      RCLCPP_WARN(get_logger(), "push-and-pull %s", resp->message.c_str());
+      return;
+    }
+    requestContact(closed);
+    resp->success = true;
+    resp->message = closed ?
+      "grasp on: the jaws hold the handle -- the contact phase is on" :
+      "grasp off: the contact phase is free, the claw stays where it is held -- open the gripper";
+    RCLCPP_INFO(get_logger(), "push-and-pull %s", resp->message.c_str());
+    publishPlStatus();
+  }
+
   // ABORT: the GS opens the gripper on the same press; here the phase flag
   // goes back to free, the EE reference to the CoM, and the vehicle -- held
   // still push_pull_abort_release_wait_s first when the claw is on the handle,
@@ -7751,10 +7811,12 @@ private:
     bool measured = false;
     std::optional<VecN> unbuckle;
     bool drop_anchor = false;
+    bool fast_hand_back = false;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       // set by the guard that called this (sway, q3): consumed by every abort, run or refused
       drop_anchor = std::exchange(pl_abort_drop_anchor_, false);
+      fast_hand_back = get_parameter("push_pull_fast_hand_back").as_bool();
       if (!mode_direct_ || !hold_.has_value()) {
         resp->success = false;
         resp->message = "not in whole-body DIRECT -- use the drone ground station";
@@ -7879,7 +7941,8 @@ private:
       pl_abort_anchor_due_.reset();
       pl_exit_hold_z0_.reset();     // an abort in the exit's room-held climb owns the anchor now
       pl_exit_hold_t0_.reset();
-      if (!pl_abort_keep_anchor_) {restoreAnchor(drop_anchor);}   // a guard's drop: the FAST hand-back
+      // a guard's drop: the FAST hand-back -- valve only (push_pull_fast_hand_back, 2026-11-02)
+      if (!pl_abort_keep_anchor_) {restoreAnchor(drop_anchor && fast_hand_back);}
       if (touched) {
         if (pl_wp_.has_value()) {pl_leave_wp_ = pl_wp_;}   // Go To Land Start stays flyable
         pl_box_.reset();
@@ -7943,7 +8006,7 @@ private:
     m.setf(std::ios::fixed);
     m.precision(2);
     m << "ABORT: contact off, " << (wait > 0.0 ? (pl_abort_keep_anchor_ ? "release (claw world-held) " :
-      drop_anchor ? "release (the claw follows the vehicle at once) " : "release ") : "")
+      (drop_anchor && fast_hand_back) ? "release (the claw follows the vehicle at once) " : "release ") : "")
       << (retreat.norm() > 1e-3 ? "back " : "") << "then up " << climb << " m and the "
       << "arm home, from " << (measured ? "the MEASURED pose" : cut ? "the point the step was cut at" : "the hold");
     if (retreat.norm() > 1e-3) {m << " (back " << retreat.norm() << " m against the push first)";}
@@ -8323,7 +8386,8 @@ private:
             pl_leash_peak_ = e;
             pl_leash_since_.reset();
             pl_leash_ok_since_.reset();
-            restoreAnchor(true);   // the FAST hand-back (2026-11-01)
+            // the FAST hand-back (2026-11-01) -- valve only since 2026-11-02
+            restoreAnchor(get_parameter("push_pull_fast_hand_back").as_bool());
             RCLCPP_WARN(get_logger(), "push-and-pull: the base drifted %.0f mm from its CoM reference "
               "with the claw room-held above the handle (> push_pull_room_hold_leash %.0f mm) -- the claw "
               "follows the vehicle again so the arm stops absorbing it; the room hold re-engages once the "
@@ -9268,6 +9332,7 @@ private:
   rclcpp::TimerBase::SharedPtr pp_timer_;
   rclcpp::Subscription<Joy>::SharedPtr joy_sub_;
   rclcpp::Service<SetBool>::SharedPtr teleop_engage_srv_;
+  rclcpp::Service<SetBool>::SharedPtr pl_grasp_srv_;   // (2026-11-02) push_pull/grasp
   rclcpp::Service<Trigger>::SharedPtr teleop_home_srv_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr teleop_state_pub_, skeleton_pub_;
   rclcpp::Publisher<String>::SharedPtr teleop_note_pub_;
