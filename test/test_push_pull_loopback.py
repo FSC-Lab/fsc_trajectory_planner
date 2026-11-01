@@ -73,6 +73,13 @@ set_ee_anchor_com services that record what the planner asks for.
        CoM anchor AT ONCE even with push_pull_abort_release_world_held (the valve's free-handle
        release): "the world" is then EKF2 dead-reckoning; and a mocap fault confirmed DURING a
        world-held release (a force-guard abort) ends the world hold early
+  [9p] (2026-10-31, the 10-31 evening valve flight) the pre-grasp room hold: with the claw room-held
+       above the handle Ready is refused while the law's CoM error is over push_pull_ready_max_com_err
+       ("wait for it to settle"); past push_pull_room_hold_leash the room hold is released (the CoM
+       anchor, the status says so, Ready refused) and re-engaged once the base settles, Ready then
+       waiting push_pull_room_hold_reengage_s; on the room-held descent a CoM error over
+       push_pull_guard_ready_com_err aborts and hands the claw to the CoM anchor at once; a fast q3
+       fold in the hold is ignored without push_pull_guard_arm_before_handle and aborts with it.
   [9o] (2026-10-31) the flight node's emergency abort (push_pull/emergency_abort): ABORTING named
        as the flight node's, the configured release (world-held release on: no CoM anchor in the
        first 0.5 s), a second call answered "already aborting".
@@ -111,6 +118,7 @@ BOX_TOPIC = "/pl_rig/obj_0/mocap"
 FORCE_TOPIC = "/pl_rig/wb_control_debug"
 CONTACT_SRV = "/pl_rig/set_contact"
 ANCHOR_SRV = "/pl_rig/set_ee_anchor_com"
+FAST_SRV = ANCHOR_SRV + "_fast"            # (2026-11-01) the node's fast hand-back service
 GUARD_TOPIC = "/pl_rig/mocap_guard"        # the estimator's raw-mocap guard (2026-10-21)
 YAML = os.environ.get("PL_YAML", os.path.expanduser(
     "~/ros2_ws/src/fsc_autopilot_ros2/config/"
@@ -205,6 +213,7 @@ class Rig(Node):
         self.status = self.pl_status = self.info = self.arrival = None
         self.refs = []
         self.contact_calls, self.anchor_calls = [], []
+        self.fast_calls = []                   # (2026-11-01) requests through the FAST hand-back
         self.create_subscription(String, "whole_body_planner/status",
                                  lambda m: setattr(self, "status", m.data), LATCHED)
         self.create_subscription(String, "whole_body_planner/push_pull/status",
@@ -218,6 +227,7 @@ class Rig(Node):
             lambda m: self.refs.append((time.monotonic(), m)), 50)
         self.create_service(SetBool, CONTACT_SRV, self.on_contact)
         self.create_service(SetBool, ANCHOR_SRV, self.on_anchor)
+        self.create_service(SetBool, FAST_SRV, self.on_anchor_fast)
         self.cli = {n: self.create_client(Trigger, f"whole_body_planner/push_pull/{n}")
                     for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort", "emergency_abort", "release"]}
         self.params = self.create_client(SetParameters, "whole_body_trajectory_planner/set_parameters")
@@ -238,6 +248,7 @@ class Rig(Node):
         self.glitch_n = 0          # [9g] the next n box samples are the 10-21 mis-solve
         self.wobble = None         # [5] (amplitude m, frequency Hz): the body swings along x
         self.com_sway = None       # [9m] (amplitude m, frequency Hz): the law's CoM error swings along x
+        self.com_off = 0.0         # [9p] a static CoM error along x [m]
         self.rng = np.random.default_rng(0)
         self.create_timer(0.02, self.feed)
         self.create_timer(0.004, self.feed_force)    # the node's 250 Hz debug
@@ -250,6 +261,12 @@ class Rig(Node):
     def on_anchor(self, req, resp):
         self.anchor_calls.append(req.data)
         resp.success, resp.message = True, f"anchor com -> {req.data}"
+        return resp
+
+    def on_anchor_fast(self, req, resp):   # the same anchor state, flagged as the fast hand-back
+        self.anchor_calls.append(req.data)
+        self.fast_calls.append(req.data)
+        resp.success, resp.message = True, f"anchor com -> {req.data} (FAST)"
         return resp
 
     def feed(self):
@@ -301,6 +318,9 @@ class Rig(Node):
             a, f = self.com_sway
             data[45:48] = [1.0, 0.0, 1.0]
             data[48:51] = [1.0 + a * math.sin(2.0 * math.pi * f * time.monotonic()), 0.0, 1.0]
+        elif self.com_off != 0.0:       # [9p] x_c held off x_cd along x
+            data[45:48] = [1.0, 0.0, 1.0]
+            data[48:51] = [1.0 + self.com_off, 0.0, 1.0]
         d = Float32MultiArray()
         d.data = data
         self.force_pub.publish(d)
@@ -1233,6 +1253,117 @@ def main():
         rig.free_radius = 0.0
         print(f"[9n] the wrong sense refused at Plan: "
               f"{msg_wrong}; the right sense passes it (then: {r.message})")
+
+        # [9p] (2026-10-31) THE PRE-GRASP ROOM HOLD (the 10-31 evening valve flight: the base ran
+        # 22 cm with the claw room-held above the handle, the arm folded through q3 = 0 on the Ready
+        # descent, no guard armed). Live-set on this yaml: the room hold before Ready, the base gate,
+        # the leash, the descent guard, the arm guards before the handle.
+        set_param_bool(rig, "push_pull_world_anchor_ready", True)
+        set_param(rig, "push_pull_ready_max_com_err", 0.030)
+        set_param(rig, "push_pull_ready_max_com_speed", 0.060)
+        set_param(rig, "push_pull_room_hold_leash", 0.040)
+        set_param(rig, "push_pull_guard_ready_com_err", 0.060)
+        set_param_bool(rig, "push_pull_guard_arm_before_handle", False)
+
+        def above_handle(tag):
+            r = call(rig, "reset")
+            assert r.success, r.message
+            rig.box = BOX.copy()
+            rig.com_off = 0.0
+            time.sleep(0.6)
+            assert call(rig, "capture_box").success
+            assert call(rig, "plan").success
+            wait(lambda: rig.pl_status.startswith("READY"), 20, f"READY ({tag})")
+            n_w = len(rig.anchor_calls)
+            fly(rig, 0)
+            wait(lambda: rig.pl_status.startswith("DONE go_to_start"), 5, f"above the handle ({tag})")
+            assert False in rig.anchor_calls[n_w:], ("no room hold above the handle", rig.anchor_calls[n_w:])
+
+        above_handle("9p")
+        # the gate: 35 mm off (over the 30 mm gate, under the 40 mm leash) -- Ready refused
+        rig.com_off = 0.035
+        time.sleep(1.5)                                # past the room hold's 1.0 s blend wait
+        r = call(rig, "ready")
+        assert not r.success and "off its CoM reference" in r.message and "wait for it to settle" in r.message, \
+            ("Ready with the base 35 mm off", r.message)
+        msg_gate = r.message
+        # the leash: 50 mm -- the room hold released, the status says so, Ready refused
+        n_a = len(rig.anchor_calls)
+        n_f = len(rig.fast_calls)
+        rig.com_off = 0.050
+        wait(lambda: True in rig.anchor_calls[n_a:] and "ROOM HOLD RELEASED" in rig.pl_status, 2,
+             "the leash released the room hold")
+        assert rig.pl_status.startswith("DONE go_to_start"), rig.pl_status
+        # (2026-11-01) the leash's hand-back goes through the node's FAST service
+        assert rig.fast_calls[n_f:] == [True], ("the leash must use the FAST hand-back", rig.fast_calls[n_f:])
+        r = call(rig, "ready")
+        assert not r.success and "drifted" in r.message and "wait for it to settle" in r.message, \
+            ("Ready with the room hold released", r.message)
+        msg_leash = r.message
+        # settled: the room hold re-engages, Ready waits out the blend, then flies
+        n_b = len(rig.anchor_calls)
+        rig.com_off = 0.0
+        wait(lambda: False in rig.anchor_calls[n_b:] and "ROOM HOLD RELEASED" not in rig.pl_status, 2,
+             "the room hold re-engaged")
+        r = call(rig, "ready")
+        assert not r.success and "blending" in r.message, ("Ready right after the re-engage", r.message)
+        msg_blend = r.message
+        time.sleep(1.2)
+        rig.refs.clear()
+        r = call(rig, "ready")
+        assert r.success, ("Ready once settled", r.message)
+        wait(lambda: rig.status.startswith("EXECUTING"), 10, "Ready EXECUTING (9p)")
+        # the descent guard: 80 mm off on the room-held descent -- abort, the CoM anchor at once
+        n_c = len(rig.anchor_calls)
+        rig.com_off = 0.080
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 3, "the descent guard (9p)")
+        t_ab = time.monotonic()
+        assert "room-held descent" in rig.pl_status, rig.pl_status
+        rig.com_off = 0.0
+        wait(lambda: True in rig.anchor_calls[n_c:], 0.6, "the CoM anchor at once on a descent abort")
+        dt_p = time.monotonic() - t_ab
+        print(f"[9p] Ready refused 35 mm off: '{msg_gate}'")
+        print(f"[9p] leash at 50 mm: room hold released, Ready refused: '{msg_leash}'")
+        print(f"[9p] re-engaged once settled; Ready refused for the blend: '{msg_blend}'; then flown")
+        print(f"[9p] the descent guard at 80 mm: {rig.pl_status}; the CoM anchor {dt_p:.2f} s after ABORTING")
+        abort_done("9p")
+
+        # the arm guards before the handle: a fast q3 fold in the room hold above the handle
+        def fold_q3(to_deg, rate_deg_s):
+            q3 = rig.q[2]
+            step = math.radians(rate_deg_s) * 0.02 * (1 if math.radians(to_deg) > q3 else -1)
+            while abs(rig.q[2] - math.radians(to_deg)) > abs(step):
+                q = rig.q.copy()
+                q[2] += step
+                rig.q = q
+                time.sleep(0.02)
+            q = rig.q.copy()
+            q[2] = math.radians(to_deg)
+            rig.q = q
+
+        above_handle("9p-q3")
+        q3_0 = math.degrees(rig.q[2])
+        fold_q3(2.0, 60.0)                       # through the q3 guards' threshold, fast
+        time.sleep(1.0)
+        assert rig.pl_status.startswith("DONE go_to_start"), ("a fold tripped without the option", rig.pl_status)
+        fold_q3(q3_0, 60.0)
+        time.sleep(0.6)
+        set_param_bool(rig, "push_pull_guard_arm_before_handle", True)
+        time.sleep(0.3)
+        n_d = len(rig.anchor_calls)
+        fold_q3(2.0, 60.0)
+        wait(lambda: rig.pl_status.startswith("ABORTING"), 3, "the q3 guard before the handle (9p)")
+        assert "q3" in rig.pl_status, rig.pl_status
+        wait(lambda: True in rig.anchor_calls[n_d:], 0.6, "the CoM anchor at once on a q3 abort")
+        print(f"[9p] a 60 deg/s q3 fold above the handle: ignored without push_pull_guard_arm_before_handle, "
+              f"with it: {rig.pl_status}")
+        abort_done("9p-q3")
+        fold_q3(q3_0, 200.0)
+        for k in ("push_pull_ready_max_com_err", "push_pull_ready_max_com_speed", "push_pull_room_hold_leash",
+                  "push_pull_guard_ready_com_err"):
+            set_param(rig, k, _yaml_num(k, 0.0))
+        set_param_bool(rig, "push_pull_guard_arm_before_handle", _yaml_bool("push_pull_guard_arm_before_handle", False))
+        set_param_bool(rig, "push_pull_world_anchor_ready", WORLD_ANCHOR_READY)
 
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))

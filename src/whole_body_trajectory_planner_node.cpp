@@ -954,6 +954,30 @@ public:
     // settle" (the arm GS's automatic Ready retries). 0 = off.
     declare_parameter<double>("push_pull_ready_max_speed", 0.0);
     declare_parameter<double>("push_pull_ready_settle_s", 0.0);
+    // THE PRE-GRASP ROOM HOLD (2026-10-31, Pegasus archive valve_room_hold_guards_20261031; the
+    // 10-31 evening hardware valve flight): from the end of Go To Start the claw is held in the
+    // ROOM (push_pull_world_anchor_ready), so every base motion becomes arm motion while the claw
+    // itself stays still -- the claw checks above cannot see the base running. That evening the
+    // base drifted 54 mm in the 1.2 s hold, Ready started with the CoM 67 mm off its reference and
+    // moving 116 mm/s, and the arm took it up until the elbow straightened (q3 through 0 0.2 s
+    // into the descent) with no guard armed. All off at 0 (unchanged).
+    // ready_max_com_err / _com_speed [m, m/s] > 0: Ready also needs the law's horizontal CoM error
+    // ||x_c - x_cd||_xy (wb_control_debug [48..49] - [45..46]) and its rate (the sway guard's
+    // filter) below these for ready_com_settle_s; refused with "wait for it to settle" (the arm GS's
+    // automatic Ready retries). At Ready: 197 recorded Isaac valve runs <= 25 mm / 51 mm/s, the six
+    // earlier hardware flights 14-35 mm / 6-59 mm/s, the 10-31 evening 68 mm / 116 mm/s.
+    declare_parameter<double>("push_pull_ready_max_com_err", 0.0);
+    declare_parameter<double>("push_pull_ready_max_com_speed", 0.0);
+    declare_parameter<double>("push_pull_ready_com_settle_s", 0.3);
+    // room_hold_leash [m] > 0: with the claw room-held above the handle (Go To Start done, no step
+    // flying), a CoM error above it for 0.1 s hands the claw back to the CoM anchor -- the arm
+    // stops absorbing the drift, nothing aborts -- and Ready is refused until the base has settled
+    // (below ready_max_com_err, else half the leash, and ready_max_com_speed, for
+    // ready_com_settle_s), the room hold has re-engaged and room_hold_reengage_s has passed (the
+    // node blends the anchor over its wb_ee_anchor_blend_s). Holds: Isaac <= 31 mm, hardware
+    // 20-48 mm; the 10-31 evening crossed 40 mm 1.1 s into its hold.
+    declare_parameter<double>("push_pull_room_hold_leash", 0.0);
+    declare_parameter<double>("push_pull_room_hold_reengage_s", 1.0);
     // ... and through the PUSH (2026-10-04, after the first three flights):
     // true = the claw follows the PLANNED world path while the box is
     // clamped. With the CoM anchor a base offset drags the claw reference,
@@ -1108,6 +1132,18 @@ public:
     declare_parameter<double>("push_pull_guard_sway_speed", 0.0);
     declare_parameter<double>("push_pull_guard_sway_filter_s", 0.25);
     declare_parameter<double>("push_pull_guard_sway_persist_s", 0.20);
+    // BEFORE THE HANDLE (2026-10-31, valve_room_hold_guards_20261031): the guards above were
+    // engaged only with the claw on the handle or the push flying, so the room hold above the
+    // handle and the Ready descent onto it had no arm or sway guard (the 10-31 evening fold ran
+    // 0.5 s unguarded until the operator aborted). guard_arm_before_handle: the q3 guards (static
+    // and rate) and the sway guard are armed there too while the claw is room-held. Replayed: the
+    // 10-31 evening trips 0.8 s before the operator; no earlier hardware or Isaac pre-grasp phase
+    // trips. guard_ready_com_err [m] > 0: during the room-held Ready descent a CoM error above it
+    // for guard_sway_persist_s aborts, letting go of the room hold (the descent cannot switch
+    // anchors half-way). Descents: Isaac <= 37 mm, hardware 28-74 mm (the 74 with the undamped
+    // wrist of 10-31 afternoon), the 10-31 evening 189 mm.
+    declare_parameter<bool>("push_pull_guard_arm_before_handle", false);
+    declare_parameter<double>("push_pull_guard_ready_com_err", 0.0);
     // PATH FOLLOWING FOR THE TURN (2026-10-18; push_pull_turn_deg != 0 only):
     // true = the turn is flown at a GOVERNED PROGRESS (ProgressGovernor) in
     // place of the wall clock -- the same rigid rotation, its schedule slowed or
@@ -1353,6 +1389,12 @@ public:
     // body's pose -> pick_place_place_point x, y, z (the arm GS's Place-row Get)
     trigger(prefix + "/pick_place/get_place", [this](Trigger::Response::SharedPtr r) {onPpGetPlace(r);});
     anchor_cli_ = create_client<SetBool>(get_parameter("pick_place_anchor_service").as_string());
+    // THE FAST HAND-BACK (2026-11-01, Pegasus archive/two_param_sets_20261101): the leash and
+    // the guard aborts hand the claw back to the vehicle through the node's _fast service,
+    // which blends over its wb_ee_anchor_fast_blend_s; an older node has no such service
+    // and the normal one is used (its 1.0 s blend -- a third of the 10-31 evening's run)
+    anchor_fast_cli_ = create_client<SetBool>(
+      get_parameter("pick_place_anchor_service").as_string() + "_fast");
     for (int k = 0; k < kNumPickPlaceLegs; ++k) {
       trigger(
         prefix + "/pick_place/" + pickPlaceLegName(k),
@@ -1601,6 +1643,8 @@ private:
       if (direct == mode_direct_) {return;}
       mode_direct_ = direct;
       pp_anchor_world_ = false;          // the whole-body node restores its yaml anchor itself
+      pl_world_since_.reset();
+      pl_leash_released_ = false;
       if (direct) {
         const auto rest = restFromMeasurements();
         if (!rest.has_value()) {
@@ -1947,8 +1991,8 @@ private:
     const double tau = get_parameter("push_pull_guard_q3_lookahead_s").as_double();
     const double lim = get_parameter("push_pull_guard_q3_min_deg").as_double();
     const bool pushing = pl_flying_.has_value() && *pl_flying_ == kPlPush;
-    const bool engaged = mode_direct_ && hold_.has_value() && (pl_at_handle_ || pushing) &&
-      !pl_aborting_ && !pl_abort_plan_;
+    const bool engaged = (mode_direct_ && hold_.has_value() && (pl_at_handle_ || pushing) &&
+      !pl_aborting_ && !pl_abort_plan_) || plGuardsBeforeHandle();
     if (tau <= 0.0 || lim <= 0.0 || !engaged) {
       pl_q3r_since_.reset();
       return false;
@@ -5080,25 +5124,68 @@ private:
   // Ask the whole-body node for the CoM (com = true) or world anchor. Fire and
   // forget: the node blends over its own wb_ee_anchor_blend_s, refuses outside
   // DIRECT, and restores its yaml anchor on every mode change by itself.
-  void requestAnchor(bool com)
+  // fast = the node's _fast service (a CoM hand-back blended over its
+  // wb_ee_anchor_fast_blend_s): the leash and the guard aborts, where a running
+  // base must stop loading the arm at once
+  void requestAnchor(bool com, bool fast = false)
   {
+    if (com) {
+      pl_world_since_.reset();
+    } else if (!pp_anchor_world_) {
+      pl_world_since_ = Clock::now();   // the room hold's age (push_pull_room_hold_reengage_s)
+    }
     pp_anchor_world_ = !com;
-    if (!anchor_cli_ || !anchor_cli_->service_is_ready()) {
+    auto cli = anchor_cli_;
+    bool via_fast = false;
+    if (fast && com && anchor_fast_cli_ && anchor_fast_cli_->service_is_ready()) {
+      cli = anchor_fast_cli_;
+      via_fast = true;
+    } else if (fast && com) {
+      RCLCPP_WARN(get_logger(), "EE-anchor FAST hand-back service %s not available (older node) -- "
+        "the normal blend", anchor_fast_cli_ ? anchor_fast_cli_->get_service_name() : "?");
+    }
+    if (!cli || !cli->service_is_ready()) {
       RCLCPP_WARN(get_logger(), "EE-anchor service %s not available -- anchor unchanged",
-        anchor_cli_ ? anchor_cli_->get_service_name() : "?");
+        cli ? cli->get_service_name() : "?");
       return;
     }
     auto req = std::make_shared<SetBool::Request>();
     req->data = com;
-    anchor_cli_->async_send_request(req);
-    RCLCPP_INFO(get_logger(), "pick-and-place: EE anchor -> %s", com ? "CoM" : "WORLD");
+    cli->async_send_request(req);
+    RCLCPP_INFO(get_logger(), "pick-and-place: EE anchor -> %s%s", com ? "CoM" : "WORLD",
+      via_fast ? " (FAST hand-back)" : "");
   }
 
   // Any new motion that is not a claw leg's own wait / descent / grasp
   // returns to the CoM anchor.
-  void restoreAnchor()
+  void restoreAnchor(bool fast = false)
   {
-    if (pp_anchor_world_) {requestAnchor(true);}
+    if (pp_anchor_world_) {requestAnchor(true, fast);}
+  }
+
+  // THE PRE-GRASP ROOM HOLD (2026-10-31): holding above the handle -- Go To Start done, no step
+  // or abort in flight, the claw not yet on the handle -- whatever the anchor
+  bool plAboveHandle() const
+  {
+    return mode_direct_ && hold_.has_value() && pl_wp_.has_value() && !pl_at_handle_ &&
+           !pl_aborting_ && !pl_abort_plan_ && !pl_flying_.has_value() && pl_completed_ == kPlGoToStart;
+  }
+
+  // ... and room-held there, or on the room-held Ready descent: the arm absorbs the base's motion
+  bool plPreGraspRoomHeld() const
+  {
+    if (!mode_direct_ || !hold_.has_value() || !pl_wp_.has_value() || pl_at_handle_ ||
+      pl_aborting_ || pl_abort_plan_ || !pp_anchor_world_)
+    {
+      return false;
+    }
+    return pl_flying_.has_value() ? *pl_flying_ == kPlReady : pl_completed_ == kPlGoToStart;
+  }
+
+  // push_pull_guard_arm_before_handle: the arm and sway guards armed in the pre-grasp room hold
+  bool plGuardsBeforeHandle() const
+  {
+    return get_parameter("push_pull_guard_arm_before_handle").as_bool() && plPreGraspRoomHeld();
   }
 
   void onPpReset(Trigger::Response::SharedPtr resp)
@@ -6119,6 +6206,9 @@ private:
       "push_pull_guard_q3_rate_persist_s", "push_pull_guard_q3_rate_filter_s",
       "push_pull_guard_q2_max_deg",
       "push_pull_guard_sway_speed", "push_pull_guard_sway_filter_s", "push_pull_guard_sway_persist_s",
+      "push_pull_guard_arm_before_handle", "push_pull_guard_ready_com_err",
+      "push_pull_ready_max_com_err", "push_pull_ready_max_com_speed", "push_pull_ready_com_settle_s",
+      "push_pull_room_hold_leash", "push_pull_room_hold_reengage_s",
       "push_pull_box_gate_jump_m", "push_pull_box_gate_jump_deg",
       "push_pull_descent_trim", "push_pull_descent_trim_window_s", "push_pull_descent_trim_max",
       "push_pull_world_anchor_ready", "push_pull_world_anchor_push", "push_pull_contact",
@@ -6632,15 +6722,18 @@ private:
     const bool pushing = pl_flying_.has_value() && *pl_flying_ == kPlPush;
     const bool engaged = mode_direct_ && hold_.has_value() && (pl_at_handle_ || pushing) &&
       !pl_aborting_ && !pl_abort_plan_;
-    if (!engaged) {
+    // (2026-10-31) the arm's half -- joint states silent, the static q3 guard -- also in the
+    // pre-grasp room hold (push_pull_guard_arm_before_handle); the box feed's only on the handle
+    const bool before = !engaged && plGuardsBeforeHandle();
+    if (!engaged && !before) {
       pl_bg_q3_since_.reset();
       return false;
     }
     std::ostringstream m;
     m.setf(std::ios::fixed);
-    const bool box_armed = get_parameter("push_pull_guard_box_lag").as_double() > 0.0 ||
+    const bool box_armed = engaged && (get_parameter("push_pull_guard_box_lag").as_double() > 0.0 ||
       get_parameter("push_pull_guard_box_tilt_deg").as_double() > 0.0 ||
-      get_parameter("push_pull_guard_box_cross").as_double() > 0.0;
+      get_parameter("push_pull_guard_box_cross").as_double() > 0.0);
     const double stale = get_parameter("push_pull_guard_box_stale_s").as_double();
     const double age = pl_mocap_.empty() ? 1e9 : secondsSince(pl_mocap_.back().t);
     // A FROZEN feed counts as a silent one (2026-10-19, the hardware box push):
@@ -7249,6 +7342,37 @@ private:
             << " mm/s for " << std::setprecision(1) << held << " of "
             << get_parameter("push_pull_ready_settle_s").as_double() << " s) -- wait for it to settle";
           err = w.str();
+        } else if (get_parameter("push_pull_room_hold_leash").as_double() > 0.0 && pl_leash_released_) {
+          // THE PRE-GRASP ROOM HOLD (2026-10-31): the leash let go of it -- a descent now would
+          // fly CoM-anchored, the one the room hold replaced
+          w << std::setprecision(0) << "the base drifted " << pl_leash_peak_ * 1e3
+            << " mm from its CoM reference with the claw room-held (> push_pull_room_hold_leash "
+            << get_parameter("push_pull_room_hold_leash").as_double() * 1e3
+            << " mm): the claw follows the vehicle until the base settles, then the room hold "
+               "re-engages -- wait for it to settle";
+          err = w.str();
+        } else if (get_parameter("push_pull_room_hold_leash").as_double() > 0.0 &&
+          get_parameter("push_pull_world_anchor_ready").as_bool() &&
+          secondsSince(pl_world_since_) < get_parameter("push_pull_room_hold_reengage_s").as_double())
+        {
+          w << std::setprecision(1) << "the room hold above the handle engaged "
+            << std::min(secondsSince(pl_world_since_), 99.0) << " s ago (< push_pull_room_hold_reengage_s "
+            << get_parameter("push_pull_room_hold_reengage_s").as_double()
+            << " s: the anchor is still blending) -- wait for it to settle";
+          err = w.str();
+        } else if (get_parameter("push_pull_ready_max_com_err").as_double() > 0.0 &&
+          (!pl_com_ok_since_.has_value() ||
+           secondsSince(pl_com_ok_since_) < get_parameter("push_pull_ready_com_settle_s").as_double()))
+        {
+          const double held = pl_com_ok_since_.has_value() ? secondsSince(pl_com_ok_since_) : 0.0;
+          w << std::setprecision(0) << "the vehicle is " << pl_sway_e_.norm() * 1e3
+            << " mm off its CoM reference, moving " << pl_sway_v_.norm() * 1e3
+            << " mm/s (the room-held claw cannot show it; Ready needs < "
+            << get_parameter("push_pull_ready_max_com_err").as_double() * 1e3 << " mm and "
+            << get_parameter("push_pull_ready_max_com_speed").as_double() * 1e3 << " mm/s for "
+            << std::setprecision(1) << get_parameter("push_pull_ready_com_settle_s").as_double()
+            << " s, held " << held << " s) -- wait for it to settle";
+          err = w.str();
         } else if (plTrim().norm() > get_parameter("push_pull_descent_trim_max").as_double()) {
           w << "the claw holds " << plTrim().norm() * 1e3 << " mm off the point above the handle on "
             "average (> push_pull_descent_trim_max " <<
@@ -7506,6 +7630,8 @@ private:
       case kPlGoToStart:
         pl_at_handle_ = false;
         pl_trim_buf_.clear();
+        pl_leash_released_ = false;
+        pl_com_ok_since_.reset();
         // from the hover above the handle through the descent and the grasp
         // the claw is held in the WORLD (the pick's validated anchor) -- and
         // through the push too with push_pull_world_anchor_push
@@ -7753,7 +7879,7 @@ private:
       pl_abort_anchor_due_.reset();
       pl_exit_hold_z0_.reset();     // an abort in the exit's room-held climb owns the anchor now
       pl_exit_hold_t0_.reset();
-      if (!pl_abort_keep_anchor_) {restoreAnchor();}
+      if (!pl_abort_keep_anchor_) {restoreAnchor(drop_anchor);}   // a guard's drop: the FAST hand-back
       if (touched) {
         if (pl_wp_.has_value()) {pl_leave_wp_ = pl_wp_;}   // Go To Land Start stays flyable
         pl_box_.reset();
@@ -8153,7 +8279,7 @@ private:
       }
       const double sway_lim = get_parameter("push_pull_guard_sway_speed").as_double();
       const bool sway_armed = sway_lim > 0.0 && mode_direct_ &&
-        (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush)) &&
+        (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush) || plGuardsBeforeHandle()) &&
         !pl_aborting_ && !pl_abort_plan_ && secondsSince(pl_sway_t_) < 0.1;
       if (!sway_armed || pl_sway_v_.norm() <= sway_lim) {
         pl_sway_since_.reset();
@@ -8173,6 +8299,83 @@ private:
           pl_abort_drop_anchor_ = true;
           pl_sway_since_.reset();
           trip = true;
+        }
+      }
+      // THE PRE-GRASP ROOM HOLD (2026-10-31; the parameters' comment has the why): the Ready
+      // gate's settle, the leash in the hold above the handle, the room-held descent's guard
+      {
+        const bool fresh = secondsSince(pl_sway_t_) < 0.1;
+        const double e = pl_sway_e_.norm(), v = pl_sway_v_.norm();
+        const double em = get_parameter("push_pull_ready_max_com_err").as_double();
+        const double vm = get_parameter("push_pull_ready_max_com_speed").as_double();
+        const double leash = get_parameter("push_pull_room_hold_leash").as_double();
+        const bool slow = vm <= 0.0 || v <= vm;
+        if (fresh && em > 0.0 && e <= em && slow) {
+          if (!pl_com_ok_since_.has_value()) {pl_com_ok_since_ = now;}
+        } else {
+          pl_com_ok_since_.reset();
+        }
+        const bool above = plAboveHandle();
+        if (leash > 0.0 && above && pp_anchor_world_ && !pl_leash_released_ && fresh && e > leash) {
+          if (!pl_leash_since_.has_value()) {pl_leash_since_ = now;}
+          if (secondsSince(pl_leash_since_) >= kPlLeashPersistS) {
+            pl_leash_released_ = true;
+            pl_leash_peak_ = e;
+            pl_leash_since_.reset();
+            pl_leash_ok_since_.reset();
+            restoreAnchor(true);   // the FAST hand-back (2026-11-01)
+            RCLCPP_WARN(get_logger(), "push-and-pull: the base drifted %.0f mm from its CoM reference "
+              "with the claw room-held above the handle (> push_pull_room_hold_leash %.0f mm) -- the claw "
+              "follows the vehicle again so the arm stops absorbing it; the room hold re-engages once the "
+              "base settles, and Ready waits for it", e * 1e3, leash * 1e3);
+            publishPlStatus();   // the status names it
+          }
+        } else {
+          pl_leash_since_.reset();
+        }
+        if (pl_leash_released_) {
+          pl_leash_peak_ = std::max(pl_leash_peak_, fresh ? e : 0.0);
+          const double back = em > 0.0 ? em : 0.5 * leash;
+          if (!above) {
+            pl_leash_released_ = false;          // a step, an abort or a mode change took over
+            pl_leash_ok_since_.reset();
+          } else if (fresh && e <= back && slow) {
+            if (!pl_leash_ok_since_.has_value()) {pl_leash_ok_since_ = now;}
+            if (secondsSince(pl_leash_ok_since_) >=
+              get_parameter("push_pull_ready_com_settle_s").as_double())
+            {
+              pl_leash_released_ = false;
+              pl_leash_ok_since_.reset();
+              requestAnchor(false);
+              RCLCPP_INFO(get_logger(), "push-and-pull: the base settled within %.0f mm of its CoM "
+                "reference (peak %.0f mm) -- the claw is room-held above the handle again", back * 1e3,
+                pl_leash_peak_ * 1e3);
+              publishPlStatus();
+            }
+          } else {
+            pl_leash_ok_since_.reset();
+          }
+        }
+        const double gr = get_parameter("push_pull_guard_ready_com_err").as_double();
+        const bool descending = gr > 0.0 && fresh && plPreGraspRoomHeld() &&
+          pl_flying_.has_value() && *pl_flying_ == kPlReady;
+        if (!trip && descending && e > gr) {
+          if (!pl_ready_com_since_.has_value()) {pl_ready_com_since_ = now;}
+          if (secondsSince(pl_ready_com_since_) >= get_parameter("push_pull_guard_sway_persist_s").as_double()) {
+            std::ostringstream m;
+            m.setf(std::ios::fixed);
+            m.precision(0);
+            m << "the base is " << e * 1e3 << " mm off its CoM reference on the room-held descent (> "
+              << gr * 1e3 << " mm, push_pull_guard_ready_com_err; moving " << v * 1e3
+              << " mm/s): the arm is absorbing it toward a straight elbow";
+            pl_guard_reason_ = m.str();
+            pl_guard_tripped_ = true;
+            pl_abort_drop_anchor_ = true;
+            pl_ready_com_since_.reset();
+            trip = true;
+          }
+        } else {
+          pl_ready_com_since_.reset();
         }
       }
       if (trip) {
@@ -8516,6 +8719,11 @@ private:
         m << "DONE go_to_start next=ready (the gripper opens first) -- claw " << std::setprecision(0)
           << pl_last_err_ * 1e3 << " mm from the point above the handle (tolerance "
           << get_parameter("push_pull_arrival_tol").as_double() * 1e3 << " mm)";
+        // THE LEASH (2026-10-31): same first words, so the arm GS's edges hold
+        if (pl_leash_released_) {
+          m << " -- ROOM HOLD RELEASED: the base drifted " << pl_leash_peak_ * 1e3
+            << " mm; the claw follows the vehicle until it settles";
+        }
       } else if (pl_completed_ == kPlReady && pl_handle_settling_) {
         // THE HAND-OVER SETTLE (2026-10-24): same first two words, so the arm GS's edges hold
         m << "DONE ready next=push (settling: the claw " << std::setprecision(0) << pl_last_err_ * 1e3
@@ -8847,6 +9055,7 @@ private:
   bool pp_aborted_{false};                      // until the next pick-and-place action
   // phase-dependent EE anchor (pick_place_world_anchor_*)
   rclcpp::Client<SetBool>::SharedPtr anchor_cli_;
+  rclcpp::Client<SetBool>::SharedPtr anchor_fast_cli_;   // (2026-11-01) the fast hand-back
   bool pp_anchor_world_{false};                 // the whole-body node was asked for WORLD
   OnSetParametersCallbackHandle::SharedPtr pp_param_cb_;
   // push-and-pull mode (push_pull.hpp)
@@ -8922,6 +9131,13 @@ private:
   // was read, and since when the rate is over the limit
   Eigen::Vector2d pl_sway_e_{Eigen::Vector2d::Zero()}, pl_sway_v_{Eigen::Vector2d::Zero()};
   std::optional<Clock::time_point> pl_sway_t_, pl_sway_since_;
+  // the pre-grasp room hold (2026-10-31): the Ready gate's settle, the leash, the descent guard,
+  // the room hold's age
+  std::optional<Clock::time_point> pl_com_ok_since_, pl_leash_since_, pl_leash_ok_since_, pl_ready_com_since_;
+  std::optional<Clock::time_point> pl_world_since_;
+  bool pl_leash_released_{false};
+  double pl_leash_peak_{0.0};
+  static constexpr double kPlLeashPersistS = 0.1;
   // set by the guards that mean "the vehicle is running away from the clamped claw" (the
   // sway guard, the q3 guards): that abort lets go of the room hold at once (onPlAbort)
   bool pl_abort_drop_anchor_{false};
