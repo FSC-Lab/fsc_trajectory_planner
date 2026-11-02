@@ -1318,7 +1318,7 @@ std::unique_ptr<Trajectory> planPushPullLand(
 std::unique_ptr<Trajectory> planPushPullAbort(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from, double climb, double release_wait,
-  const Vec3 & retreat, const std::optional<VecN> & unbuckle)
+  const Vec3 & retreat, const std::optional<VecN> & unbuckle, double fast_climb, double fast_climb_T)
 {
   RestSpec back = from;
   back.x_b += Vec3(retreat(0), retreat(1), 0.0);
@@ -1350,7 +1350,19 @@ std::unique_ptr<Trajectory> planPushPullAbort(
         segs.push_back(std::make_shared<PauseTrajectory>(v.params, from, release_wait));
       }
       if (retreating) {segs.push_back(transitionLeg(v, transition, opts, from, back));}
-      if (climb > 1e-3) {segs.push_back(transitionLeg(v, transition, opts, back, up));}
+      const size_t n_before_climb = segs.size();
+      // the fast first part of the climb (2026-11-02): the arm as it was, the rest carries it
+      const double fc = std::min(std::max(0.0, fast_climb), std::max(0.0, climb));
+      RestSpec mid = back;
+      if (climb > 1e-3 && fc > 1e-3 && fast_climb_T > 0.0) {
+        mid.x_b(2) += fc;
+        segs.push_back(transitionLeg(v, transition, timedOptions(opts, fc, fast_climb_T), back, mid));
+      }
+      if (climb - (segs.size() > n_before_climb ? fc : 0.0) > 1e-3) {
+        segs.push_back(transitionLeg(v, transition, opts, segs.size() > n_before_climb ? mid : back, up));
+      } else if (segs.size() > n_before_climb) {
+        up = mid;   // the whole climb was fast: the fold starts from it (the unbuckle folds with it)
+      }
       if ((up.q - c.home).cwiseAbs().maxCoeff() > 1e-6 ||
         (segs.size() == (release_wait > 0.0 ? 1u : 0u) + (retreating ? 1u : 0u)))
       {

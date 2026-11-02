@@ -1031,6 +1031,45 @@ public:
     // and the contact flag is never inferred from the gripper's position. Refused on a
     // straight push (push_pull_turn_deg 0): the box's contact starts at the Push press.
     declare_parameter<bool>("push_pull_grasp_event", false);
+    // THE EXIT-WINDOW ABORT (2026-11-02, valve; Pegasus archive/wb_valve_turning_flight_20261101):
+    // true = an abort while the fingers may still be around the handle -- after the push / turn
+    // or a static hold's release (the claw still on the handle, held in the room), or in the
+    // exit's room-held climb -- keeps the claw HELD IN THE ROOM until it has climbed
+    // push_pull_exit_world_held_dz (at most push_pull_exit_world_held_max_s after the release
+    // wait), whatever guard fired, then the CoM anchor. On 11-01 a sway-guard abort handed the
+    // claw to the swinging base at fin height and the open fingers swept across the fin. A
+    // mocap-guard abort still hands back at once (the room is then EKF2 dead-reckoning).
+    // false (the default) = unchanged.
+    declare_parameter<bool>("push_pull_abort_exit_hold", false);
+    // CLIMB ON OPEN (2026-11-02, valve; Pegasus archive/valve_cup_abort_20261102): true = an abort
+    // with the claw on the handle holds where it starts only until the arm ground station reports
+    // the jaws FULLY OPEN (push_pull/abort_jaws_open, sent on the open goal's result) and climbs
+    // at that instant -- no fixed release window. Without a report within
+    // push_pull_abort_open_timeout_s [s] (the station down, the WiFi lost, an open that failed) it
+    // climbs anyway. An abort in the exit's climb (the jaws opened before it) climbs at once.
+    // false (the default) = the fixed push_pull_abort_release_wait_s (unchanged).
+    declare_parameter<bool>("push_pull_abort_climb_on_open", false);
+    declare_parameter<double>("push_pull_abort_open_timeout_s", 3.0);
+    // (2026-11-02, valve) true = EVERY abort hands the claw back to the vehicle through the
+    // whole-body node's fast blend (set_ee_anchor_com_fast), not only the guards that drop the
+    // room hold: the claw follows the drone from the first tick of the abort. false = unchanged.
+    declare_parameter<bool>("push_pull_abort_fast_follow", false);
+    // THE JAWS READ OPEN (2026-11-02, with push_pull_abort_climb_on_open): the gripper's own joint
+    // state, read here -- the climb does not wait for the arm GS's report (two WiFi hops on
+    // hardware). The joint push_pull_abort_gripper_joint on push_pull_abort_gripper_topic (relative
+    // to the vehicle namespace; read at start-up; empty = only the GS's report) reads OPEN at or
+    // above push_pull_abort_gripper_open_at. Hardware: fsc_open_manipulator/joint_states,
+    // gripper_left_joint, 0.017 m (open 0.019, the gripper controller's goal tolerance 0.002);
+    // Isaac: isaacsim_manipulator/gripper_state, gripper_joint, -0.03 rad (open 0).
+    declare_parameter<std::string>("push_pull_abort_gripper_topic", "");
+    declare_parameter<std::string>("push_pull_abort_gripper_joint", "");
+    declare_parameter<double>("push_pull_abort_gripper_open_at", 0.0);
+    // THE FAST FIRST CLIMB (2026-11-02, valve): the abort's climb begins with
+    // push_pull_abort_fast_climb [m] in push_pull_abort_fast_climb_s [s] as its own leg, the bounds
+    // opened just enough for it, so the open fingers leave the handle's height at once; the rest of
+    // the climb at the usual bounds. 0 = off (the whole climb at the usual bounds, unchanged).
+    declare_parameter<double>("push_pull_abort_fast_climb", 0.0);
+    declare_parameter<double>("push_pull_abort_fast_climb_s", 0.8);
     // (2026-10-22) the release wait on a MOCAP-GUARD abort [s]; < 0 = push_pull_abort_release_wait_s
     declare_parameter<double>("push_pull_abort_mocap_release_wait_s", -1.0);
     // THE UNBUCKLE (2026-10-21, archive/box_abort_unbuckle_20261021): true = an abort held
@@ -1473,6 +1512,9 @@ public:
       pl_grasp_srv_ = create_service<SetBool>(
         prefix + "/push_pull/grasp",
         [this](const SetBool::Request::SharedPtr q, SetBool::Response::SharedPtr r) {onPlGrasp(q->data, r);});
+      // the jaws' OPEN report during an abort (2026-11-02: push_pull_abort_climb_on_open)
+      pl_trigger(prefix + "/push_pull/abort_jaws_open",
+        [this](Trigger::Response::SharedPtr r) {onPlAbortJawsOpen(r);});
       for (int k = 0; k < kNumPushPullSteps; ++k) {
         pl_trigger(
           prefix + "/push_pull/" + pushPullStepName(k),
@@ -1528,6 +1570,18 @@ public:
       odom_topic, 10, [this](const Odometry & m) {onOdom(m);});
     js_sub_ = create_subscription<JointState>(
       js_topic, 10, [this](const JointState & m) {onJointStates(m);});
+    {
+      // the gripper's own joint state for the abort's climb (push_pull_abort_gripper_*, 2026-11-02)
+      const std::string gt = get_parameter("push_pull_abort_gripper_topic").as_string();
+      pl_grip_joint_ = get_parameter("push_pull_abort_gripper_joint").as_string();
+      pl_grip_open_at_ = get_parameter("push_pull_abort_gripper_open_at").as_double();
+      if (!gt.empty() && !pl_grip_joint_.empty()) {
+        pl_grip_sub_ = create_subscription<JointState>(
+          gt, rclcpp::SensorDataQoS(), [this](const JointState & m) {onPlGripperState(m);});
+        RCLCPP_INFO(get_logger(), "push-and-pull: an abort's jaws read OPEN when '%s' on '%s' is at or above "
+          "%.4f (push_pull_abort_gripper_*)", pl_grip_joint_.c_str(), gt.c_str(), pl_grip_open_at_);
+      }
+    }
     ee_sub_ = create_subscription<PoseStamped>(
       prefix + "/ee_target", 10, [this](const PoseStamped & m) {onEeTarget(m);});
 
@@ -1720,6 +1774,10 @@ private:
         pl_abort_anchor_due_.reset();
         pl_exit_hold_z0_.reset();
         pl_exit_hold_t0_.reset();
+        pl_exit_hold_abort_ = false;
+        pl_exit_window_ = false;
+        pl_abort_open_wait_ = false;
+        pl_abort_open_seen_ = false;
         pl_mg_aborted_ = false;
         ++pl_gen_;
         if (teleop_) {
@@ -2801,6 +2859,7 @@ private:
           RCLCPP_WARN(get_logger(), "push-and-pull: ABORT complete -- holding, arm home.");
           pl_at_handle_ = false;
           pl_handle_settling_ = false;
+          pl_abort_open_wait_ = false;
         }
         pl_abort_plan_.reset();
         if (pl_flying_.has_value() && pl_exec_plan_ && pl_exec_plan_ == plan_) {
@@ -6211,6 +6270,9 @@ private:
       "push_pull_abort_climb", "push_pull_abort_release_wait_s", "push_pull_guard_tilt_deg",
       "push_pull_abort_from_measured", "push_pull_abort_back", "push_pull_abort_release_world_held",
       "push_pull_fast_hand_back", "push_pull_grasp_event",
+      "push_pull_abort_climb_on_open", "push_pull_abort_open_timeout_s", "push_pull_abort_fast_follow",
+      "push_pull_abort_gripper_topic", "push_pull_abort_gripper_joint", "push_pull_abort_gripper_open_at",
+      "push_pull_abort_fast_climb", "push_pull_abort_fast_climb_s",
       "push_pull_abort_mocap_release_wait_s",
       "push_pull_abort_unbuckle",
       "push_pull_exit_world_held_dz", "push_pull_exit_world_held_max_s",
@@ -7433,6 +7495,8 @@ private:
       pl_handle_settling_ = false;
       pl_exit_hold_z0_.reset();
       pl_exit_hold_t0_.reset();
+      pl_exit_hold_abort_ = false;
+      if (s != kPlExit) {pl_exit_window_ = false;}
       switch (s) {
         case kPlReady:
           // the descent keeps the world-held claw requested on arrival above
@@ -7783,6 +7847,7 @@ private:
       return;
     }
     requestContact(closed);
+    pl_exit_window_ = !closed;   // released: the jaws open next (push_pull_abort_exit_hold)
     resp->success = true;
     resp->message = closed ?
       "grasp on: the jaws hold the handle -- the contact phase is on" :
@@ -7813,11 +7878,16 @@ private:
     std::optional<VecN> unbuckle;
     bool drop_anchor = false;
     bool fast_hand_back = false;
+    bool fast_follow = false;
+    bool exit_hold = false;
+    bool open_wait = false;
+    double fast_climb = 0.0, fast_climb_s = 0.0;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
       // set by the guard that called this (sway, q3): consumed by every abort, run or refused
       drop_anchor = std::exchange(pl_abort_drop_anchor_, false);
       fast_hand_back = get_parameter("push_pull_fast_hand_back").as_bool();
+      fast_follow = get_parameter("push_pull_abort_fast_follow").as_bool();
       if (!mode_direct_ || !hold_.has_value()) {
         resp->success = false;
         resp->message = "not in whole-body DIRECT -- use the drone ground station";
@@ -7899,6 +7969,27 @@ private:
       climb = std::max(0.0, std::min(
           get_parameter("push_pull_abort_climb").as_double(), cfg.fence.max_z - from.x_b(2)));
       wait = touched ? get_parameter("push_pull_abort_release_wait_s").as_double() : 0.0;
+      // THE EXIT-WINDOW ABORT (push_pull_abort_exit_hold, 2026-11-02): the fingers may still be
+      // around the handle -- the push / turn done or a static hold released, the claw still on
+      // the handle and held in the room, or the exit's room-held climb. In the exit's climb the
+      // jaws are already open (the exit starts on the OPEN report): no release wait.
+      const bool exit_flying = pl_flying_.has_value() && *pl_flying_ == kPlExit && pl_exit_hold_z0_.has_value();
+      exit_hold = get_parameter("push_pull_abort_exit_hold").as_bool() && touched && !pl_mg_aborted_ &&
+        !fast_follow && pp_anchor_world_ && (exit_flying ||
+          (!pl_flying_.has_value() && pl_at_handle_ && (pl_completed_ == kPlPush || pl_exit_window_)));
+      if (exit_hold && exit_flying) {wait = 0.0;}
+      // CLIMB ON OPEN (push_pull_abort_climb_on_open, 2026-11-02): the pause ends at the jaws'
+      // OPEN report (onPlAbortJawsOpen) -- the timeout only bounds it. In the exit's climb the
+      // jaws opened before the exit started: no pause.
+      open_wait = touched && get_parameter("push_pull_abort_climb_on_open").as_bool();
+      if (open_wait && pl_flying_.has_value() && *pl_flying_ == kPlExit) {
+        open_wait = false;
+        wait = 0.0;
+      }
+      if (open_wait) {
+        wait = std::max(0.0, get_parameter("push_pull_abort_open_timeout_s").as_double());
+        open_wait = wait > 0.0;
+      }
       // ... SHORTENED on a mocap-guard abort (2026-10-22, the valve): the odometry is then EKF2
       // dead-reckoning and the law holds THAT still, so the real vehicle moves by its drift
       // (Isaac, in contact: 50-90 mm/s) and the open claw with it -- every second at fin height
@@ -7909,6 +8000,9 @@ private:
         if (mw >= 0.0) {wait = std::min(wait, mw);}
       }
       pl_abort_climb_ = climb;
+      fast_climb = std::max(0.0, get_parameter("push_pull_abort_fast_climb").as_double());
+      fast_climb_s = std::max(0.0, get_parameter("push_pull_abort_fast_climb_s").as_double());
+      if (fast_climb_s <= 0.0) {fast_climb = 0.0;}
       opts = planOptions();
       gen = ++plan_gen_;
       plan_.reset();
@@ -7937,13 +8031,38 @@ private:
       // crash): the room hold then pulls the stretched arm against the base -- there the arm
       // torques railed at +-3 N.m and the tilt went 8 -> 15 deg in the 0.6 s before the
       // watchdog. The claw follows the base (the CoM anchor) from the first tick of the abort.
-      pl_abort_keep_anchor_ = touched && wait > 0.0 && pp_anchor_world_ && !pl_mg_aborted_ &&
-        !drop_anchor && get_parameter("push_pull_abort_release_world_held").as_bool();
+      pl_abort_keep_anchor_ = !exit_hold && touched && wait > 0.0 && pp_anchor_world_ && !pl_mg_aborted_ &&
+        !drop_anchor && !fast_follow && get_parameter("push_pull_abort_release_world_held").as_bool();
+      pl_abort_open_wait_ = open_wait;
+      pl_abort_opened_by_.clear();
+      // the station opens the jaws as it calls this: a report that beat the call here counts, and
+      // so does a gripper that already reads open (the jaws open above the handle, in Ready)
+      pl_abort_open_seen_ = open_wait && (secondsSince(pl_jaws_open_at_) < 1.0 || plGripperReadsOpen());
+      pl_jaws_open_at_.reset();
+      pl_abort_wait_s_ = wait;
       pl_abort_anchor_due_.reset();
       pl_exit_hold_z0_.reset();     // an abort in the exit's room-held climb owns the anchor now
       pl_exit_hold_t0_.reset();
-      // a guard's drop: the FAST hand-back -- valve only (push_pull_fast_hand_back, 2026-11-02)
-      if (!pl_abort_keep_anchor_) {restoreAnchor(drop_anchor && fast_hand_back);}
+      pl_exit_hold_abort_ = false;
+      pl_exit_window_ = false;
+      if (exit_hold) {
+        // held in the room through the release wait and the first push_pull_exit_world_held_dz
+        // of the climb (plExitHoldCheck hands back), whatever guard fired
+        const auto z0 = plClawZ();
+        if (z0.has_value()) {
+          pl_exit_hold_z0_ = z0;
+          pl_exit_hold_t0_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(wait));
+          pl_exit_hold_abort_ = true;
+        } else {
+          exit_hold = false;        // no claw height: the climb cannot be measured
+          restoreAnchor((drop_anchor && fast_hand_back) || fast_follow);
+        }
+      } else if (!pl_abort_keep_anchor_) {
+        // a guard's drop: the FAST hand-back -- valve only (push_pull_fast_hand_back, 2026-11-02);
+        // every abort with push_pull_abort_fast_follow
+        restoreAnchor((drop_anchor && fast_hand_back) || fast_follow);
+      }
       if (touched) {
         if (pl_wp_.has_value()) {pl_leave_wp_ = pl_wp_;}   // Go To Land Start stays flyable
         pl_box_.reset();
@@ -7957,11 +8076,12 @@ private:
     publishPlStatus();
     publishPlInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, from, cfg, opts, gen, climb, wait, retreat, unbuckle]() {
+    worker_ = std::thread([this, from, cfg, opts, gen, climb, wait, retreat, unbuckle, fast_climb, fast_climb_s]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
-          traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat, unbuckle);
+          traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat, unbuckle,
+            fast_climb, fast_climb_s);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -7972,7 +8092,8 @@ private:
             "the arm held as measured until the fold", err.c_str());
           err.clear();
           try {
-            traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat);
+            traj = planPushPullAbort(*vehicle_, *planner_, opts, cfg, from, climb, wait, retreat, std::nullopt,
+              fast_climb, fast_climb_s);
           } catch (const std::exception & e) {
             err = e.what();
           }
@@ -7987,10 +8108,19 @@ private:
             pl_error_ = "abort refused: " + err + " -- holding where it was cut";
             RCLCPP_ERROR(get_logger(), "push-and-pull ABORT could not plan: %s", err.c_str());
             if (pl_abort_keep_anchor_) {pl_abort_keep_anchor_ = false; restoreAnchor();}
+            pl_abort_open_wait_ = false;
           } else {
             plan_ = traj;
             pl_abort_plan_ = traj;
             exec_t0_ = Clock::now();
+            if (pl_abort_open_wait_ && pl_abort_open_seen_) {
+              // the jaws were reported open while this was planned: no pause left
+              exec_t0_ = *exec_t0_ - std::chrono::duration_cast<Clock::duration>(
+                std::chrono::duration<double>(wait));
+              pl_abort_open_wait_ = false;
+              RCLCPP_WARN(get_logger(), "push-and-pull ABORT: the jaws were reported open while the "
+                "abort was planned -- climbing at once");
+            }
             state_ = "EXECUTING";
             if (pl_abort_keep_anchor_) {
               pl_abort_anchor_due_ = *exec_t0_ + std::chrono::duration_cast<Clock::duration>(
@@ -8006,9 +8136,15 @@ private:
     std::ostringstream m;
     m.setf(std::ios::fixed);
     m.precision(2);
-    m << "ABORT: contact off, " << (wait > 0.0 ? (pl_abort_keep_anchor_ ? "release (claw world-held) " :
-      (drop_anchor && fast_hand_back) ? "release (the claw follows the vehicle at once) " : "release ") : "")
-      << (retreat.norm() > 1e-3 ? "back " : "") << "then up " << climb << " m and the "
+    m << "ABORT: contact off, " << (exit_hold ? "the claw HELD IN THE ROOM until it has climbed clear of the handle, " : "")
+      << (open_wait ? "hold until the jaws are OPEN (the gripper reads open or the arm GS reports it; at most " +
+      std::to_string(wait).substr(0, 4) + " s), " : "")
+      << ((drop_anchor && fast_hand_back) || fast_follow ? "the claw follows the vehicle at once, " : "")
+      << (wait > 0.0 && !open_wait ? (pl_abort_keep_anchor_ ? "release (claw world-held) " : "release ") : "")
+      << (retreat.norm() > 1e-3 ? "back " : "") << "then up " << climb << " m"
+      << (fast_climb > 1e-3 && climb > 1e-3 ? " (the first " + std::to_string(std::min(fast_climb, climb)).substr(0, 4) +
+          " m in " + std::to_string(fast_climb_s).substr(0, 4) + " s)" : std::string())
+      << " and the "
       << "arm home, from " << (measured ? "the MEASURED pose" : cut ? "the point the step was cut at" : "the hold");
     if (retreat.norm() > 1e-3) {m << " (back " << retreat.norm() << " m against the push first)";}
     if (unbuckle.has_value()) {
@@ -8020,6 +8156,90 @@ private:
     resp->success = true;
     resp->message = m.str();
     RCLCPP_WARN(get_logger(), "push-and-pull: %s", resp->message.c_str());
+  }
+
+  // THE JAWS' OPEN REPORT (push_pull_abort_climb_on_open, 2026-11-02, Pegasus
+  // archive/valve_cup_abort_20261102): the arm ground station calls it when an abort's OPEN goal
+  // has finished. The abort's pause -- a rest at the pose it starts from -- ends here: skipping to
+  // its end is continuous, so the vehicle climbs at this instant, not after a fixed window.
+  void onPlAbortJawsOpen(Trigger::Response::SharedPtr resp)
+  {
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    resp->success = true;
+    if (!pl_abort_open_wait_) {
+      if ((pl_aborting_ || pl_abort_plan_) && !pl_abort_opened_by_.empty()) {
+        resp->message = "the climb started already: " + pl_abort_opened_by_;
+        return;
+      }
+      pl_jaws_open_at_ = Clock::now();   // an abort starting within 1 s takes it
+      resp->message = "no abort is waiting for the jaws";
+      return;
+    }
+    resp->message = plJawsOpen("the jaws are open (the arm GS's report)");
+  }
+
+  // The gripper's own joint state (push_pull_abort_gripper_*): the same as the GS's report, the
+  // moment the jaws read open -- no WiFi in between on hardware.
+  void onPlGripperState(const JointState & m)
+  {
+    const auto it = std::find(m.name.begin(), m.name.end(), pl_grip_joint_);
+    if (it == m.name.end()) {return;}
+    const size_t k = static_cast<size_t>(it - m.name.begin());
+    if (k >= m.position.size() || !std::isfinite(m.position[k])) {return;}
+    std::lock_guard<std::recursive_mutex> lk(lock_);
+    pl_grip_pos_ = m.position[k];
+    pl_grip_t_ = Clock::now();
+    if (pl_abort_open_wait_ && pl_grip_pos_ >= pl_grip_open_at_) {
+      std::ostringstream w;
+      w.setf(std::ios::fixed);
+      w.precision(4);
+      w << "the gripper READS open (" << pl_grip_joint_ << " " << pl_grip_pos_ << ")";
+      plJawsOpen(w.str());
+    }
+  }
+
+  // a fresh gripper reading at or above the open threshold (no topic configured: false)
+  bool plGripperReadsOpen() const
+  {
+    return pl_grip_sub_ && secondsSince(pl_grip_t_) < 0.5 && std::isfinite(pl_grip_pos_) &&
+           pl_grip_pos_ >= pl_grip_open_at_;
+  }
+
+  // THE JAWS ARE OPEN (push_pull_abort_climb_on_open, 2026-11-02, Pegasus
+  // archive/valve_cup_abort_20261102): from the GS's report or the gripper's own reading,
+  // whichever comes first. The abort's pause -- a rest at the pose it starts from -- ends here:
+  // skipping to its end is continuous, so the vehicle climbs at this instant, not after a fixed
+  // window. Under lock_, with pl_abort_open_wait_ set. Returns the message.
+  std::string plJawsOpen(const std::string & who)
+  {
+    pl_abort_opened_by_ = who;
+    if (pl_aborting_ && !pl_abort_plan_) {
+      pl_abort_open_seen_ = true;
+      const std::string m = who + " -- the abort climbs as soon as it is planned";
+      RCLCPP_WARN(get_logger(), "push-and-pull ABORT: %s", m.c_str());
+      return m;
+    }
+    pl_abort_open_wait_ = false;
+    if (!pl_abort_plan_ || plan_ != pl_abort_plan_ || state_ != "EXECUTING" || !exec_t0_.has_value()) {
+      return "no abort plan in flight";
+    }
+    const auto now = Clock::now();
+    const double t = std::chrono::duration<double>(now - *exec_t0_).count();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(2);
+    if (t < pl_abort_wait_s_) {
+      exec_t0_ = now - std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(pl_abort_wait_s_));
+      if (pl_abort_anchor_due_.has_value()) {pl_abort_anchor_due_ = now;}
+      if (pl_exit_hold_abort_ && pl_exit_hold_t0_.has_value()) {pl_exit_hold_t0_ = now;}
+      m << who << " " << t << " s into the abort -- climbing now";
+    } else {
+      m << who << " " << t << " s into the abort -- the climb had started already "
+        "(push_pull_abort_open_timeout_s)";
+    }
+    RCLCPP_WARN(get_logger(), "push-and-pull ABORT: %s", m.str().c_str());
+    return m.str();
   }
 
   void onPlReset(Trigger::Response::SharedPtr resp)
@@ -8513,8 +8733,9 @@ private:
   void plExitHoldCheck()
   {
     if (!pl_exit_hold_z0_.has_value()) {return;}
-    const bool flying = mode_direct_ && pl_flying_.has_value() && *pl_flying_ == kPlExit &&
-      !pl_aborting_ && !pl_abort_plan_;
+    // the exit's own hold, or an abort's (push_pull_abort_exit_hold): the abort is planning or flying
+    const bool flying = pl_exit_hold_abort_ ? (mode_direct_ && (pl_aborting_ || pl_abort_plan_ != nullptr)) :
+      (mode_direct_ && pl_flying_.has_value() && *pl_flying_ == kPlExit && !pl_aborting_ && !pl_abort_plan_);
     const auto z = plClawZ();
     const double climbed = z.has_value() ? *z - *pl_exit_hold_z0_ : 0.0;
     const double held = secondsSince(pl_exit_hold_t0_);
@@ -8522,7 +8743,7 @@ private:
       pl_mg_state_ >= 2;
     const char * why = nullptr;
     if (!flying) {
-      why = "the exit is no longer flying";
+      why = pl_exit_hold_abort_ ? "the abort is no longer flying" : "the exit is no longer flying";
     } else if (mocap_bad) {
       why = "a confirmed mocap fault (the room is EKF2 dead-reckoning)";
     } else if (climbed >= get_parameter("push_pull_exit_world_held_dz").as_double()) {
@@ -8531,12 +8752,14 @@ private:
       why = "the hold's time cap";
     }
     if (why == nullptr) {return;}
+    const bool from_abort = pl_exit_hold_abort_;
     pl_exit_hold_z0_.reset();
     pl_exit_hold_t0_.reset();
-    // an abort sets its own anchor (onPlAbort); leave that alone
-    if (!pl_aborting_ && !pl_abort_plan_) {restoreAnchor();}
-    RCLCPP_INFO(get_logger(), "push-and-pull exit: the claw climbed %.0f mm room-held in %.1f s "
-      "-- %s: the CoM anchor", climbed * 1e3, held, why);
+    pl_exit_hold_abort_ = false;
+    // an abort sets its own anchor (onPlAbort); leave that alone -- unless this hold IS the abort's
+    if (from_abort || (!pl_aborting_ && !pl_abort_plan_)) {restoreAnchor();}
+    RCLCPP_INFO(get_logger(), "push-and-pull %s: the claw climbed %.0f mm room-held in %.1f s "
+      "-- %s: the CoM anchor", from_abort ? "ABORT" : "exit", climbed * 1e3, std::max(0.0, held), why);
   }
 
   void publishPlArrival()
@@ -8724,6 +8947,12 @@ private:
       // ([118]; NaN when the node does not send it)
       m.data.push_back(secondsSince(pl_head_err_t_) < 0.25 ? pl_head_err_deg_ : std::nan(""));
       m.data.push_back(secondsSince(pl_free_radius_t_) < 1.0 ? pl_free_radius_ : std::nan(""));
+      // [32] the law's horizontal CoM error [m], [33] its filtered rate [m/s] (wb_control_debug
+      // [45..50]; NaN when stale) -- the Valve tab's calm gate before the exit opens the jaws
+      // (2026-11-02)
+      const bool sway_fresh = secondsSince(pl_sway_t_) < 0.25;
+      m.data.push_back(sway_fresh ? pl_sway_e_.norm() : std::nan(""));
+      m.data.push_back(sway_fresh ? pl_sway_v_.norm() : std::nan(""));
       if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding) ||
         pl_handle_settling_ || settle_done)
       {
@@ -9267,6 +9496,21 @@ private:
   double pl_claw_speed_{std::numeric_limits<double>::quiet_NaN()};
   std::optional<Clock::time_point> pl_ready_settled_since_;
   bool pl_handle_settling_{false};
+  bool pl_exit_window_{false};      ///< a static hold's release reported: the jaws open next (abort exit hold)
+  bool pl_exit_hold_abort_{false};  ///< the exit hold is an abort's (push_pull_abort_exit_hold)
+  // push_pull_abort_climb_on_open (2026-11-02): this abort's pause ends at the jaws' OPEN report;
+  // the report arrived before the abort plan was installed; the pause's length [s]
+  bool pl_abort_open_wait_{false};
+  bool pl_abort_open_seen_{false};
+  double pl_abort_wait_s_{0.0};
+  std::optional<Clock::time_point> pl_jaws_open_at_;   ///< a report with no abort waiting (1 s grace)
+  std::string pl_abort_opened_by_;   ///< what ended this abort's pause (a late report is told)
+  // the gripper's own joint state (push_pull_abort_gripper_*): its last reading, when, and the config
+  rclcpp::Subscription<JointState>::SharedPtr pl_grip_sub_;
+  std::string pl_grip_joint_;
+  double pl_grip_open_at_{0.0};
+  double pl_grip_pos_{std::numeric_limits<double>::quiet_NaN()};
+  std::optional<Clock::time_point> pl_grip_t_;
   std::optional<Clock::time_point> pl_handle_settle_t0_;
   std::optional<Clock::time_point> pl_handle_settled_since_;
   bool pl_within_{false};

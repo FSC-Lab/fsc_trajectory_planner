@@ -85,6 +85,14 @@ set_ee_anchor_com services that record what the planner asks for.
        first 0.5 s), a second call answered "already aborting".
   [9n] (2026-10-30) the law's EE heading error and the node's free-axis heading radius reach
        arrival_error [30]/[31]; a turn whose sense disagrees with the radius is refused at Plan
+  [9r] (2026-11-02, valve) the exit-window abort (push_pull_abort_exit_hold): arrival_error [32] carries
+       the law's CoM error; after the push, a SWAY-guard abort keeps the claw held in the room through
+       the release wait and until it has climbed push_pull_exit_world_held_dz, then the CoM anchor.
+  [9s] (2026-11-02, valve) the abort that climbs on the jaws' OPEN report (push_pull_abort_climb_on_open,
+       live-set): the claw goes to the vehicle through the FAST hand-back at once
+       (push_pull_abort_fast_follow), the reference holds until push_pull/abort_jaws_open and climbs
+       the moment it comes, the first 60 mm fast (push_pull_abort_fast_climb); the gripper's own joint
+       state reading open starts it too (push_pull_abort_gripper_*); with neither the timeout climbs.
   [10] SAFETY silences the stream
 
 Run with a scratch install first on the path and a private ROS domain:
@@ -120,6 +128,7 @@ CONTACT_SRV = "/pl_rig/set_contact"
 ANCHOR_SRV = "/pl_rig/set_ee_anchor_com"
 FAST_SRV = ANCHOR_SRV + "_fast"            # (2026-11-01) the node's fast hand-back service
 GUARD_TOPIC = "/pl_rig/mocap_guard"        # the estimator's raw-mocap guard (2026-10-21)
+GRIP_TOPIC = "/pl_rig/gripper_state"       # (2026-11-02) the gripper's own joint state, Isaac's convention
 YAML = os.environ.get("PL_YAML", os.path.expanduser(
     "~/ros2_ws/src/fsc_autopilot_ros2/config/"
     "params_single_aerial_manipulator_whole_body_l1_4d_direct_actuation_t650_sim_box_pushing.yaml"))
@@ -130,6 +139,10 @@ GOV_CMD = ["ros2", "run", "fsc_trajectory_planner", "whole_body_trajectory_plann
            "-p", f"push_pull_contact_service:={CONTACT_SRV}",
            "-p", f"pick_place_anchor_service:={ANCHOR_SRV}",
            "-p", f"push_pull_mocap_guard_topic:={GUARD_TOPIC}",
+           # (2026-11-02) the abort's jaws read open from the gripper's joint state ([9s]); silent by default
+           "-p", f"push_pull_abort_gripper_topic:={GRIP_TOPIC}",
+           "-p", "push_pull_abort_gripper_joint:=gripper_joint",
+           "-p", "push_pull_abort_gripper_open_at:=-0.03",
            # the rig is a PERFECT plant: no trim to measure
            "-p", "push_pull_descent_trim:=false",
            # ... and its box is a fixed mocap pose that never moves with the claw,
@@ -210,6 +223,8 @@ class Rig(Node):
         self.box_pub = self.create_publisher(Mocap, BOX_TOPIC, 10)
         self.force_pub = self.create_publisher(Float32MultiArray, FORCE_TOPIC, 10)
         self.guard_pub = self.create_publisher(Float64MultiArray, GUARD_TOPIC, 10)
+        self.grip_pub = self.create_publisher(JointState, GRIP_TOPIC, 10)
+        self.grip_pos = None                   # (2026-11-02) [rad] published when set ([9s])
         self.status = self.pl_status = self.info = self.arrival = None
         self.refs = []
         self.contact_calls, self.anchor_calls = [], []
@@ -231,7 +246,8 @@ class Rig(Node):
         self.create_service(SetBool, ANCHOR_SRV, self.on_anchor)
         self.create_service(SetBool, FAST_SRV, self.on_anchor_fast)
         self.cli = {n: self.create_client(Trigger, f"whole_body_planner/push_pull/{n}")
-                    for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort", "emergency_abort", "release"]}
+                    for n in STEPS + ["adjust", "plan", "reset", "capture_box", "abort", "emergency_abort", "release",
+                                      "abort_jaws_open"]}
         self.params = self.create_client(SetParameters, "whole_body_trajectory_planner/set_parameters")
         self.getp = self.create_client(GetParameters, "whole_body_trajectory_planner/get_parameters")
         self.odom_xyz = np.array([*(START + OFFSET), 0.0])
@@ -309,6 +325,11 @@ class Rig(Node):
             g = Float64MultiArray()
             g.data = list(map(float, self.mg)) + [0.0] * 13
             self.guard_pub.publish(g)
+        if self.grip_pos is not None:   # (2026-11-02) the gripper's own joint state
+            j = JointState()
+            j.name = ["gripper_joint"]
+            j.position = [float(self.grip_pos)]
+            self.grip_pub.publish(j)
 
     def feed_force(self):
         data = [0.0] * 120
@@ -1418,6 +1439,125 @@ def main():
         assert rig.contact_calls[n_c:] == [] and rig.anchor_calls[n_a:] == [], \
             (rig.contact_calls[n_c:], rig.anchor_calls[n_a:])
         print("[9q] grasp event refusals: " + " | ".join(msgs))
+
+        # [9r] (2026-11-02) THE EXIT-WINDOW ABORT (push_pull_abort_exit_hold, valve). After the push the
+        # claw is still on the handle, held in the room (push_pull_world_anchor_push); a SWAY-guard
+        # abort -- which hands the claw back to the vehicle at once everywhere else ([9m]) -- keeps it
+        # held in the room through the release wait and until the claw has climbed
+        # push_pull_exit_world_held_dz (the fingers clear of the handle), then the CoM anchor. First
+        # arrival_error [32]/[33] (the law's CoM error and its rate: the Valve tab's calm gate).
+        if WORLD_ANCHOR_PUSH:
+            dz = 0.06
+            sway0 = _yaml_num("push_pull_guard_sway_speed", 0.0)
+            set_param_bool(rig, "push_pull_abort_exit_hold", True)
+            set_param(rig, "push_pull_exit_world_held_dz", dz)
+            if sway0 <= 0.0:
+                set_param(rig, "push_pull_guard_sway_speed", 0.15)
+            wait_s = _yaml_num("push_pull_abort_release_wait_s", 0.0)
+            back_on_handle("9r")
+            # arrival_error is published while a plan is held: check [32] on the handle
+            rig.com_off = 0.025
+            wait(lambda: rig.arrival is not None and len(rig.arrival) > 33 and abs(rig.arrival[32] - 0.025) < 1e-6,
+                 3, "arrival_error [32] = the law's CoM error (9r)")
+            rig.com_off = 0.0
+            time.sleep(0.3)
+            fly(rig, 2)
+            wait(lambda: rig.pl_status.startswith("DONE push"), 5, "DONE push (9r)")
+            n_a = len(rig.anchor_calls)
+            rig.com_sway = (0.080, 0.5)
+            wait(lambda: rig.pl_status.startswith("ABORTING"), 6, "sway guard after the push (9r)")
+            rig.com_sway = None
+            time.sleep(wait_s + 0.5)
+            assert True not in rig.anchor_calls[n_a:], ("handed back at fin height", rig.anchor_calls[n_a:])
+            rig.odom_xyz = rig.odom_xyz + np.array([0.0, 0.0, dz + 0.01])
+            t_up = time.monotonic()
+            wait(lambda: True in rig.anchor_calls[n_a:], 1.0, "the CoM anchor once the claw has climbed clear (9r)")
+            dt = time.monotonic() - t_up
+            abort_done("9r")
+            set_param_bool(rig, "push_pull_abort_exit_hold", _yaml_bool("push_pull_abort_exit_hold", False))
+            set_param(rig, "push_pull_exit_world_held_dz", _yaml_num("push_pull_exit_world_held_dz", 0.0))
+            if sway0 <= 0.0:
+                set_param(rig, "push_pull_guard_sway_speed", 0.0)
+            print(f"[9r] sway-guard abort after the push: held in the room {wait_s + 0.5:.1f} s (release wait "
+                  f"{wait_s:.1f} s), the CoM anchor {dt:.2f} s after the claw climbed {dz * 1e3 + 10:.0f} mm")
+        else:
+            print("[9r] the abort hold skipped: the yaml's push is not room-held (push_pull_world_anchor_push)")
+
+        # [9s] (2026-11-02, valve) THE ABORT THAT CLIMBS ON THE JAWS' OPEN REPORT
+        # (push_pull_abort_climb_on_open, live-set): with the claw on the handle the abort holds where
+        # it starts until the arm GS reports the jaws open (push_pull/abort_jaws_open) and climbs at
+        # that instant -- no fixed window; the claw follows the vehicle through the FAST hand-back
+        # from the first tick (push_pull_abort_fast_follow). Then the timeout alone (no report).
+        def ref_z():
+            return rig.refs[-1][1].x_cd.z
+
+        set_param_bool(rig, "push_pull_abort_climb_on_open", True)
+        set_param(rig, "push_pull_abort_open_timeout_s", 8.0)
+        set_param_bool(rig, "push_pull_abort_fast_follow", True)
+        set_param_bool(rig, "push_pull_abort_exit_hold", False)
+        set_param(rig, "push_pull_abort_fast_climb", 0.06)
+        set_param(rig, "push_pull_abort_fast_climb_s", 0.8)
+        back_on_handle("9s")
+        n_a, n_f = len(rig.anchor_calls), len(rig.fast_calls)
+        r = call(rig, "abort")
+        assert r.success and "jaws are OPEN" in r.message and "follows the vehicle" in r.message, r.message
+        wait(lambda: rig.status.startswith("EXECUTING"), 10, "abort executing (9s)")
+        wait(lambda: True in rig.fast_calls[n_f:], 0.6, "the FAST CoM anchor at once (9s)")
+        assert False not in rig.anchor_calls[n_a:], ("held in the room on the abort", rig.anchor_calls[n_a:])
+        z0 = ref_z()
+        time.sleep(2.0)
+        assert abs(ref_z() - z0) < 1e-4, ("climbed before the jaws were reported open", z0, ref_z())
+        t_open = time.monotonic()
+        r = call(rig, "abort_jaws_open")
+        assert r.success and "climbing now" in r.message, r.message
+        wait(lambda: ref_z() > z0 + 0.001, 1.5, "the climb on the jaws' report (9s)")
+        dt_open = time.monotonic() - t_open
+        # the fast first climb: 60 mm in 0.8 s
+        wait(lambda: ref_z() > z0 + 0.055, 1.6, "the fast first climb, 55 mm within 1.6 s of the report (9s)")
+        dt_fast = time.monotonic() - t_open
+        msg_open = r.message
+        abort_done("9s")
+        # [9s-c] the gripper's OWN reading (push_pull_abort_gripper_*): no report -- the jaws read open
+        rig.grip_pos = -0.21                   # Isaac's half close
+        back_on_handle("9s-c")
+        r = call(rig, "abort")
+        assert r.success, r.message
+        wait(lambda: rig.status.startswith("EXECUTING"), 10, "abort executing (9s-c)")
+        z0 = ref_z()
+        time.sleep(1.5)
+        assert abs(ref_z() - z0) < 1e-4, ("climbed with the gripper reading the half close", z0, ref_z())
+        t_rd = time.monotonic()
+        rig.grip_pos = 0.0                     # the jaws read open
+        wait(lambda: ref_z() > z0 + 0.001, 1.0, "the climb on the gripper's own reading (9s-c)")
+        dt_rd = time.monotonic() - t_rd
+        r = call(rig, "abort_jaws_open")       # the station's report, late
+        assert r.success and "climb started already" in r.message and "READS open" in r.message, r.message
+        abort_done("9s-c")
+        rig.grip_pos = None
+        # the timeout alone: no report
+        set_param(rig, "push_pull_abort_open_timeout_s", 1.0)
+        back_on_handle("9s-b")
+        r = call(rig, "abort")
+        assert r.success, r.message
+        wait(lambda: rig.status.startswith("EXECUTING"), 10, "abort executing (9s-b)")
+        t_ex = time.monotonic()
+        z0 = ref_z()
+        wait(lambda: ref_z() > z0 + 0.001, 2.5, "the climb at the timeout (9s-b)")
+        dt_to = time.monotonic() - t_ex
+        assert dt_to > 0.6, ("climbed before the 1.0 s timeout", dt_to)
+        r = call(rig, "abort_jaws_open")   # the late report: the timeout had started the climb
+        assert r.success and "had started already" in r.message, r.message
+        abort_done("9s-b")
+        set_param_bool(rig, "push_pull_abort_climb_on_open", _yaml_bool("push_pull_abort_climb_on_open", False))
+        set_param(rig, "push_pull_abort_open_timeout_s", _yaml_num("push_pull_abort_open_timeout_s", 3.0))
+        set_param_bool(rig, "push_pull_abort_fast_follow", _yaml_bool("push_pull_abort_fast_follow", False))
+        set_param_bool(rig, "push_pull_abort_exit_hold", _yaml_bool("push_pull_abort_exit_hold", False))
+        set_param(rig, "push_pull_abort_fast_climb", _yaml_num("push_pull_abort_fast_climb", 0.0))
+        set_param(rig, "push_pull_abort_fast_climb_s", _yaml_num("push_pull_abort_fast_climb_s", 0.8))
+        print(f"[9s] climb on the jaws' report: held 2.0 s with no report, climbing {dt_open:.2f} s after it "
+              f"('{msg_open}'), 55 mm up {dt_fast:.2f} s after it (the fast first climb); the FAST CoM anchor "
+              f"at once; on the gripper's own reading (no report) climbing {dt_rd:.2f} s after it read open; "
+              f"with no report the 1.0 s timeout climbed {dt_to:.2f} s after EXECUTING")
 
         # [10] SAFETY
         rig.mode.publish(String(data="SAFETY"))

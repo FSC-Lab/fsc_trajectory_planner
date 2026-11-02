@@ -373,10 +373,14 @@ std::unique_ptr<Trajectory> planPushPullLand(
 // boundary, and the abort held that for 9 s until the fold). When the claw would
 // end more than 10 mm lower against the base than it starts, the climb carries the
 // arm instead of the retreat, so the open claw never drops along the handle.
+// `fast_climb` [m] in `fast_climb_T` [s] (2026-11-02, the valve; 0 = off): the first part of the climb
+// as its own rest-to-rest leg with the bounds opened just enough (timedOptions) -- the open fingers
+// leave the handle's height in well under a second -- then the rest of the climb at the usual bounds.
 std::unique_ptr<Trajectory> planPushPullAbort(
   const VehicleModel & v, const TrajectoryPlanner & transition, const PlanOptions & opts,
   const PushPullConfig & c, const RestSpec & from, double climb, double release_wait = 0.0,
-  const Vec3 & retreat = Vec3::Zero(), const std::optional<VecN> & unbuckle = std::nullopt);
+  const Vec3 & retreat = Vec3::Zero(), const std::optional<VecN> & unbuckle = std::nullopt,
+  double fast_climb = 0.0, double fast_climb_T = 0.0);
 
 // Throws "<what>: <part> is <h> m above the table top at t = .. s ..." when a
 // sample of `traj` puts the landing gear (within gear_radius of the body
