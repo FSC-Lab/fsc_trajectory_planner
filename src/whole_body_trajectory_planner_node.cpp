@@ -7789,6 +7789,7 @@ private:
       "grasp off: the contact phase is free, the claw stays where it is held -- open the gripper";
     RCLCPP_INFO(get_logger(), "push-and-pull %s", resp->message.c_str());
     publishPlStatus();
+    publishPlInfo();      // info [62] = the contact flag (the GS's contact line, the Isaac driver)
   }
 
   // ABORT: the GS opens the gripper on the same press; here the phase flag
