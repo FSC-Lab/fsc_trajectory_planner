@@ -85,6 +85,7 @@ set_ee_anchor_com services that record what the planner asks for.
        first 0.5 s), a second call answered "already aborting".
   [9n] (2026-10-30) the law's EE heading error and the node's free-axis heading radius reach
        arrival_error [30]/[31]; a turn whose sense disagrees with the radius is refused at Plan
+  [9q] (2026-11-02) the valve's grasp event push_pull/grasp is gone (removed with the static hold)
   [9r] (2026-11-02, valve) the exit-window abort (push_pull_abort_exit_hold): arrival_error [32] carries
        the law's CoM error; after the push, a SWAY-guard abort keeps the claw held in the room through
        the release wait and until it has climbed push_pull_exit_world_held_dz, then the CoM anchor.
@@ -228,7 +229,7 @@ class Rig(Node):
         self.status = self.pl_status = self.info = self.arrival = None
         self.refs = []
         self.contact_calls, self.anchor_calls = [], []
-        # (2026-11-02) the planner's grasp event, called as the arm GS does
+        # (2026-11-02) the valve's grasp event, removed the same day: [9q] checks it is gone
         self.grasp_cli = self.create_client(SetBool, NS + "/whole_body_planner/push_pull/grasp")
         self.fast_calls = []                   # (2026-11-01) requests through the FAST hand-back
         self.create_subscription(String, "whole_body_planner/status",
@@ -1407,38 +1408,10 @@ def main():
         set_param_bool(rig, "push_pull_world_anchor_ready", WORLD_ANCHOR_READY)
         set_param_bool(rig, "push_pull_fast_hand_back", _yaml_bool("push_pull_fast_hand_back", False))
 
-        # [9q] (2026-11-02) THE GRASP EVENT (push_pull/grasp, valve only): the arm GS reports the jaws
-        # closed on the handle in a valve static hold. Refused unless the yaml enables it, on a
-        # straight push, and away from the handle -- and it never touches the anchor. (Its happy path
-        # needs a valve: the Isaac static-hold flight, Pegasus archive/valve_box_isolation_20261102.)
-        def grasp(on):
-            assert rig.grasp_cli.wait_for_service(timeout_sec=5)
-            fut = rig.grasp_cli.call_async(SetBool.Request(data=on))
-            t0 = time.monotonic()
-            while not fut.done():
-                time.sleep(0.02)
-                assert time.monotonic() - t0 < 5, "push_pull/grasp"
-            return fut.result()
-        n_c, n_a = len(rig.contact_calls), len(rig.anchor_calls)
-        msgs = []
-        if not _yaml_bool("push_pull_grasp_event", False):
-            r = grasp(True)
-            assert not r.success and "belongs to valve turning" in r.message, r.message
-            msgs.append(r.message)
-        set_param_bool(rig, "push_pull_grasp_event", True)
-        r = grasp(True)
-        assert not r.success and "straight push" in r.message, r.message
-        msgs.append(r.message)
-        set_param(rig, "push_pull_turn_deg", -30.0)
-        for on in (True, False):
-            r = grasp(on)
-            assert not r.success and "not on the handle" in r.message, r.message
-        msgs.append(r.message)
-        set_param(rig, "push_pull_turn_deg", 0.0)
-        set_param_bool(rig, "push_pull_grasp_event", _yaml_bool("push_pull_grasp_event", False))
-        assert rig.contact_calls[n_c:] == [] and rig.anchor_calls[n_a:] == [], \
-            (rig.contact_calls[n_c:], rig.anchor_calls[n_a:])
-        print("[9q] grasp event refusals: " + " | ".join(msgs))
+        # [9q] (2026-11-02) the grasp event (push_pull/grasp) was REMOVED with the valve's static hold the
+        # same day: the service must not exist any more
+        assert not rig.grasp_cli.wait_for_service(timeout_sec=1.0), "push_pull/grasp is still served"
+        print("[9q] push_pull/grasp is gone (the static hold was removed)")
 
         # [9r] (2026-11-02) THE EXIT-WINDOW ABORT (push_pull_abort_exit_hold, valve). After the push the
         # claw is still on the handle, held in the room (push_pull_world_anchor_push); a SWAY-guard
