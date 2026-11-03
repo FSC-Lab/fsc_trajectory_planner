@@ -48,6 +48,7 @@
 #define FSC_TRAJECTORY_PLANNER_PUSH_PULL_HPP_
 
 #include <array>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -447,6 +448,63 @@ constexpr double kBoxGateV = 1.0;    // [m/s]
 constexpr double kBoxGateA = 2.0;    // [m/s^2]
 constexpr double kBoxGateW = 90.0;   // [deg/s]
 bool boxSampleWithinGate(double d_m, double a_deg, double dt, double jump_m, double jump_deg);
+
+// THE FIN IN THE U (2026-11-03, the valve's U push): the open gripper pushes the fin's back
+// edge with the bracket between its claws, so the fin must stay INSIDE the U. Where it is,
+// in the fin's own frame, from the valve's mocap (the rotor frame: origin on the bearing
+// axis at the plate bottom, +x along the beam to the fin) and the claw point (world):
+//   depth  = the fin top's z - the claw's z            (the claw's depth under the fin top)
+//   across = (claw - fin centre) . n                   (n = the rotor's +x, the jaws' axis)
+//   gap    = (fin back edge - bracket corner) . t      (t = the rotor's +y times the turn's sign;
+//            the bracket corner bracket_back behind the claw point along t). > 0: the fin
+//            ahead of the bracket (the slack, ~13 mm at the grasp); < 0: the fin BEHIND the
+//            bracket -- the U has passed it, which cannot happen while the fin is inside.
+struct ValveFin
+{
+  double radius{0.160};      // [m] the fin's centre from the axis (rotor +x)
+  double bearing_y{0.0006};  // [m] its centre's rotor y
+  double top{0.204};         // [m] its top above the plate bottom
+  double height{0.130};      // [m]
+  double half_len{0.020};    // [m] along the turn (rotor y)
+  double half_thick{0.0025}; // [m] radial (rotor x)
+};
+struct FinCapture
+{
+  double depth{0.0};
+  double across{0.0};
+  double gap{0.0};
+};
+FinCapture finCapture(const Vec3 & claw, const Vec3 & axis, const Mat3 & R_rotor, const ValveFin & f,
+                      double turn_sign, double bracket_back);
+
+// THE CLEARANCE GUARD (2026-11-03): the distance from vehicle parts (capsules, world frame;
+// a == b is a point) to the valve's boxes (rotor frame, axis-aligned there) and its mocap
+// marker balls (rotor frame). Independent of WHY a part got close. Each capsule is sampled
+// at kClearanceSamples points against the boxes; exact against the balls.
+constexpr int kClearanceSamples = 21;
+struct ClearanceCapsule
+{
+  Vec3 a;
+  Vec3 b;
+  double r{0.0};
+  std::string name;
+};
+struct ClearanceBox
+{
+  Vec3 c;   // centre, rotor frame
+  Vec3 h;   // half sizes
+  std::string name;
+};
+struct ClearanceResult
+{
+  double box{std::numeric_limits<double>::infinity()};      // [m] surface distance, < 0 = overlap
+  std::string box_pair;
+  double marker{std::numeric_limits<double>::infinity()};
+  std::string marker_pair;
+};
+ClearanceResult valveClearance(
+  const std::vector<ClearanceCapsule> & parts, const Vec3 & axis, const Mat3 & R_rotor,
+  const std::vector<ClearanceBox> & boxes, const std::vector<Vec3> & markers, double marker_r);
 
 }  // namespace fsc_trajectory_planner
 

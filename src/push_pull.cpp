@@ -1436,4 +1436,70 @@ bool boxSampleWithinGate(double d_m, double a_deg, double dt, double jump_m, dou
   return true;
 }
 
+FinCapture finCapture(const Vec3 & claw, const Vec3 & axis, const Mat3 & R_rotor, const ValveFin & f,
+                      double turn_sign, double bracket_back)
+{
+  const Vec3 fc = axis + R_rotor * Vec3(f.radius, f.bearing_y, f.top - 0.5 * f.height);
+  const Vec3 top = axis + R_rotor * Vec3(f.radius, f.bearing_y, f.top);
+  const Vec3 t = (turn_sign < 0.0 ? -1.0 : 1.0) * R_rotor.col(1);
+  const Vec3 n = R_rotor.col(0);
+  const Vec3 d = claw - fc;
+  FinCapture c;
+  c.depth = top(2) - claw(2);
+  c.across = d.dot(n);
+  // the fin's back edge at -half_len along t; the bracket corner bracket_back behind the claw
+  c.gap = -f.half_len - (d.dot(t) - bracket_back);
+  return c;
+}
+
+namespace
+{
+double pointBoxDistance(const Vec3 & p, const ClearanceBox & b)
+{
+  const Vec3 d = ((p - b.c).cwiseAbs() - b.h).cwiseMax(0.0);
+  return d.norm();
+}
+
+double pointSegmentDistance(const Vec3 & p, const Vec3 & a, const Vec3 & b)
+{
+  const Vec3 ab = b - a;
+  const double L2 = ab.squaredNorm();
+  const double s = L2 > 1e-18 ? std::clamp((p - a).dot(ab) / L2, 0.0, 1.0) : 0.0;
+  return (p - (a + s * ab)).norm();
+}
+}  // namespace
+
+ClearanceResult valveClearance(
+  const std::vector<ClearanceCapsule> & parts, const Vec3 & axis, const Mat3 & R_rotor,
+  const std::vector<ClearanceBox> & boxes, const std::vector<Vec3> & markers, double marker_r)
+{
+  ClearanceResult r;
+  const Mat3 Rt = R_rotor.transpose();
+  for (const ClearanceCapsule & cap : parts) {
+    const Vec3 a = Rt * (cap.a - axis), b = Rt * (cap.b - axis);   // the rotor frame
+    const bool point = (b - a).squaredNorm() < 1e-18;
+    const int n = point ? 1 : kClearanceSamples;
+    for (const ClearanceBox & box : boxes) {
+      double dmin = std::numeric_limits<double>::infinity();
+      for (int k = 0; k < n; ++k) {
+        const double s = n > 1 ? static_cast<double>(k) / (n - 1) : 0.0;
+        dmin = std::min(dmin, pointBoxDistance(a + s * (b - a), box));
+      }
+      const double d = dmin - cap.r;
+      if (d < r.box) {
+        r.box = d;
+        r.box_pair = cap.name + " / " + box.name;
+      }
+    }
+    for (size_t k = 0; k < markers.size(); ++k) {
+      const double d = pointSegmentDistance(markers[k], a, b) - cap.r - marker_r;
+      if (d < r.marker) {
+        r.marker = d;
+        r.marker_pair = cap.name + " / marker " + std::to_string(k + 1);
+      }
+    }
+  }
+  return r;
+}
+
 }  // namespace fsc_trajectory_planner

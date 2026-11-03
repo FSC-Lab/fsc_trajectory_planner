@@ -434,6 +434,60 @@ TEST(PushPull, AbortClimbsThenFoldsHome)
   EXPECT_LT((traj->goalRest().q - v->home).norm(), 1e-9);
 }
 
+// ONE CLIMB (2026-11-03, the valve's U push): a fast climb as tall as the whole climb IS
+// the climb -- one leg, no stop partway (60 mm then the rest stopped the claw beside the
+// fin), in the fast leg's time; the fold follows it, the arm held during the climb. At the
+// shipped 1.5 s it also STARTS as quickly as the old 60 mm / 0.8 s leg (no hesitation).
+TEST(PushPull, AbortWholeFastClimbIsOneClimb)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PushPullConfig c = config(*v);
+  const PushPullWaypoints wp = pushPullWaypoints(*v, c, scene());
+  const double z0 = wp.grasp.x_b(2);
+  const auto two = planPushPullAbort(*v, *planner, PlanOptions{}, c, wp.grasp, 0.30, 0.0, Vec3::Zero(),
+    std::nullopt, 0.06, 0.8);
+  const auto * seq2 = dynamic_cast<const SequenceTrajectory *>(two.get());
+  ASSERT_NE(seq2, nullptr);
+  EXPECT_EQ(seq2->segmentStarts().size(), 3u);   // the old abort: fast 60 mm, the rest, fold
+  const auto traj = planPushPullAbort(*v, *planner, PlanOptions{}, c, wp.grasp, 0.30, 0.0, Vec3::Zero(),
+    std::nullopt, 0.30, 1.5);
+  const auto * seq = dynamic_cast<const SequenceTrajectory *>(traj.get());
+  ASSERT_NE(seq, nullptr);
+  ASSERT_EQ(seq->segmentStarts().size(), 2u);    // one climb, the fold
+  const double t1 = seq->segmentStarts()[1];
+  EXPECT_NEAR(t1, 1.5, 0.05);
+  // the start: 10 mm within 50 ms of the old fast leg
+  auto t_at = [&](const Trajectory & tr, double dz) {
+      for (int k = 1; k <= 2000; ++k) {
+        const double t = 0.002 * k;
+        if (bodyOf(*v, tr.eval(t))(2) - z0 >= dz) {return t;}
+      }
+      return -1.0;
+    };
+  const double t10 = t_at(*traj, 0.010), t10_old = t_at(*two, 0.010);
+  EXPECT_GT(t10, 0.0);
+  EXPECT_LE(t10, t10_old + 0.05);   // 1.5 s: 0.31 vs 0.27 s (1.4 s would match it at 15 % more acceleration)
+  double prev = z0, t_clear = -1.0;
+  for (int k = 1; k <= 100; ++k) {
+    const double t = t1 * k / 100.0;
+    const WbReference r = traj->eval(t);
+    const double z = bodyOf(*v, r)(2);
+    if (k < 100) {EXPECT_GT(z, prev) << "stopped partway at t = " << t;}
+    EXPECT_LT((r.q_d - c.push_pose).cwiseAbs().maxCoeff(), 1e-6) << "folded before it climbed";
+    if (t_clear < 0.0 && z - z0 >= 0.080) {t_clear = t;}
+    prev = z;
+  }
+  EXPECT_NEAR(bodyOf(*v, traj->eval(t1))(2), z0 + 0.30, 1e-6);
+  EXPECT_LT(traj->eval(t1).x_cd_dot.norm(), 1e-6);
+  EXPECT_LT((traj->goalRest().q - v->home).norm(), 1e-9);
+  EXPECT_GT(t_clear, 0.0);
+  EXPECT_LT(t_clear, 0.7);   // 80 mm (the U push's depth under the fin top) within ~0.6 s
+  std::cout << "one climb: 0.30 m in " << t1 << " s, 10 mm at " << t10 << " s (old " << t10_old
+            << " s), 80 mm at " << t_clear << " s, fold "
+            << traj->duration() - t1 << " s; the old two-leg climb took " << seq2->segmentStarts()[2] << " s\n";
+}
+
 // THE RETREAT (2026-10-16): with a retreat the abort holds for the release, then
 // moves the base horizontally by it -- level, the arm still in its push pose --
 // and only then climbs and folds; it ends above the retreated point.
@@ -1477,4 +1531,53 @@ TEST(PushPullLayout, GoToLandStartGoesRoundTheTableToo)
   std::cout << "go_to_land_start: " << T << " s -- " << home->diag().summary << "\n";
   // land: straight down, heading kept
   EXPECT_NEAR(std::cos(headingOf(steps[kPlLand]->eval(steps[kPlLand]->duration())) - wp.land.phi), 1.0, 1e-9);
+}
+
+// THE FIN IN THE U (2026-11-03): the fin's place relative to the claw, in the fin's frame --
+// invariant to where the valve is and how it is turned; the bracket's slack at the grasp.
+TEST(PushPullValveGuards, FinCaptureInTheFinsFrame)
+{
+  const ValveFin f;
+  const double back = 0.008;
+  // the U push's grasp: 80 mm under the fin top, 25 mm behind its centre along the turn
+  const Vec3 grasp_r(f.radius, f.bearing_y - 0.025, f.top - 0.080);
+  for (const double yaw : {0.0, 0.7, -2.1}) {
+    const Mat3 R = Rz(yaw);
+    const Vec3 axis(0.675, -0.1, 0.80);
+    const FinCapture c = finCapture(axis + R * grasp_r, axis, R, f, +93.0, back);
+    EXPECT_NEAR(c.depth, 0.080, 1e-12);
+    EXPECT_NEAR(c.across, 0.0, 1e-12);
+    EXPECT_NEAR(c.gap, 0.013, 1e-12);     // the slack: the fin's back edge 5 mm + the bracket 8 mm
+    // the claw 20 mm further along the turn (the bracket on the fin, past it by 7 mm)
+    EXPECT_NEAR(finCapture(axis + R * (grasp_r + Vec3(0, 0.020, 0)), axis, R, f, 1.0, back).gap, -0.007, 1e-12);
+    // 15 mm out radially, 60 mm up
+    const FinCapture d = finCapture(axis + R * (grasp_r + Vec3(0.015, 0, 0.060)), axis, R, f, 1.0, back);
+    EXPECT_NEAR(d.across, 0.015, 1e-12);
+    EXPECT_NEAR(d.depth, 0.020, 1e-12);
+  }
+  // a NEGATIVE turn: the push direction (and so behind / ahead) flips
+  const Vec3 mirrored(f.radius, f.bearing_y + 0.025, f.top - 0.080);
+  EXPECT_NEAR(finCapture(mirrored, Vec3::Zero(), Mat3::Identity(), f, -90.0, back).gap, 0.013, 1e-12);
+}
+
+// THE CLEARANCE GUARD (2026-11-03): surface distances to the valve's boxes and balls, in the
+// rotor frame whatever the valve's pose; an overlap is negative; the nearest pair named.
+TEST(PushPullValveGuards, ClearanceToBoxesAndMarkers)
+{
+  const Mat3 R = Rz(0.9);
+  const Vec3 axis(0.3, 0.2, 0.8);
+  const std::vector<ClearanceBox> boxes{{Vec3(0.160, 0.0, 0.139), Vec3(0.0025, 0.020, 0.065), "fin"}};
+  const std::vector<Vec3> markers{Vec3(0.040, -0.020, 0.1255)};
+  // a horizontal capsule (r 10 mm) 50 mm above the fin top, across it
+  std::vector<ClearanceCapsule> parts{{axis + R * Vec3(0.10, 0.0, 0.254), axis + R * Vec3(0.22, 0.0, 0.254), 0.010, "skid"}};
+  ClearanceResult r = valveClearance(parts, axis, R, boxes, markers, 0.015);
+  EXPECT_NEAR(r.box, 0.040, 1e-9);
+  EXPECT_EQ(r.box_pair, "skid / fin");
+  // the nearest capsule point to the ball is at x = 0.10: distance hypot(0.06, 0.02, 0.1285) - 0.025
+  EXPECT_NEAR(r.marker, std::sqrt(0.06 * 0.06 + 0.02 * 0.02 + 0.1285 * 0.1285) - 0.025, 1e-9);
+  EXPECT_EQ(r.marker_pair, "skid / marker 1");
+  // a point INSIDE the fin: negative by the capsule radius, i.e. an overlap
+  parts = {{axis + R * Vec3(0.160, 0.0, 0.139), axis + R * Vec3(0.160, 0.0, 0.139), 0.005, "probe"}};
+  r = valveClearance(parts, axis, R, boxes, markers, 0.015);
+  EXPECT_NEAR(r.box, -0.005, 1e-12);
 }

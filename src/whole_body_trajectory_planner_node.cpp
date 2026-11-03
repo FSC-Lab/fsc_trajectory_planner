@@ -1149,6 +1149,59 @@ public:
     // is not holding). In the MODEL convention (= the arm's: arm_joint_sign q2 = +1 on every
     // config). 0 = off (the rule above, unchanged).
     declare_parameter<double>("push_pull_guard_q2_max_deg", 0.0);
+    // THE FIN IN THE U (2026-11-03, the valve's U push; Pegasus archive/valve_upush_20261102):
+    // the open gripper only PUSHES the fin, so losing it is harmless -- what is not is the turn
+    // carrying on while the valve stays put (Isaac f0: the landing gear flew into the fin ~70 deg
+    // later). On EVERY valve mocap sample, from Ready's end (the claw on the handle) through the
+    // turn (not the exit, which leaves the fin on purpose), the planner places the fin from the
+    // mocap (push_pull_valve_axis_offset + push_pull_valve_fin: radius, bearing y, top, height,
+    // half length, half thickness, rotor frame) and the claw from the arm's joints, the odometry
+    // and the attitude, and aborts at once (push_pull_guard_fin_persist_s) when the fin is out of
+    // the U: the claw less than fin_depth_min under the fin top (riding over it), more than
+    // fin_across_max across it (out between the claws), the fin more than fin_behind_max BEHIND
+    // the bracket (the U has passed it -- impossible while the fin is inside) or, while the turn
+    // flies, more than fin_ahead_max ahead of it (the U has fallen behind; the slack is ~13 mm). The bracket's push
+    // corner sits fin_bracket_back behind the claw point. Values off the recorded Isaac runs
+    // (archive/valve_upush_20261102/tools/fin_monitor_replay.py). 0 = that check off; all off =
+    // unchanged.
+    declare_parameter<double>("push_pull_guard_fin_depth_min", 0.0);
+    declare_parameter<double>("push_pull_guard_fin_across_max", 0.0);
+    declare_parameter<double>("push_pull_guard_fin_behind_max", 0.0);
+    declare_parameter<double>("push_pull_guard_fin_ahead_max", 0.0);
+    declare_parameter<double>("push_pull_guard_fin_bracket_back", 0.008);
+    declare_parameter<double>("push_pull_guard_fin_persist_s", 0.02);
+    // ... and the ARM folding onto its upper stop while on the fin (2026-11-03, the forced jam: the
+    // fin stays IN the U, so the checks above see nothing; the vehicle presses on the stuck fin and
+    // q3 went 32 -> 50 deg, the stop, in 1.2 s; the tilt guard fired only there and the abort from
+    // the stops crashed). q3 above push_pull_guard_fin_q3_max_deg for fin_persist_s -> abort.
+    // Completed Isaac turns: q3 <= 34.7 deg. 0 = off.
+    declare_parameter<double>("push_pull_guard_fin_q3_max_deg", 0.0);
+    declare_parameter<std::vector<double>>("push_pull_valve_fin",
+      std::vector<double>{0.160, 0.0006, 0.204, 0.130, 0.020, 0.0025});
+    // THE CLEARANCE GUARD (2026-11-03): whatever the cause, the distance from the vehicle --
+    // the skids (push_pull_guard_skid: half length, y, radius; bottom at push_pull_gear_depth),
+    // the struts (push_pull_guard_strut: y and z at the body, radius), the rotor discs
+    // (push_pull_guard_rotor: arm x = y, z, radius) and the arm links base -> joint 4
+    // (push_pull_guard_arm_link_radius; NOT the gripper, which pushes the fin by design) -- to the
+    // valve's fin, beam (push_pull_valve_beam: x0, x1, half width, top, thickness) and hub
+    // (push_pull_valve_hub: radius, top), and to its mocap marker balls (push_pull_valve_markers:
+    // x, y, z per ball, rotor frame; push_pull_valve_marker_radius). On every valve mocap sample
+    // while a step flies or the claw is on the handle within push_pull_guard_clearance_range of the
+    // valve axis: below push_pull_guard_clearance (the boxes) or _clearance_marker (the balls) for
+    // _clearance_persist_s -> abort. Defaults = AM_T650.usda and Valve_Assembly_v2. 0 = off.
+    declare_parameter<double>("push_pull_guard_clearance", 0.0);
+    declare_parameter<double>("push_pull_guard_clearance_marker", 0.0);
+    declare_parameter<double>("push_pull_guard_clearance_persist_s", 0.02);
+    declare_parameter<double>("push_pull_guard_clearance_range", 0.8);
+    declare_parameter<std::vector<double>>("push_pull_guard_skid", std::vector<double>{0.163, 0.1565, 0.0115});
+    declare_parameter<std::vector<double>>("push_pull_guard_strut", std::vector<double>{0.110, -0.05, 0.008});
+    declare_parameter<std::vector<double>>("push_pull_guard_rotor", std::vector<double>{0.2299, 0.1822, 0.1905});
+    declare_parameter<double>("push_pull_guard_arm_link_radius", 0.02);
+    declare_parameter<std::vector<double>>("push_pull_valve_beam",
+      std::vector<double>{-0.025, 0.200, 0.025, 0.054, 0.014});
+    declare_parameter<std::vector<double>>("push_pull_valve_hub", std::vector<double>{0.025, 0.054});
+    declare_parameter<std::vector<double>>("push_pull_valve_markers", std::vector<double>{});
+    declare_parameter<double>("push_pull_valve_marker_radius", 0.015);
     // THE BOX SAMPLE GATE (2026-10-21, the first hardware push): obj_0 mis-solved -- a 94-96
     // deg roll with the origin 61 mm off, or a 180 deg flip -- in runs of 1-25 samples, 80
     // samples over that flight, 2 of them with the claw on the box, where they reached both
@@ -6275,6 +6328,14 @@ private:
       "push_pull_guard_q3_lookahead_s", "push_pull_guard_q3_rate_min_deg_s",
       "push_pull_guard_q3_rate_persist_s", "push_pull_guard_q3_rate_filter_s",
       "push_pull_guard_q2_max_deg",
+      "push_pull_guard_fin_depth_min", "push_pull_guard_fin_across_max", "push_pull_guard_fin_behind_max",
+      "push_pull_guard_fin_ahead_max", "push_pull_guard_fin_bracket_back", "push_pull_guard_fin_persist_s",
+      "push_pull_guard_fin_q3_max_deg",
+      "push_pull_valve_fin", "push_pull_guard_clearance", "push_pull_guard_clearance_marker",
+      "push_pull_guard_clearance_persist_s", "push_pull_guard_clearance_range", "push_pull_guard_skid",
+      "push_pull_guard_strut", "push_pull_guard_rotor", "push_pull_guard_arm_link_radius",
+      "push_pull_valve_beam", "push_pull_valve_hub", "push_pull_valve_markers",
+      "push_pull_valve_marker_radius",
       "push_pull_guard_sway_speed", "push_pull_guard_sway_filter_s", "push_pull_guard_sway_persist_s",
       "push_pull_guard_arm_before_handle", "push_pull_guard_ready_com_err",
       "push_pull_ready_max_com_err", "push_pull_ready_max_com_speed", "push_pull_ready_com_settle_s",
@@ -6503,7 +6564,11 @@ private:
       }
       plMonitorUpdate(p);
       const Eigen::Quaterniond qb(o.w, o.x, o.y, o.z);
-      if (std::abs(qb.norm() - 1.0) < 0.1) {trip = plBoxGuardCheck(p, qb.normalized().toRotationMatrix());}
+      if (std::abs(qb.norm() - 1.0) < 0.1) {
+        const Mat3 Rb = qb.normalized().toRotationMatrix();
+        trip = plBoxGuardCheck(p, Rb);
+        if (!trip) {trip = plFinGuardCheck(p, Rb);}   // the valve's fin in the U + clearance (2026-11-03)
+      }
     }
     if (trip) {
       auto resp = std::make_shared<Trigger::Response>();
@@ -6685,6 +6750,175 @@ private:
       pl_bg_lag_since_.reset();
     }
     return false;
+  }
+
+  // THE FIN IN THE U + THE CLEARANCE GUARD (2026-11-03; the parameters' comment): with lock_
+  // held, on every gate-accepted valve mocap sample (p, R = obj_0). A TURN only. true = abort
+  // now (the claw follows the vehicle at once: pl_abort_drop_anchor_). Its readings go out on
+  // push_pull/arrival_error [34..38].
+  bool plFinGuardCheck(const Vec3 & p, const Mat3 & R)
+  {
+    const double turn = get_parameter("push_pull_turn_deg").as_double();
+    if (turn == 0.0 || !pl_wp_.has_value() || !mode_direct_ || !hold_.has_value() || pl_aborting_ ||
+      pl_abort_plan_)
+    {
+      pl_fin_since_.reset();
+      pl_clr_since_.reset();
+      return false;
+    }
+    Vec3 x_b;
+    Mat3 r0;
+    if (!odomPair(&x_b, &r0) || odomAge() > 0.25 || !q_meas_.has_value() ||
+      secondsSince(q_meas_time_) > 0.25)
+    {
+      // a stale pose or arm: the feed guard (push_pull_guard_box_stale_s) owns that
+      pl_fin_since_.reset();
+      pl_clr_since_.reset();
+      return false;
+    }
+    const auto vec = [this](const char * n, size_t k) {
+        std::vector<double> v = get_parameter(n).as_double_array();
+        v.resize(std::max(v.size(), k), 0.0);
+        return v;
+      };
+    const std::vector<double> off = vec("push_pull_valve_axis_offset", 3);
+    const Vec3 axis = p + R * Vec3(off[0], off[1], off[2]);
+    const std::vector<double> fv = vec("push_pull_valve_fin", 6);
+    ValveFin fin;
+    fin.radius = fv[0];
+    fin.bearing_y = fv[1];
+    fin.top = fv[2];
+    fin.height = fv[3];
+    fin.half_len = fv[4];
+    fin.half_thick = fv[5];
+    const auto now = Clock::now();
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    m.precision(0);
+    // ---- the fin in the U: from Ready's end (on the handle) through the turn, not the exit
+    const bool exiting = pl_flying_.has_value() && *pl_flying_ == kPlExit;
+    const bool on_fin = !exiting &&
+      (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush));
+    const double dmin = get_parameter("push_pull_guard_fin_depth_min").as_double();
+    const double amax = get_parameter("push_pull_guard_fin_across_max").as_double();
+    const double bmax = get_parameter("push_pull_guard_fin_behind_max").as_double();
+    const double fmax = get_parameter("push_pull_guard_fin_ahead_max").as_double();
+    const double q3max = get_parameter("push_pull_guard_fin_q3_max_deg").as_double();
+    if (on_fin && (dmin > 0.0 || amax > 0.0 || bmax > 0.0 || fmax > 0.0 || q3max > 0.0)) {
+      Vec3 r0e;
+      armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
+      const Vec3 claw = x_b + r0 * (vehicle_->r_model * r0e);
+      pl_fin_ = finCapture(claw, axis, R, fin, turn,
+                           get_parameter("push_pull_guard_fin_bracket_back").as_double());
+      pl_fin_t_ = now;
+      if (dmin > 0.0 && pl_fin_.depth < dmin) {
+        m << "the claw only " << pl_fin_.depth * 1e3 << " mm under the fin top (< " << dmin * 1e3
+          << " mm): riding over it";
+      } else if (amax > 0.0 && std::abs(pl_fin_.across) > amax) {
+        m << "the fin " << std::abs(pl_fin_.across) * 1e3 << " mm across the claw (> " << amax * 1e3
+          << " mm): out between the claws";
+      } else if (bmax > 0.0 && pl_fin_.gap < -bmax) {
+        m << "the fin " << -pl_fin_.gap * 1e3 << " mm BEHIND the bracket (> " << bmax * 1e3
+          << " mm): the U has passed it";
+      } else if (fmax > 0.0 && pl_fin_.gap > fmax && pl_flying_.has_value() && *pl_flying_ == kPlPush) {
+        // (only while the turn flies: before it nothing pushes, and under drift the claw waits up to
+        // 62 mm back in the hand-over hold -- Isaac g11_drift4, a false abort before the grasp)
+        m << "the fin " << pl_fin_.gap * 1e3 << " mm ahead of the bracket (> " << fmax * 1e3
+          << " mm): the U has fallen behind it";
+      } else if (q3max > 0.0 && (*q_meas_)(2) * 180.0 / M_PI > q3max) {
+        m.precision(1);
+        m << "q3 " << (*q_meas_)(2) * 180.0 / M_PI << " deg > " << q3max
+          << " deg: the arm folding onto its stop (the valve jammed? the vehicle pressing on the fin)";
+      }
+      if (!m.str().empty()) {
+        if (!pl_fin_since_.has_value()) {pl_fin_since_ = now;}
+        if (secondsSince(pl_fin_since_) >= get_parameter("push_pull_guard_fin_persist_s").as_double()) {
+          pl_guard_reason_ = "FIN OUT OF THE U: " + m.str();
+          pl_guard_tripped_ = true;
+          pl_abort_drop_anchor_ = true;
+          pl_fin_since_.reset();
+          return true;
+        }
+      } else {
+        pl_fin_since_.reset();
+      }
+    } else {
+      pl_fin_since_.reset();
+    }
+    // ---- the clearance: whatever the cause, near the valve while a step flies or on the handle
+    const double cb = get_parameter("push_pull_guard_clearance").as_double();
+    const double cm = get_parameter("push_pull_guard_clearance_marker").as_double();
+    const Vec3 dh = x_b - axis;
+    const bool near = std::hypot(dh(0), dh(1)) <= get_parameter("push_pull_guard_clearance_range").as_double();
+    if (!(cb > 0.0 || cm > 0.0) || !near || !(pl_flying_.has_value() || pl_at_handle_)) {
+      pl_clr_since_.reset();
+      return false;
+    }
+    std::vector<ClearanceCapsule> parts;
+    const auto world = [&](const Vec3 & b) {return Vec3(x_b + r0 * b);};
+    const std::vector<double> sk = vec("push_pull_guard_skid", 3);
+    const std::vector<double> st = vec("push_pull_guard_strut", 3);
+    const double skz = -(get_parameter("push_pull_gear_depth").as_double() - sk[2]);
+    for (const double s : {1.0, -1.0}) {
+      const char * side = s > 0.0 ? "L" : "R";
+      parts.push_back({world({-sk[0], s * sk[1], skz}), world({sk[0], s * sk[1], skz}), sk[2],
+                       std::string("skid ") + side});
+      parts.push_back({world({0.0, s * st[0], st[1]}), world({0.0, s * sk[1], skz}), st[2],
+                       std::string("strut ") + side});
+    }
+    const std::vector<double> ro = vec("push_pull_guard_rotor", 3);
+    for (int k = 0; k < 4; ++k) {
+      const Vec3 c{(k == 0 || k == 3) ? ro[0] : -ro[0], (k == 1 || k == 3) ? ro[0] : -ro[0], ro[1]};
+      const std::string nm = "rotor " + std::to_string(k);
+      parts.push_back({world(c), world(c), 0.0, nm});
+      for (int j = 0; j < 16; ++j) {
+        const double a = 2.0 * M_PI * j / 16.0;
+        for (const double rr : {0.5 * ro[2], ro[2]}) {
+          const Vec3 q = c + Vec3(rr * std::cos(a), rr * std::sin(a), 0.0);
+          parts.push_back({world(q), world(q), 0.0, nm});
+        }
+      }
+    }
+    std::array<Vec3, 5> cp;
+    armChainPoints(*q_meas_, vehicle_->params, &cp);
+    const double lr = get_parameter("push_pull_guard_arm_link_radius").as_double();
+    static const char * const kLink[] = {"arm base-joint2", "arm joint2-joint3", "arm joint3-joint4"};
+    for (int k = 0; k < 3; ++k) {
+      parts.push_back({world(vehicle_->r_model * cp[k]), world(vehicle_->r_model * cp[k + 1]), lr, kLink[k]});
+    }
+    const std::vector<double> bm = vec("push_pull_valve_beam", 5);
+    const std::vector<double> hb = vec("push_pull_valve_hub", 2);
+    std::vector<ClearanceBox> boxes{
+      {Vec3(fin.radius, fin.bearing_y, fin.top - 0.5 * fin.height),
+       Vec3(fin.half_thick, fin.half_len, 0.5 * fin.height), "fin"},
+      {Vec3(0.5 * (bm[0] + bm[1]), 0.0, bm[3] - 0.5 * bm[4]), Vec3(0.5 * (bm[1] - bm[0]), bm[2], 0.5 * bm[4]),
+       "beam"},
+      {Vec3(0.0, 0.0, 0.5 * hb[1]), Vec3(hb[0], hb[0], 0.5 * hb[1]), "hub"}};
+    std::vector<Vec3> markers;
+    const std::vector<double> mk = get_parameter("push_pull_valve_markers").as_double_array();
+    for (size_t k = 0; k + 2 < mk.size(); k += 3) {markers.emplace_back(mk[k], mk[k + 1], mk[k + 2]);}
+    pl_clr_ = valveClearance(parts, axis, R, boxes, markers,
+                             get_parameter("push_pull_valve_marker_radius").as_double());
+    pl_clr_t_ = now;
+    m.str("");
+    if (cb > 0.0 && pl_clr_.box < cb) {
+      m << pl_clr_.box_pair << " " << pl_clr_.box * 1e3 << " mm (< " << cb * 1e3 << " mm)";
+    } else if (cm > 0.0 && pl_clr_.marker < cm) {
+      m << pl_clr_.marker_pair << " " << pl_clr_.marker * 1e3 << " mm (< " << cm * 1e3 << " mm)";
+    }
+    if (m.str().empty()) {
+      pl_clr_since_.reset();
+      return false;
+    }
+    if (!pl_clr_since_.has_value()) {pl_clr_since_ = now;}
+    if (secondsSince(pl_clr_since_) < get_parameter("push_pull_guard_clearance_persist_s").as_double()) {
+      return false;
+    }
+    pl_guard_reason_ = "CLEARANCE: " + m.str();
+    pl_guard_tripped_ = true;
+    pl_abort_drop_anchor_ = true;
+    pl_clr_since_.reset();
+    return true;
   }
 
   // THE PUSH MONITOR (2026-10-21, user): the arm GS's live Push rows -- the
@@ -8897,6 +9131,15 @@ private:
       const bool sway_fresh = secondsSince(pl_sway_t_) < 0.25;
       m.data.push_back(sway_fresh ? pl_sway_e_.norm() : std::nan(""));
       m.data.push_back(sway_fresh ? pl_sway_v_.norm() : std::nan(""));
+      // [34] the claw's depth under the fin top, [35] the fin across the claw, [36] the fin ahead
+      // of the bracket (< 0: behind), [37] the vehicle's clearance to the valve's boxes, [38] to
+      // its marker balls [m] (2026-11-03: the fin-in-the-U and clearance guards; NaN when not armed)
+      const bool fin_fresh = secondsSince(pl_fin_t_) < 0.25, clr_fresh = secondsSince(pl_clr_t_) < 0.25;
+      m.data.push_back(fin_fresh ? pl_fin_.depth : std::nan(""));
+      m.data.push_back(fin_fresh ? pl_fin_.across : std::nan(""));
+      m.data.push_back(fin_fresh ? pl_fin_.gap : std::nan(""));
+      m.data.push_back(clr_fresh ? pl_clr_.box : std::nan(""));
+      m.data.push_back(clr_fresh ? pl_clr_.marker : std::nan(""));
       if (within != pl_within_ || s != pl_err_step_ || (s == kPlGoToStart && holding) ||
         pl_handle_settling_ || settle_done)
       {
@@ -9445,6 +9688,11 @@ private:
   // the report arrived before the abort plan was installed; the pause's length [s]
   bool pl_abort_open_wait_{false};
   bool pl_abort_open_seen_{false};
+  // the fin-in-the-U and clearance guards (2026-11-03): latest readings, when, persistence
+  FinCapture pl_fin_;
+  std::optional<Clock::time_point> pl_fin_t_, pl_fin_since_;
+  ClearanceResult pl_clr_;
+  std::optional<Clock::time_point> pl_clr_t_, pl_clr_since_;
   double pl_abort_wait_s_{0.0};
   std::optional<Clock::time_point> pl_jaws_open_at_;   ///< a report with no abort waiting (1 s grace)
   std::string pl_abort_opened_by_;   ///< what ended this abort's pause (a late report is told)
