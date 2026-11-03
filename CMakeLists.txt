@@ -42,6 +42,7 @@ add_library(planner_lib STATIC
   src/trajectory.cpp
   src/arm_sweep_planner.cpp
   src/pick_place.cpp
+  src/mail_route.cpp
   src/push_pull.cpp
   src/workspace.cpp)
 set_target_properties(planner_lib PROPERTIES
@@ -80,6 +81,7 @@ install(PROGRAMS
   test/test_ee_trajectory_origin.py
   test/test_pick_place_loopback.py
   test/test_pick_place_get_loopback.py
+  test/test_mail_route_loopback.py
   test/test_teleop_loopback.py
   test/ee_trajectory_sim_driver.py
   test/ee_trajectory_sim_cycle.sh
@@ -109,12 +111,18 @@ if(BUILD_TESTING)
   ament_add_gtest(test_pick_place test/test_pick_place.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_pick_place planner_lib)
+  ament_add_gtest(test_mail_route test/test_mail_route.cpp
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(test_mail_route planner_lib)
   ament_add_gtest(test_push_pull test/test_push_pull.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_push_pull planner_lib)
   ament_add_gtest(test_teleop_reference test/test_teleop_reference.cpp
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(test_teleop_reference planner_lib)
+  ament_add_gtest(test_claw_speed test/test_claw_speed.cpp
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(test_claw_speed planner_lib)
   # The parity fixture is the flight stack's own (installed beside its
   # flat_planner_selftest), so the two tests can never disagree on the truth.
   get_filename_component(_wb_share "${fsc_autopilot_ros2_DIR}/.." ABSOLUTE)

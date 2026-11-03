@@ -843,3 +843,62 @@ publishes stand-in pick / drop points on private topics
   once it is large (as in pp3). Proposed, not yet done: a dwell longer than
   one swing (`pick_place_settle_s` 3 s) and a slower descent (>= 8 s, a new
   `pick_place_descent_t_min`). Data: `log/pick_place_sim/*pp7_matched_approach*`.
+
+## Mail route (2026-11-03)
+
+The mail delivery extended to THREE letters, posted ALTERNATELY into TWO
+mailboxes (letter 1 RED, 2 BLUE, 3 RED) -- `pick_place_route` (default false:
+the single mission is untouched). It is NOT a new mission: every letter flies
+the six-leg insert mission's legs, descents, exits, gates and abort on its own
+waypoints (`mail_route.{hpp,cpp}`: `mailRouteLetterTargets` / `mailRouteWaypoints`
+over `pickPlaceWaypoints`), and a one-letter route is today's mission to 1e-12
+(gtest). `pp_wp_` is the letter in progress; the route keeps all of them.
+
+- **The operator chooses the letter** (user design): `pick_place/route/select_letter_<k>`
+  (the arm GS's Mail Route tab, one button each). Its go_to_start flies to its
+  PICK START (`pick_place_route_pick_start_offset`, letter frame, default
+  `[-0.5, 0, 0.35, 0]`). Nothing switches by itself: a letter's place exit POSTS
+  it and the route waits. Selecting is refused while a motion flies, while a
+  letter is in the claw (lifted and not posted, or the claw closed on it at its
+  hat), and for a posted letter. The land legs fly whenever no letter is in the
+  claw (go_to_land_start out of the leg order). An abort with a letter in the
+  claw marks it dropped. info [88..]: on, letter, N, its box, per-letter state
+  (0 to do, 1 picked, 2 posted, 3 dropped), per-letter box, planned flight time.
+- **Gets**: `route/capture_letter_<k>` / `route/get_box_<b>` average the pick body
+  (the localization frame) through the pick / place locator into
+  `pick_place_route_letter_points` / `_box_points` ([x, y, z, yaw_deg] per entry,
+  NaN = not measured); a Get reading the frame on another hat or box is refused
+  (`pick_place_min_pick_place_dist`). `pick_place_place_start_offset` is required
+  (each box's Place Start follows it).
+- **The hats are obstacles** (`HatClearance`, measured off AM_T650.usda's /body
+  mesh: gear box +-0.163 x +-0.168 m down to -0.243, the frame's OUTLINE per 10 deg
+  sector from the plates up -- the plates ~0.08 m all round, the four diagonal arms
+  to the motors at 0.35 m -- four 15" prop discs at (+-0.2299, +-0.2299) from +0.05
+  up, the claw + a hanging letter). A square frame box (+-0.253 m) was 3x too wide
+  straight ahead and refused letter 2's own pick in Isaac (route3). The pick pose holds the body only ~0.07 m above the pick
+  point, so at a pick the gear hangs below the hat tops: with the letters FACING
+  the boxes and the hats 0.5 m apart along the approach, a pick stands the gear on
+  the next hat (refused). The layout flown: the line along x in front of the
+  boxes, letters TURNED 90 deg (picked from the side), 0.5-0.6 m apart.
+  `hatConflict` checks every leg, descent and exit -- the dry run AND every
+  re-plan from the hold -- and a transit starting below the CRUISE FLOOR (gear
+  clear of every hat top, ~1.09 m) climbs to it first (`planMailRouteLeg`; the
+  turn to the boxes after a pick otherwise swept the gear 4 cm over the emptied
+  hat). `pick_place_route_hat_check` false turns both off.
+- The route's automatic release goes out on `pick_place/route/drop_now`, so the
+  Mail Envelope tab (which also flies the insert and opens on `pick_place/drop_now`)
+  does not release a second time.
+
+Tests: `test_mail_route.cpp` (6 gtests), `test/test_mail_route_loopback.py`
+(Gets, the hat-check refusal, letter 1 posted and the route waiting, a select of a
+posted letter refused, an abort, letter 3 selected instead, no select / land with
+it in the claw, COMPLETE "2 of 3 letters posted", route off = the single mission).
+Isaac: Pegasus `08_px4_t650_aerial_manipulator_mail_route.py` +
+`scripts/indoor_sim/start_t650_aerial_manipulator_whole_body_L1_4D_mail_route_sitl.sh`,
+flown by `docs/docs_aerial_manipulator/archive/mail_route_20261103/tools/run_mail_route.sh`
+(route2, 2026-11-03: all three letters in the right boxes, release errors <= 10 mm;
+the auto insert's 15 mm gate never passed against the 27-40 mm hold offset, so
+the driver pressed Insert after 20 s each time, as the operator does; route3,
+order 1, 3, 2: letters 1 and 3 posted into RED, letter 2's pick descent refused by
+the square frame model -- fixed with the outline, gtest
+`APicksOwnHatIsClearOfTheFrameWithRoomForATrim`).

@@ -98,9 +98,11 @@
 #include <fsc_autopilot_ros2_msgs/msg/position_controller_reference.hpp>
 #include <fsc_autopilot_ros2_msgs/msg/whole_body_reference.hpp>
 
+#include "fsc_trajectory_planner/claw_speed.hpp"
 #include "fsc_trajectory_planner/ee_trajectory_planner.hpp"
 #include "fsc_trajectory_planner/kinematics.hpp"
 #include "fsc_trajectory_planner/pick_place.hpp"
+#include "fsc_trajectory_planner/mail_route.hpp"
 #include "fsc_trajectory_planner/push_pull.hpp"
 #include "fsc_trajectory_planner/teleop_reference.hpp"
 #include "fsc_trajectory_planner/trajectory.hpp"
@@ -707,6 +709,37 @@ public:
     // 20261023/cad/make_localization_frame.py).
     declare_parameter<std::vector<double>>("pick_place_pick_locator", std::vector<double>{});
     declare_parameter<std::vector<double>>("pick_place_place_locator", std::vector<double>{});
+    // THE MAIL ROUTE (2026-11-03, mail_route.hpp): the insert mission flown once
+    // per letter -- pick_place_route_letters letters from as many hats, posted in
+    // ALTERNATION into pick_place_route_boxes mailboxes (letter 1 into box 1,
+    // letter 2 into box 2, ...). Each letter's legs are the six-leg mission's
+    // (go_to_start = its Pick Start); the operator selects the letter
+    // (pick_place/route/select_letter_<k>), a letter's place exit posts it, and the
+    // land legs fly whenever no letter is in the claw. false = the single mission,
+    // unchanged.
+    declare_parameter<bool>("pick_place_route", false);
+    // fixed at launch: one Get service per letter and per box
+    declare_parameter<int>("pick_place_route_letters", 3);
+    declare_parameter<int>("pick_place_route_boxes", 2);
+    // [x, y, z, yaw_deg] per letter / per box, flat, letters in FLYING order;
+    // NaN = not measured yet, [] = none. Written by the route's Gets
+    // (pick_place/route/capture_letter_<k>, get_box_<b>: the localization frame
+    // through the pick / place locator, as capture_pick / get_place) and by the
+    // arm GS's rows; never shifted by Adjust.
+    declare_parameter<std::vector<double>>("pick_place_route_letter_points", std::vector<double>{});
+    declare_parameter<std::vector<double>>("pick_place_route_box_points", std::vector<double>{});
+    declare_parameter<std::vector<std::string>>(
+      "pick_place_route_box_names", std::vector<std::string>{"RED", "BLUE"});
+    // a letter's Pick Start = the letter + [dx, dy, dz, dyaw_deg] in its own frame:
+    // 0.5 m back from the hat, 0.35 m up; [] = Start
+    declare_parameter<std::vector<double>>(
+      "pick_place_route_pick_start_offset", std::vector<double>{-0.5, 0.0, 0.35, 0.0});
+    // THE HATS AS OBSTACLES (HatClearance, 2026-11-03): every leg, descent and exit
+    // of the route is checked against every hat (the gear, frame, props and claw,
+    // within this margin), and a transit starting below the cruise floor climbs to
+    // it first. false = neither (a layout the check cannot describe).
+    declare_parameter<bool>("pick_place_route_hat_check", true);
+    declare_parameter<double>("pick_place_route_hat_margin", 0.03);
 
     // --- push-and-pull mode (push_pull.hpp) --------------------------------
     // The box: a mocap body (CG + yaw), captured by capture_box (the arm GS's
@@ -1360,6 +1393,10 @@ public:
     // the autonomous drop's release signal (pick_place_drop_auto): once per drop
     // hold, the gate values as text; the arm GS's Pick & Drop tab opens the gripper
     pp_drop_now_pub_ = create_publisher<String>(prefix + "/pick_place/drop_now", 10);
+    // the MAIL ROUTE's release (2026-11-03): its own topic, so only the arm GS's Mail
+    // Route tab acts on it -- the Mail Envelope tab, which also flies the insert,
+    // opens on pick_place/drop_now and would release (and exit) a second time
+    pp_route_drop_now_pub_ = create_publisher<String>(prefix + "/pick_place/route/drop_now", 10);
     const auto trigger = [this](const std::string & name, std::function<void(Trigger::Response::SharedPtr)> fn) {
         pp_srvs_.push_back(create_service<Trigger>(
           name, [fn](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr r) {fn(r);}));
@@ -1388,6 +1425,20 @@ public:
     // the PLACE point measured with the payload itself (2026-10-10): the PICK
     // body's pose -> pick_place_place_point x, y, z (the arm GS's Place-row Get)
     trigger(prefix + "/pick_place/get_place", [this](Trigger::Response::SharedPtr r) {onPpGetPlace(r);});
+    // the mail route's Gets, one per letter and per mailbox
+    for (int k = 0; k < ppRouteCount(false); ++k) {
+      trigger(prefix + "/pick_place/route/capture_letter_" + std::to_string(k + 1),
+        [this, k](Trigger::Response::SharedPtr r) {onRouteGet(k, false, r);});
+    }
+    for (int b = 0; b < ppRouteCount(true); ++b) {
+      trigger(prefix + "/pick_place/route/get_box_" + std::to_string(b + 1),
+        [this, b](Trigger::Response::SharedPtr r) {onRouteGet(b, true, r);});
+    }
+    // the letter the operator flies (the arm GS's Mail Route tab, one button each)
+    for (int k = 0; k < ppRouteCount(false); ++k) {
+      trigger(prefix + "/pick_place/route/select_letter_" + std::to_string(k + 1),
+        [this, k](Trigger::Response::SharedPtr r) {onRouteSelect(k, r);});
+    }
     anchor_cli_ = create_client<SetBool>(get_parameter("pick_place_anchor_service").as_string());
     // THE FAST HAND-BACK (2026-11-01, Pegasus archive/two_param_sets_20261101): the leash and
     // the guard aborts hand the claw back to the vehicle through the node's _fast service,
@@ -2726,6 +2777,12 @@ private:
       if (finished) {
         if (pp_abort_plan_ && pp_abort_plan_ == plan_) {
           RCLCPP_WARN(get_logger(), "pick-and-place: ABORT complete -- holding, arm home.");
+          // the mail route: the abort opened the gripper -- a letter in the claw is dropped
+          if (!pp_route_wps_.empty() && pp_route_letter_ < static_cast<int>(pp_route_state_.size()) &&
+            (pp_route_state_[pp_route_letter_] == 1 || (pp_at_table_ && pp_completed_ == kExecutePick)))
+          {
+            pp_route_state_[pp_route_letter_] = 3;
+          }
           pp_at_table_ = false;   // climbed off, arm folded
         }
         pp_abort_plan_.reset();
@@ -2733,6 +2790,7 @@ private:
           pp_exited_[*pp_exiting_] = true;
           pp_at_table_ = false;   // back at the clearance point: the next leg needs no retreat
           RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", ppExitName(*pp_exiting_));
+          if (!pp_route_wps_.empty()) {routeExitDone(*pp_exiting_);}
           if (pp_exit_to_land_) {
             // the drop's exit flew on to Land Start: Go To Land Start is done
             pp_completed_ = kGoToLandStart;
@@ -3934,6 +3992,35 @@ private:
           r.successful = false;
           r.reason = n + " needs [], [dx, dy, dz] or [dx, dy, dz, dyaw_deg], all finite";
         }
+      } else if (n == "pick_place_route_letters" || n == "pick_place_route_boxes") {
+        r.successful = false;
+        r.reason = n + " is fixed at launch (one Get service per letter / mailbox is made then)";
+      } else if (n == "pick_place_route_letter_points" || n == "pick_place_route_box_points") {
+        // [] or [x, y, z, yaw_deg] per letter / box; NaN = not measured, never inf
+        const size_t len = 4 * static_cast<size_t>(ppRouteCount(n == "pick_place_route_box_points"));
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (!p.as_double_array().empty() && p.as_double_array().size() != len) ||
+          std::any_of(p.as_double_array().begin(), p.as_double_array().end(),
+          [](double x) {return std::isinf(x);}))
+        {
+          r.successful = false;
+          r.reason = n + " needs [] or " + std::to_string(len) + " numbers ([x, y, z, yaw_deg] each, NaN = "
+            "not measured)";
+        }
+      } else if (n == "pick_place_route_pick_start_offset") {
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (!p.as_double_array().empty() && p.as_double_array().size() != 4) ||
+          !std::all_of(p.as_double_array().begin(), p.as_double_array().end(),
+          [](double x) {return std::isfinite(x);}))
+        {
+          r.successful = false;
+          r.reason = n + " needs [] or [dx, dy, dz, dyaw_deg], all finite";
+        }
+      } else if (n == "pick_place_route_hat_margin") {
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || !(p.as_double() >= 0.0)) {
+          r.successful = false;
+          r.reason = n + " needs a number >= 0 [m] (a double)";
+        }
       } else if (n == "pick_place_pick_point") {
         // [] = not captured, else [x, y, z, yaw_deg], all finite (2026-10-10)
         if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
@@ -4055,6 +4142,7 @@ private:
   void ppInvalidate()
   {
     pp_wp_.reset();
+    pp_route_wps_.clear();
     clearDropAim();
     pp_planning_ = false;
     pp_error_.clear();
@@ -4460,6 +4548,10 @@ private:
 
   void onPpPlan(Trigger::Response::SharedPtr resp)
   {
+    if (get_parameter("pick_place_route").as_bool()) {
+      onRoutePlan(resp);
+      return;
+    }
     // a Place Start that follows the place point: the row shows what is planned
     // (a typed place point may have changed since the last Get)
     bool idle = false;
@@ -4586,6 +4678,7 @@ private:
     PickPlaceWaypoints wp;
     PickPlaceConfig cfg;
     PlanOptions opts;
+    RouteCheck rc;            // the mail route's leg rule and hat check (off outside it)
     unsigned gen = 0;
     std::string aim;          // the drop's aim at the basket, for the reply
     {
@@ -4605,7 +4698,10 @@ private:
         err = "PS4 teleoperation engaged -- disengage it first";
       } else if (state_ == "EXECUTING" || state_ == "CALCULATING") {
         err = "planner is " + state_ + " -- wait for HOLD";
-      } else if (leg > pp_completed_ + 1) {
+      } else if (leg >= kGoToLandStart && !pp_route_wps_.empty() && routeCarrying()) {
+        err = "letter " + std::to_string(pp_route_letter_ + 1) + " is in the claw -- post it (or Abort) before "
+          "landing";
+      } else if (leg > pp_completed_ + 1 && !(leg == kGoToLandStart && !pp_route_wps_.empty())) {
         err = std::string("out of order -- the next leg is ") + pickPlaceLegName(pp_completed_ + 1);
       } else if (!odom_p_.has_value() || secondsSince(odom_p_time_) > kOdomFreshS) {
         err = "no fresh odometry -- a leg must not start blind";
@@ -4635,6 +4731,7 @@ private:
         aim = pp_aim_text_;
       }
       wp = *pp_wp_;
+      rc = ppRouteCheck(leg == kExecutePick);
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -4661,11 +4758,13 @@ private:
     publishPpStatus();
     publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen, from_table]() {
+    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen, from_table, rc]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
-          traj = planPickPlaceLeg(*vehicle_, *planner_, opts, cfg, wp, leg, from, from_table);
+          traj = rc.on ? planMailRouteLeg(*vehicle_, *planner_, opts, cfg, wp, leg, from, from_table, rc.floor)
+                       : planPickPlaceLeg(*vehicle_, *planner_, opts, cfg, wp, leg, from, from_table);
+          routeHatCheck(rc, traj, pickPlaceLegName(leg), &err);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -4877,6 +4976,7 @@ private:
     PlanOptions opts;
     std::optional<PickPlaceWaypoints> wp;
     double drop_shift = -1.0;   // the drop's exit: the vehicle's offset from the hold [m]
+    RouteCheck rc;
     unsigned gen = 0;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
@@ -4907,6 +5007,7 @@ private:
         return;
       }
       if (pp_wp_.has_value()) {wp = *pp_wp_;}
+      rc = ppRouteCheck(leg == kExecutePick);
       pp_exit_to_land_ = pickPlaceExitEndsAtLandStart(cfg, leg);
       from = *hold_;
       // THE DROP'S EXIT STARTS WHERE THE VEHICLE IS (2026-10-15, user: the claw
@@ -4944,11 +5045,12 @@ private:
     publishPpStatus();
     publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, leg, from, cfg, opts, gen, wp]() {
+    worker_ = std::thread([this, leg, from, cfg, opts, gen, wp, rc]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
           traj = planPickPlaceExit(*vehicle_, *planner_, opts, cfg, leg, from, wp ? &*wp : nullptr);
+          routeHatCheck(rc, traj, ppExitName(leg), &err);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -5188,6 +5290,466 @@ private:
     return get_parameter("push_pull_guard_arm_before_handle").as_bool() && plPreGraspRoomHeld();
   }
 
+  // ================================================== the mail route
+  // (pick_place_route, mail_route.hpp): the insert mission once per letter, the
+  // letters posted alternately into the boxes. Plan dry-runs the whole route and
+  // keeps every letter's waypoints; pp_wp_ is the letter in progress, so every
+  // leg, descent, exit, gate and abort above flies it unchanged. The operator
+  // selects the letter (onRouteSelect); a letter's place exit posts it and the
+  // route waits for the next selection, or the land legs.
+
+  int ppRouteCount(bool boxes) const
+  {
+    const int64_t n = get_parameter(boxes ? "pick_place_route_boxes" : "pick_place_route_letters").as_int();
+    return static_cast<int>(std::max<int64_t>(0, n));
+  }
+
+  std::string ppRouteBoxName(int b) const
+  {
+    const auto names = get_parameter("pick_place_route_box_names").as_string_array();
+    return b >= 0 && b < static_cast<int>(names.size()) ? names[b] : "box " + std::to_string(b + 1);
+  }
+
+  // Entry k of pick_place_route_letter_points / _box_points: false when it is not
+  // measured (NaN, or the array too short).
+  bool ppRoutePoint(const char * param, int k, Vec3 * p, double * yaw) const
+  {
+    const auto v = get_parameter(param).as_double_array();
+    if (k < 0 || v.size() < 4 * static_cast<size_t>(k + 1)) {return false;}
+    for (int i = 0; i < 4; ++i) {
+      if (!std::isfinite(v[4 * k + i])) {return false;}
+    }
+    *p = Vec3{v[4 * k], v[4 * k + 1], v[4 * k + 2]};
+    *yaw = v[4 * k + 3] * M_PI / 180.0;
+    return true;
+  }
+
+  // The route's inputs: Start / Land Start / Land as the six-leg mission takes them
+  // (Adjust already written in, a base capture's x, y), every letter and every box
+  // as measured, the two offsets. Called under the lock.
+  bool ppRouteTargets(MailRouteTargets * t, std::string * err) const
+  {
+    BasePose * base[3] = {&t->start, &t->land_start, &t->land};
+    const int leg[3] = {kGoToStart, kGoToLandStart, kExecuteLand};
+    for (int i = 0; i < 3; ++i) {
+      if (!ppBase(std::string("pick_place_") + kPpPoint[leg[i]], base[i], err)) {return false;}
+      if (pp_capture_[leg[i]].has_value()) {base[i]->p.head<2>() = pp_capture_[leg[i]]->head<2>();}
+    }
+    const int n = ppRouteCount(false), nb = ppRouteCount(true);
+    if (n < 1 || nb < 1) {
+      *err = "the mail route needs at least one letter and one mailbox (pick_place_route_letters / _boxes)";
+      return false;
+    }
+    std::string missing;
+    for (int k = 0; k < n; ++k) {
+      Vec3 p;
+      double y = 0.0;
+      if (!ppRoutePoint("pick_place_route_letter_points", k, &p, &y)) {
+        missing += (missing.empty() ? "" : ", ") + std::string("letter ") + std::to_string(k + 1);
+        continue;
+      }
+      t->letters.push_back(p);
+      t->letter_yaw.push_back(y);
+    }
+    for (int b = 0; b < nb; ++b) {
+      Vec3 p;
+      double y = 0.0;
+      if (!ppRoutePoint("pick_place_route_box_points", b, &p, &y)) {
+        missing += (missing.empty() ? "" : ", ") + std::string("mailbox ") + ppRouteBoxName(b);
+        continue;
+      }
+      t->boxes.push_back(p);
+      t->box_yaw.push_back(y);
+    }
+    if (!missing.empty()) {
+      *err = "Get " + missing + " first (the localization frame on each hat, then on each mailbox)";
+      return false;
+    }
+    t->place_start_offset = get_parameter("pick_place_place_start_offset").as_double_array();
+    if (t->place_start_offset.size() != 4) {
+      *err = "the mail route needs pick_place_place_start_offset: each mailbox's Place Start follows its box";
+      return false;
+    }
+    t->pick_start_offset = get_parameter("pick_place_route_pick_start_offset").as_double_array();
+    return true;
+  }
+
+  // What a route motion is checked against, snapshot under the lock for a
+  // planning worker: the cruise floor of its transits and the hats (off outside
+  // a planned route). `own_pick`: the motion is the letter's pick (its approach,
+  // descent or exit) -- the claw may reach that letter's hat.
+  struct RouteCheck
+  {
+    bool on{false};
+    int letter{0};
+    int own{-1};
+    double floor{-std::numeric_limits<double>::infinity()};
+    std::vector<Vec3> hats;
+    HatClearance hc;
+  };
+
+  RouteCheck ppRouteCheck(bool own_pick) const
+  {
+    RouteCheck rc;
+    if (pp_route_wps_.empty()) {return rc;}
+    rc.on = true;
+    rc.letter = pp_route_letter_;
+    rc.own = own_pick ? pp_route_letter_ : -1;
+    rc.floor = pp_route_floor_;
+    rc.hats = pp_route_hats_;
+    rc.hc.margin = get_parameter("pick_place_route_hat_margin").as_double();
+    return rc;
+  }
+
+  // A route motion re-planned from the hold that would strike a hat is refused
+  // like an infeasible one (the dry run checked the plan from the nominal holds).
+  void routeHatCheck(
+    const RouteCheck & rc, std::shared_ptr<Trajectory> & traj, const std::string & what, std::string * err) const
+  {
+    if (!rc.on || !traj || rc.hats.empty()) {return;}
+    const std::string why = hatConflict(
+      *vehicle_, *traj, rc.hats, rc.own, rc.hc, "letter " + std::to_string(rc.letter + 1) + ": " + what);
+    if (!why.empty()) {
+      *err = why;
+      traj.reset();
+    }
+  }
+
+  void onRoutePlan(Trigger::Response::SharedPtr resp)
+  {
+    MailRouteTargets tg;
+    PickPlaceConfig cfg;
+    PlanOptions opts;
+    RestSpec from;
+    HatClearance hc;
+    std::vector<double> loc;
+    bool hat_check = true;
+    unsigned gen = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (!mode_direct_ || !hold_.has_value()) {
+        resp->success = false;
+        resp->message = "not in whole-body DIRECT (the first leg is planned from the hold)";
+        return;
+      }
+      if (teleopActive()) {
+        resp->success = false;
+        resp->message = "PS4 teleoperation engaged -- disengage it first";
+        return;
+      }
+      if (pp_flying_.has_value() || pp_exiting_.has_value() || state_ == "EXECUTING") {
+        resp->success = false;
+        resp->message = "planner is " + state_ + " -- plan once it holds";
+        return;
+      }
+      std::string err;
+      if (!ppConfig(&cfg, &err) || !ppRouteTargets(&tg, &err)) {
+        resp->success = false;
+        resp->message = err;
+        return;
+      }
+      // THE WRONG-FRAME CHECK, per pair: a Get with the frame still on another
+      // hat or box writes a point on top of that one
+      const double min_d = get_parameter("pick_place_min_pick_place_dist").as_double();
+      if (min_d > 0.0) {
+        std::vector<std::pair<std::string, Vec3>> pts;
+        for (size_t k = 0; k < tg.letters.size(); ++k) {pts.push_back({"letter " + std::to_string(k + 1), tg.letters[k]});}
+        for (size_t b = 0; b < tg.boxes.size(); ++b) {pts.push_back({"mailbox " + ppRouteBoxName(b), tg.boxes[b]});}
+        for (size_t a = 0; a < pts.size(); ++a) {
+          for (size_t b = a + 1; b < pts.size(); ++b) {
+            const double d = (pts[a].second - pts[b].second).head<2>().norm();
+            if (d >= min_d) {continue;}
+            std::ostringstream m;
+            m.setf(std::ios::fixed);
+            m.precision(2);
+            m << pts[a].first << " and " << pts[b].first << " are only " << d << " m apart (needs " << min_d
+              << ") -- one Get read the frame on the wrong target: redo that Get";
+            resp->success = false;
+            resp->message = m.str();
+            return;
+          }
+        }
+      }
+      hat_check = get_parameter("pick_place_route_hat_check").as_bool();
+      hc.margin = get_parameter("pick_place_route_hat_margin").as_double();
+      loc = get_parameter("pick_place_pick_locator").as_double_array();
+      opts = planOptions();
+      from = *hold_;
+      ppInvalidate();
+      gen = pp_gen_;
+      pp_planning_ = true;
+      pp_aborted_ = false;
+      pp_guard_tripped_ = false;
+    }
+    publishPpStatus();
+    publishPpPaths(nullptr);
+    if (pp_worker_.joinable()) {pp_worker_.join();}
+    pp_worker_ = std::thread([this, tg, cfg, opts, from, gen, hc, loc, hat_check]() {
+        std::vector<PickPlaceWaypoints> wps;
+        std::vector<Vec3> hats;
+        MailRoutePlan plan;
+        std::string err;
+        try {
+          wps = mailRouteWaypoints(*vehicle_, cfg, tg);
+          if (hat_check) {hats = mailRouteHats(tg, loc);}
+          plan = planMailRoute(*vehicle_, *planner_, opts, cfg, wps, from, hat_check ? &hats : nullptr, hc);
+        } catch (const std::exception & e) {
+          err = e.what();
+        }
+        {
+          std::lock_guard<std::recursive_mutex> lk(lock_);
+          if (gen != pp_gen_) {return;}   // superseded
+          pp_planning_ = false;
+          if (!err.empty()) {
+            pp_error_ = err;
+            RCLCPP_WARN(get_logger(), "mail route plan refused: %s", err.c_str());
+          } else {
+            const size_t n = wps.size();
+            pp_route_wps_ = wps;
+            pp_route_hats_ = hats;
+            pp_route_floor_ = hat_check ? mailRouteCruiseFloor(hats, hc)
+                                        : -std::numeric_limits<double>::infinity();
+            pp_route_T_ = plan.whole->duration();
+            pp_route_leg_T_.assign(n, {});
+            pp_route_exit_T_.assign(n, {});
+            for (size_t i = 0; i < n; ++i) {
+              for (int k = 0; k < kNumPickPlaceLegs; ++k) {
+                // the land legs are the last letter's, flown once at the end
+                const auto & L = plan.legs[plan.legs[i][k] ? i : n - 1][k];
+                pp_route_leg_T_[i][k] = L ? L->duration() : 0.0;
+                pp_route_exit_T_[i][k] = plan.exits[i][k] ? plan.exits[i][k]->duration() : 0.0;
+              }
+            }
+            if (pp_route_state_.size() != n) {
+              pp_route_state_.assign(n, 0);
+              pp_route_letter_ = 0;
+            }
+            pp_route_letter_ = std::clamp(pp_route_letter_, 0, static_cast<int>(n) - 1);
+            pp_wp_ = pp_route_wps_[pp_route_letter_];
+            pp_leg_T_ = pp_route_leg_T_[pp_route_letter_];
+            pp_exit_T_ = pp_route_exit_T_[pp_route_letter_];
+            clearDropAim();
+            for (size_t i = 0; i < n; ++i) {
+              RCLCPP_INFO(get_logger(), "mail route letter %zu -> mailbox %s: legs %.1f / %.1f / %.1f / %.1f s, "
+                "exits %.1f / %.1f s", i + 1,
+                ppRouteBoxName(mailRouteBox(static_cast<int>(i), static_cast<int>(tg.boxes.size()))).c_str(),
+                pp_route_leg_T_[i][0], pp_route_leg_T_[i][1], pp_route_leg_T_[i][2], pp_route_leg_T_[i][3],
+                pp_route_exit_T_[i][kExecutePick], pp_route_exit_T_[i][kExecutePlace]);
+            }
+            if (hat_check) {
+              RCLCPP_INFO(get_logger(), "mail route planned: %.1f s of flight, %zu letters, every leg clear of "
+                "the %zu hats, transits from >= %.3f m", pp_route_T_, n, hats.size(), pp_route_floor_);
+            } else {
+              RCLCPP_WARN(get_logger(), "mail route planned: %.1f s of flight, %zu letters -- hat check OFF",
+                pp_route_T_, n);
+            }
+          }
+        }
+        publishPpStatus();
+        publishPpInfo();
+        publishPpPaths(plan.whole.get());
+      });
+    resp->success = true;
+    resp->message = "planning the mail route (" + std::to_string(tg.letters.size()) + " letters into " +
+      std::to_string(tg.boxes.size()) + " mailboxes, alternately) from the current hold -- the status "
+      "reads READY when done";
+  }
+
+  // GET for the route: the localization frame (the pick body) averaged as every
+  // capture, through the pick locator for a letter (the letter where the frame's
+  // slot puts it) or the place locator for a mailbox (its mouth and heading),
+  // written into entry k of the route's points.
+  void onRouteGet(int k, bool box, Trigger::Response::SharedPtr resp)
+  {
+    const char * param = box ? "pick_place_route_box_points" : "pick_place_route_letter_points";
+    const std::string what = box ? "mailbox " + ppRouteBoxName(k) : "letter " + std::to_string(k + 1);
+    std::ostringstream m;
+    m.setf(std::ios::fixed);
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      if (pp_flying_.has_value() || pp_exiting_.has_value()) {
+        resp->success = false;
+        resp->message = "a pick-and-place motion is in flight -- Get once it holds";
+        return;
+      }
+      if (pp_topic_[kExecutePick].empty()) {
+        resp->success = false;
+        resp->message = "no mocap body for the localization frame -- set pick_place_pick_topic";
+        return;
+      }
+      PpAverage a;
+      if (!ppAverageBody(kExecutePick, (what + " NOT measured").c_str(), &a, &resp->message)) {
+        resp->success = false;
+        return;
+      }
+      Vec3 target;
+      double yaw = 0.0;
+      std::string note;
+      const bool located = ppThroughLocator(
+        box ? "pick_place_place_locator" : "pick_place_pick_locator", a, &target, &yaw, &note);
+      const int cnt = ppRouteCount(box);
+      std::vector<double> v = get_parameter(param).as_double_array();
+      if (v.size() != 4 * static_cast<size_t>(cnt)) {v.assign(4 * cnt, std::numeric_limits<double>::quiet_NaN());}
+      double yaw_deg = wrapPi(yaw) * 180.0 / M_PI;
+      if (box) {
+        // as get_place: the frame's heading, written nearest the one already there
+        const double old = std::isfinite(v[4 * k + 3]) ? v[4 * k + 3] : 0.0;
+        yaw_deg = located ? old + wrapPi(yaw - old * M_PI / 180.0) * 180.0 / M_PI : old;
+      }
+      // THE WRONG-FRAME CHECK: the frame still on another hat or box
+      const double min_d = get_parameter("pick_place_min_pick_place_dist").as_double();
+      if (min_d > 0.0) {
+        for (int other_box = 0; other_box < 2; ++other_box) {
+          for (int j = 0; j < ppRouteCount(other_box == 1); ++j) {
+            if ((other_box == 1) == box && j == k) {continue;}
+            Vec3 p;
+            double y = 0.0;
+            if (!ppRoutePoint(other_box ? "pick_place_route_box_points" : "pick_place_route_letter_points", j, &p, &y)) {
+              continue;
+            }
+            const double d = (target - p).head<2>().norm();
+            if (d >= min_d) {continue;}
+            const std::string other = other_box ? "mailbox " + ppRouteBoxName(j) : "letter " + std::to_string(j + 1);
+            m.precision(2);
+            m << what << " NOT changed: it reads [" << target(0) << ", " << target(1) << ", " << target(2)
+              << "] m, only " << d << " m from " << other << " (needs " << min_d << ") -- is the frame still on "
+              << (other_box ? "that mailbox" : "that letter's hat") << "? Set it on " << what << "'s "
+              << (box ? "top" : "hat") << ", then Get";
+            resp->success = false;
+            resp->message = m.str();
+            return;
+          }
+        }
+      }
+      const bool was_planned = pp_wp_.has_value();
+      v[4 * k] = target(0);
+      v[4 * k + 1] = target(1);
+      v[4 * k + 2] = target(2);
+      v[4 * k + 3] = yaw_deg;
+      const auto res = set_parameters({rclcpp::Parameter(param, v)});   // onPpParams: plan made stale
+      if (res.empty() || !res.front().successful) {
+        resp->success = false;
+        resp->message = what + " NOT measured: " + param + " not set" +
+          (res.empty() ? std::string() : ": " + res.front().reason);
+        return;
+      }
+      m.precision(3);
+      m << what << " at [" << target(0) << ", " << target(1) << ", " << target(2) << "] m, yaw "
+        << std::setprecision(1) << yaw_deg << " deg, from ";
+      if (located) {
+        m << note << " (" << pp_topic_[kExecutePick] << ", ";
+      } else {
+        m << pp_topic_[kExecutePick] << " (";
+      }
+      m << a.n << " samples, spread " << std::setprecision(1) << a.spread * 1e3 << " mm)";
+      if (was_planned) {m << " -- the plan is stale, press Plan";}
+    }
+    resp->success = true;
+    resp->message = m.str();
+    RCLCPP_INFO(get_logger(), "mail route: %s", resp->message.c_str());
+    publishPpStatus();
+    publishPpInfo();
+    publishPpPaths(nullptr);
+  }
+
+  // A letter's exit completed (streamTick, under the lock): the pick's marks it
+  // picked (in the claw), the place's posted. The route then WAITS: the operator
+  // selects the next letter (onRouteSelect) or lands.
+  void routeExitDone(int leg)
+  {
+    const int n = static_cast<int>(pp_route_wps_.size());
+    if (static_cast<int>(pp_route_state_.size()) != n) {pp_route_state_.assign(n, 0);}
+    pp_route_state_[pp_route_letter_] = leg == kExecutePick ? 1 : 2;
+  }
+
+  // A letter in the claw: lifted off its hat and not posted, or the claw closed on
+  // it at its hat (under the lock).
+  bool routeCarrying() const
+  {
+    const bool lifted = pp_route_letter_ < static_cast<int>(pp_route_state_.size()) &&
+      pp_route_state_[pp_route_letter_] == 1;
+    return lifted || (pp_at_table_ && pp_completed_ == kExecutePick);
+  }
+
+  // SELECT LETTER k (2026-11-03, user design: the arm GS's Mail Route tab has one
+  // button per letter; the operator chooses which letter is picked and posted, no
+  // automatic switching): its waypoints become the mission's and its go_to_start
+  // (to its Pick Start) the next leg. Refused while a motion flies, while a letter
+  // is in the claw, and for a letter already posted (its hat is empty).
+  void onRouteSelect(int k, Trigger::Response::SharedPtr resp)
+  {
+    {
+      std::lock_guard<std::recursive_mutex> lk(lock_);
+      std::string err;
+      const int n = static_cast<int>(pp_route_wps_.size());
+      if (n == 0) {
+        err = "no mail route planned -- press Plan";
+      } else if (k < 0 || k >= n) {
+        err = "the route has " + std::to_string(n) + " letters";
+      } else if (pp_planning_ || pp_flying_.has_value() || pp_exiting_.has_value() || pp_aborting_ ||
+        pp_abort_plan_ || state_ == "EXECUTING" || state_ == "CALCULATING")
+      {
+        err = "a motion is in flight -- wait for the hold, or Abort first";
+      } else if (k != pp_route_letter_ && routeCarrying()) {
+        err = "letter " + std::to_string(pp_route_letter_ + 1) + " is in the claw -- post it (or Abort) first";
+      } else if (k < static_cast<int>(pp_route_state_.size()) && pp_route_state_[k] == 2) {
+        err = "letter " + std::to_string(k + 1) + " is already posted -- its hat is empty";
+      }
+      if (!err.empty()) {
+        resp->success = false;
+        resp->message = "Letter " + std::to_string(k + 1) + ": " + err;
+        return;
+      }
+      if (static_cast<int>(pp_route_state_.size()) != n) {pp_route_state_.assign(n, 0);}
+      const int nb = ppRouteCount(true);
+      if (k == pp_route_letter_ && pp_completed_ < kExecutePlace) {
+        resp->success = true;
+        resp->message = "letter " + std::to_string(k + 1) + " is already the letter in progress";
+      } else {
+        pp_route_letter_ = k;
+        pp_completed_ = -1;
+        pp_exited_.fill(false);
+        pp_wp_ = pp_route_wps_[k];
+        pp_leg_T_ = pp_route_leg_T_[k];
+        pp_exit_T_ = pp_route_exit_T_[k];
+        pp_drop_hold_t0_.reset();
+        resetDropAuto();
+        pp_aborted_ = false;
+        pp_guard_tripped_ = false;
+        pp_error_.clear();
+        pp_timed_out_ = false;
+        resp->success = true;
+        resp->message = "letter " + std::to_string(k + 1) + " selected (into mailbox " +
+          ppRouteBoxName(mailRouteBox(k, nb)) + ") -- next: go_to_start, to its Pick Start";
+      }
+    }
+    RCLCPP_INFO(get_logger(), "mail route: %s", resp->message.c_str());
+    publishPpStatus();
+    publishPpInfo();
+  }
+
+  // The status line's route suffix (under the lock).
+  std::string routeSuffix() const
+  {
+    const int n = static_cast<int>(pp_route_wps_.size());
+    std::ostringstream m;
+    const int nb = ppRouteCount(true);
+    if (pp_completed_ >= kNumPickPlaceLegs - 1) {
+      const auto posted = std::count(pp_route_state_.begin(), pp_route_state_.end(), 2);
+      m << " [route: " << posted << " of " << n << " letters posted]";
+    } else if (pp_route_letter_ < static_cast<int>(pp_route_state_.size()) &&
+      pp_route_state_[pp_route_letter_] == 2 && pp_completed_ < kGoToLandStart)
+    {
+      m << " [letter " << pp_route_letter_ + 1 << " posted into mailbox "
+        << ppRouteBoxName(mailRouteBox(pp_route_letter_, nb)) << " -- select the next letter, or "
+        << pickPlaceLegName(kGoToLandStart) << "]";
+    } else {
+      m << " [letter " << pp_route_letter_ + 1 << "/" << n << " -> mailbox "
+        << ppRouteBoxName(mailRouteBox(pp_route_letter_, nb)) << "]";
+    }
+    return m.str();
+  }
+
   void onPpReset(Trigger::Response::SharedPtr resp)
   {
     {
@@ -5202,6 +5764,8 @@ private:
       pp_guard_tripped_ = false;
       pp_at_table_ = false;
       pp_exited_.fill(false);
+      pp_route_letter_ = 0;
+      pp_route_state_.clear();
       pp_drop_hold_t0_.reset();
       resetDropAuto();
       ppInvalidate();
@@ -5209,6 +5773,7 @@ private:
     }
     resp->success = true;
     resp->message = "pick-and-place progress and plan cleared (captures and the Adjust offset kept)";
+    if (get_parameter("pick_place_route").as_bool()) {resp->message += "; the mail route starts again at letter 1";}
     publishPpStatus();
     publishPpInfo();
     publishPpPaths(nullptr);
@@ -5323,7 +5888,12 @@ private:
     if (!drop_now.empty()) {
       String d;
       d.data = drop_now;
-      pp_drop_now_pub_->publish(d);
+      bool route = false;
+      {
+        std::lock_guard<std::recursive_mutex> lk(lock_);
+        route = !pp_route_wps_.empty();
+      }
+      (route ? pp_route_drop_now_pub_ : pp_drop_now_pub_)->publish(d);
     }
     if (descend) {startPpDescent();}
     if (gate_changed) {publishPpStatus();}
@@ -5379,46 +5949,6 @@ private:
     pp_ins_prev_.clear();
     pp_ins_text_.clear();
     return true;
-  }
-
-  // The claw's speed for the autonomous insert / drop gates (2026-10-30), over the
-  // samples of the last 0.5 s: the LARGER of its least-squares velocity and its
-  // spread as a speed (2 x the largest deviation from the samples' mean / the span).
-  // A two-sample speed read the 10 Hz samples' few-mm jitter as 0.05-0.08 m/s on a
-  // claw holding within 15 mm (sim, layout_auto1), so the 0.03 m/s gate never held;
-  // a displacement over 0.5 s alone was blind to a ~1 Hz swing (drop_auto_check).
-  // The fit rejects jitter, the spread catches a swing. NaN until 4 samples span
-  // 0.4 s; a gap > 0.25 s starts afresh.
-  static double clawSpeed(std::deque<std::pair<Clock::time_point, Vec3>> * buf, const Vec3 & claw,
-    Clock::time_point now)
-  {
-    constexpr double kWindow = 0.5;
-    const auto age = [&](const Clock::time_point & t) {
-        return std::chrono::duration<double>(now - t).count();
-      };
-    if (!buf->empty() && age(buf->back().first) > 0.25) {buf->clear();}
-    buf->emplace_back(now, claw);
-    while (!buf->empty() && age(buf->front().first) > kWindow + 1e-6) {buf->pop_front();}
-    const double span = age(buf->front().first);
-    if (buf->size() < 4 || span < 0.4) {return std::numeric_limits<double>::quiet_NaN();}
-    double tm = 0.0;
-    Vec3 xm = Vec3::Zero();
-    for (const auto & s : *buf) {
-      tm += -age(s.first);
-      xm += s.second;
-    }
-    tm /= static_cast<double>(buf->size());
-    xm /= static_cast<double>(buf->size());
-    double stt = 0.0, rmax = 0.0;
-    Vec3 stx = Vec3::Zero();
-    for (const auto & s : *buf) {
-      const double dtm = -age(s.first) - tm;
-      stt += dtm * dtm;
-      stx += dtm * (s.second - xm);
-      rmax = std::max(rmax, (s.second - xm).norm());
-    }
-    const double fit = stt > 1e-9 ? (stx / stt).norm() : 0.0;
-    return std::max(fit, 2.0 * rmax / span);
   }
 
   // Called under the lock: a new drop hold (or none) -- nothing released yet.
@@ -5783,6 +6313,7 @@ private:
     PickPlaceWaypoints wp;
     PickPlaceConfig cfg;
     PlanOptions opts;
+    RouteCheck rc;
     unsigned gen = 0;
     int leg = -1;
     {
@@ -5808,6 +6339,7 @@ private:
       // arrival error stays measured against the TRUE target (pp_wp_)
       pp_descent_trim_ = descentTrim();
       wp.goal[leg].x_b += pp_descent_trim_;
+      rc = ppRouteCheck(leg == kExecutePick);
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -5822,11 +6354,12 @@ private:
     publishPpStatus();
     publishPpInfo();
     if (worker_.joinable()) {worker_.join();}
-    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen]() {
+    worker_ = std::thread([this, leg, from, wp, cfg, opts, gen, rc]() {
         std::shared_ptr<Trajectory> traj;
         std::string err;
         try {
           traj = planPickPlaceDescent(*vehicle_, *planner_, opts, cfg, wp, leg, from);
+          routeHatCheck(rc, traj, std::string(pickPlaceLegName(leg)) + " descent", &err);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -5911,12 +6444,20 @@ private:
         } else if (pp_completed_ >= kNumPickPlaceLegs - 1) {
           m << "touch down with SAFETY -> land";
         } else {
-          m << "re-fly " << pickPlaceLegName(pp_completed_ + 1) << " or Reset";
+          m << "re-fly " << pickPlaceLegName(pp_completed_ + 1)
+            << (pp_route_wps_.empty() ? " or Reset" : ", select another letter, or Reset");
         }
       } else if (!pp_wp_.has_value()) {
-        PickPlaceTargets t;
         std::string err;
-        m << "NOT PLANNED: " << (ppTargets(&t, &err) ? std::string("press Plan") : err);
+        bool ok = false;
+        if (get_parameter("pick_place_route").as_bool()) {
+          MailRouteTargets t;
+          ok = ppRouteTargets(&t, &err);
+        } else {
+          PickPlaceTargets t;
+          ok = ppTargets(&t, &err);
+        }
+        m << "NOT PLANNED: " << (ok ? std::string("press Plan") : err);
       } else if (pp_completed_ >= kNumPickPlaceLegs - 1) {
         m << "COMPLETE -- touch down with SAFETY -> land";
       } else if (pp_completed_ < 0) {
@@ -5940,6 +6481,7 @@ private:
           if (!pp_drop_text_.empty()) {m << " -- " << pp_drop_text_;}
         }
       }
+      if (mode_direct_ && !pp_route_wps_.empty()) {m << routeSuffix();}
       s = m.str();
     }
     String msg;
@@ -6000,6 +6542,21 @@ private:
       m.data.push_back(pp_at_table_ ? 1.0 : 0.0);
       m.data.push_back(pp_exiting_.has_value() ? static_cast<double>(*pp_exiting_) : -1.0);
       m.data.push_back(static_cast<double>(pp_phase_));
+      // [88] the route is on, [89] its letter in progress (0-based), [90] N
+      // letters, [91] that letter's box (0-based), [92 .. 92+N) each letter's
+      // state (0 to do, 1 picked, 2 posted, 3 dropped by an abort), [92+N .. 92+2N) each
+      // letter's box, [92+2N] the planned route's flight time [s] (NaN unplanned)
+      const int n = ppRouteCount(false), nb = ppRouteCount(true);
+      const bool route = get_parameter("pick_place_route").as_bool();
+      m.data.push_back(route ? 1.0 : 0.0);
+      m.data.push_back(route ? static_cast<double>(pp_route_letter_) : -1.0);
+      m.data.push_back(static_cast<double>(n));
+      m.data.push_back(static_cast<double>(mailRouteBox(pp_route_letter_, nb)));
+      for (int k = 0; k < n; ++k) {
+        m.data.push_back(k < static_cast<int>(pp_route_state_.size()) ? pp_route_state_[k] : 0.0);
+      }
+      for (int k = 0; k < n; ++k) {m.data.push_back(static_cast<double>(mailRouteBox(k, nb)));}
+      m.data.push_back(pp_route_wps_.empty() ? nan : pp_route_T_);
     }
     pp_info_pub_->publish(m);
   }
@@ -9057,6 +9614,17 @@ private:
   rclcpp::Client<SetBool>::SharedPtr anchor_cli_;
   rclcpp::Client<SetBool>::SharedPtr anchor_fast_cli_;   // (2026-11-01) the fast hand-back
   bool pp_anchor_world_{false};                 // the whole-body node was asked for WORLD
+  // THE MAIL ROUTE (pick_place_route): every letter's waypoints from Plan (pp_wp_
+  // is the one in progress), their planned leg / exit durations, the hats and the
+  // cruise floor the legs are checked against, the letter in progress and what
+  // became of each (0 to do, 1 picked, 2 posted, 3 dropped by an abort)
+  std::vector<PickPlaceWaypoints> pp_route_wps_;
+  std::vector<std::array<double, kNumPickPlaceLegs>> pp_route_leg_T_, pp_route_exit_T_;
+  std::vector<Vec3> pp_route_hats_;
+  double pp_route_floor_{-std::numeric_limits<double>::infinity()};
+  double pp_route_T_{0.0};
+  int pp_route_letter_{0};
+  std::vector<int> pp_route_state_;
   OnSetParametersCallbackHandle::SharedPtr pp_param_cb_;
   // push-and-pull mode (push_pull.hpp)
   std::string pl_box_topic_;                    // the box's mocap body
@@ -9260,7 +9828,7 @@ private:
   rclcpp::Service<Trigger>::SharedPtr ee_origin_srv_;
   rclcpp::TimerBase::SharedPtr ee_err_timer_;
   rclcpp::Publisher<String>::SharedPtr pp_status_pub_;
-  rclcpp::Publisher<String>::SharedPtr pp_drop_now_pub_;
+  rclcpp::Publisher<String>::SharedPtr pp_drop_now_pub_, pp_route_drop_now_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr pp_info_pub_, pp_path_pub_, pp_drone_path_pub_;
   rclcpp::Publisher<Float64MultiArray>::SharedPtr pp_arrival_pub_, pp_ws_pub_;
   std::vector<rclcpp::Service<Trigger>::SharedPtr> pp_srvs_;
