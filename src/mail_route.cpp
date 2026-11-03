@@ -90,16 +90,22 @@ std::vector<PickPlaceWaypoints> mailRouteWaypoints(
   return wps;
 }
 
-std::vector<Vec3> mailRouteHats(const MailRouteTargets & t, const std::vector<double> & pick_locator)
+std::vector<Vec3> mailRouteHats(
+  const MailRouteTargets & t, const std::vector<double> & pick_locator,
+  const std::vector<double> & frame_centroid)
 {
   std::vector<Vec3> hats;
   const bool loc = pick_locator.size() == 3 || pick_locator.size() == 4;
+  const bool cen = frame_centroid.size() == 2;
   for (size_t i = 0; i < t.letters.size(); ++i) {
     Vec3 h = t.letters[i];
     if (loc) {
-      // the letter = the frame + Rz(frame yaw) [dx, dy, dz], frame yaw = letter yaw - dyaw
+      // the letter = the frame + Rz(frame yaw) [dx, dy, dz], frame yaw = letter yaw - dyaw;
+      // the frame (obj_0, the markers' centroid) = O + Rz(frame yaw) c
       const double fy = t.letter_yaw[i] - (pick_locator.size() == 4 ? pick_locator[3] * M_PI / 180.0 : 0.0);
-      h.head<2>() -= (Rz(fy) * Vec3(pick_locator[0], pick_locator[1], 0.0)).head<2>();
+      const Vec3 back(pick_locator[0] + (cen ? frame_centroid[0] : 0.0),
+        pick_locator[1] + (cen ? frame_centroid[1] : 0.0), 0.0);
+      h.head<2>() -= (Rz(fy) * back).head<2>();
     }
     hats.push_back(h);
   }
@@ -236,8 +242,11 @@ MailRoutePlan planMailRoute(
               planPickPlaceDescent(v, transition, opts, c, wp, k, wp.approach[k]))};
           leg = std::make_shared<SequenceTrajectory>(std::move(segs));
         }
-        // the claw is MEANT to reach its own letter's hat on the pick and its exit
-        const int own = k == kExecutePick ? static_cast<int>(i) : -1;
+        // the claw is MEANT to reach its own letter's hat on the pick and its exit,
+        // and the go_to_place_start after them starts over it with the letter hanging
+        // (it climbs to the cruise floor first; 2026-11-03 audit: with a Vertical
+        // Margin under ~0.13 m it was refused at t = 0 with the letter in the claw)
+        const int own = (k == kExecutePick || k == kGoToPlaceStart) ? static_cast<int>(i) : -1;
         const auto check = [&](const Trajectory & tr, const std::string & what) {
             if (hats == nullptr) {return;}
             const std::string why = hatConflict(v, tr, *hats, own, hc, what);

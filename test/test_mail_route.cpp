@@ -205,6 +205,70 @@ TEST(MailRoute, TheHatsAreWhereTheFrameStoodOnThem)
     EXPECT_NEAR(hats[i](2), t.letters[i](2), 1e-12);   // the top: the letter's height
   }
   EXPECT_LT((mailRouteHats(t, {})[1] - t.letters[1]).norm(), 1e-12);   // no locator: at the letters
+  // obj_0 is the markers' CENTROID, c from the hat's centre O in the frame's axes
+  // (2026-11-03 audit): the hat is O = obj_0 - Rz(yaw) c; the letters here are turned
+  // 90 deg, so Rz c = (-c_y, c_x)
+  const std::vector<double> c{-0.00358, 0.00638};
+  const auto at_o = mailRouteHats(t, kLocator, c);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_NEAR(at_o[i](0), 0.70 - 0.6 * i + c[1], 1e-12) << i;
+    EXPECT_NEAR(at_o[i](1), -c[0], 1e-12) << i;
+    EXPECT_NEAR(at_o[i](2), t.letters[i](2), 1e-12) << i;
+  }
+}
+
+TEST(MailRoute, ALowVerticalMarginStillLiftsTheLetterOffItsOwnHat)
+{
+  // 2026-11-03 audit: the go_to_place_start after a pick starts over the hat the letter
+  // was just lifted from. Its claw was checked against that hat, so with the pick's exit
+  // under ~0.13 m above the letter (Vertical Margin 0.10) the leg was refused at t = 0
+  // with the letter in the claw. That hat is exempt for the claw on this leg too (the
+  // leg climbs to the cruise floor first); the airframe is still checked against it.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = mailConfig(*v);
+  c.approach_dz = 0.10;
+  const MailRouteTargets t = scene();
+  const auto hats = mailRouteHats(t, kLocator);
+  std::string why;
+  try {
+    planMailRoute(*v, *planner, PlanOptions{}, c, mailRouteWaypoints(*v, c, t), hold(*v), &hats);
+  } catch (const std::runtime_error & e) {
+    why = e.what();
+  }
+  EXPECT_TRUE(why.empty()) << why;
+}
+
+TEST(MailRoute, AMidRoutePlanIsCheckedFromLetterOnesPickStart)
+{
+  // 2026-11-03 audit: a route re-planned at a pick hold (after a margin edit there) was
+  // dry-run from that hold with letter 1's go_to_start -- the claw starts on the hat it
+  // is picking from, which is not that leg's own, so the whole Plan was refused. The
+  // node now dry-runs a route under way from letter 1's Pick Start; the first leg is
+  // then a rest-to-rest of zero length, which the planner flies as a short hold.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  const PickPlaceConfig c = mailConfig(*v);
+  const MailRouteTargets t = scene();
+  const auto wps = mailRouteWaypoints(*v, c, t);
+  const auto hats = mailRouteHats(t, kLocator);
+  std::string old_why;
+  try {
+    planMailRoute(*v, *planner, PlanOptions{}, c, wps, wps[1].goal[kExecutePick], &hats);
+  } catch (const std::runtime_error & e) {
+    old_why = e.what();
+  }
+  std::cout << "  from letter 2's pick hold: " << old_why << "\n";
+  EXPECT_NE(old_why.find("letter 1: go_to_start"), std::string::npos) << old_why;
+  EXPECT_NE(old_why.find("hat 2"), std::string::npos) << old_why;
+  std::string why;
+  try {
+    const MailRoutePlan p = planMailRoute(*v, *planner, PlanOptions{}, c, wps, wps[0].goal[kGoToStart], &hats);
+    EXPECT_TRUE(p.whole);
+  } catch (const std::runtime_error & e) {
+    why = e.what();
+  }
+  EXPECT_TRUE(why.empty()) << why;
 }
 
 TEST(MailRoute, EveryLegKeepsTheAirframeAndClawClearOfTheHats)

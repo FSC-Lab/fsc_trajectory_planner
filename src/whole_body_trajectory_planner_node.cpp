@@ -740,6 +740,12 @@ public:
     // it first. false = neither (a layout the check cannot describe).
     declare_parameter<bool>("pick_place_route_hat_check", true);
     declare_parameter<double>("pick_place_route_hat_margin", 0.03);
+    // obj_0 (the frame's MARKER CENTROID, Motive's default pivot) from the hat's centre O,
+    // [x, y] in the frame's axes [m] (Pegasus archive/mail_delivery_20261023 README: the
+    // five markers' centroid (-3.58, 6.38, 41.1) mm from O); the hats are placed at O.
+    // [] = obj_0 on O (2026-11-03 audit)
+    declare_parameter<std::vector<double>>(
+      "pick_place_route_frame_centroid", std::vector<double>{-0.00358, 0.00638});
 
     // --- push-and-pull mode (push_pull.hpp) --------------------------------
     // The box: a mocap body (CG + yaw), captured by capture_box (the arm GS's
@@ -1434,6 +1440,9 @@ public:
       trigger(prefix + "/pick_place/route/get_box_" + std::to_string(b + 1),
         [this, b](Trigger::Response::SharedPtr r) {onRouteGet(b, true, r);});
     }
+    // the route's own Plan (2026-11-03 audit: the Mail Route tab plans through this, so
+    // pick_place_route stays the yaml's and the other tabs' Plan stays the single mission)
+    trigger(prefix + "/pick_place/route/plan", [this](Trigger::Response::SharedPtr r) {onRoutePlan(r);});
     // the letter the operator flies (the arm GS's Mail Route tab, one button each)
     for (int k = 0; k < ppRouteCount(false); ++k) {
       trigger(prefix + "/pick_place/route/select_letter_" + std::to_string(k + 1),
@@ -1732,6 +1741,15 @@ private:
         pp_flying_.reset();
         pp_phase_ = kPpNone;
         pp_exec_plan_.reset();
+        // (2026-11-03, the mail route's operator fuzzer) an EXIT cut by SAFETY: nothing flies
+        // it any more, and pp_exiting_ was cleared only by the exit completing or an abort, so
+        // after DIRECT came back the status read FLYING exit_* for ever and every button but
+        // ABORT (which opens the gripper) refused. The exit is not marked done: the claw is
+        // where SAFETY left it (pp_at_table_ / the route's state keep the carrying interlock),
+        // and the operator presses it again from the new hold.
+        pp_exit_plan_.reset();
+        pp_exiting_.reset();
+        pp_exit_to_land_ = false;
         pp_abort_plan_.reset();
         pp_aborting_ = false;
         pp_aborted_ = false;
@@ -2777,12 +2795,16 @@ private:
       if (finished) {
         if (pp_abort_plan_ && pp_abort_plan_ == plan_) {
           RCLCPP_WARN(get_logger(), "pick-and-place: ABORT complete -- holding, arm home.");
-          // the mail route: the abort opened the gripper -- a letter in the claw is dropped
-          if (!pp_route_wps_.empty() && pp_route_letter_ < static_cast<int>(pp_route_state_.size()) &&
-            (pp_route_state_[pp_route_letter_] == 1 || (pp_at_table_ && pp_completed_ == kExecutePick)))
-          {
-            pp_route_state_[pp_route_letter_] = 3;
+          // the mail route: the abort opened the gripper -- a letter in the claw is dropped,
+          // one let go in the mailbox before Exit To Insert is posted
+          if (pp_route_on_ && pp_route_letter_ < static_cast<int>(pp_route_state_.size())) {
+            if (pp_route_abort_posted_) {
+              pp_route_state_[pp_route_letter_] = 2;
+            } else if (pp_route_state_[pp_route_letter_] == 1 || (pp_at_table_ && pp_completed_ == kExecutePick)) {
+              pp_route_state_[pp_route_letter_] = 3;
+            }
           }
+          pp_route_abort_posted_ = false;
           pp_at_table_ = false;   // climbed off, arm folded
         }
         pp_abort_plan_.reset();
@@ -2790,7 +2812,7 @@ private:
           pp_exited_[*pp_exiting_] = true;
           pp_at_table_ = false;   // back at the clearance point: the next leg needs no retreat
           RCLCPP_INFO(get_logger(), "pick-and-place: %s complete.", ppExitName(*pp_exiting_));
-          if (!pp_route_wps_.empty()) {routeExitDone(*pp_exiting_);}
+          if (pp_route_on_) {routeExitDone(*pp_exiting_);}
           if (pp_exit_to_land_) {
             // the drop's exit flew on to Land Start: Go To Land Start is done
             pp_completed_ = kGoToLandStart;
@@ -4007,6 +4029,15 @@ private:
           r.reason = n + " needs [] or " + std::to_string(len) + " numbers ([x, y, z, yaw_deg] each, NaN = "
             "not measured)";
         }
+      } else if (n == "pick_place_route_frame_centroid") {
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
+          (!p.as_double_array().empty() && p.as_double_array().size() != 2) ||
+          std::any_of(p.as_double_array().begin(), p.as_double_array().end(),
+          [](double x) {return !std::isfinite(x) || std::abs(x) > 0.1;}))
+        {
+          r.successful = false;
+          r.reason = n + " needs [] or [x, y] (finite, within 0.1 m)";
+        }
       } else if (n == "pick_place_route_pick_start_offset") {
         if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
           (!p.as_double_array().empty() && p.as_double_array().size() != 4) ||
@@ -4584,6 +4615,14 @@ private:
         resp->message = "planner is " + state_ + " -- plan once it holds";
         return;
       }
+      // never with a letter of a mail route in the claw: the single mission would drop the
+      // route's carrying interlocks (2026-11-03 audit)
+      if (pp_route_on_ && routeCarrying()) {
+        resp->success = false;
+        resp->message = "the mail route has letter " + std::to_string(pp_route_letter_ + 1) +
+          " in the claw -- post it (or Abort) first, or re-plan the route from the Mail Route tab";
+        return;
+      }
       std::string err;
       if (!ppConfig(&cfg, &err) || !ppTargets(&tg, &err)) {
         resp->success = false;
@@ -4613,6 +4652,15 @@ private:
           resp->message = m.str();
           return;
         }
+      }
+      // a single-mission Plan ENDS a mail route session (2026-11-03 audit; the check that
+      // refuses it with a letter in the claw is above, before the single mission's own)
+      if (pp_route_on_) {
+        RCLCPP_INFO(get_logger(), "mail route ended: the single mission is planned instead");
+        pp_route_on_ = false;
+        pp_route_state_.clear();
+        pp_route_letter_ = 0;
+        pp_route_abort_posted_ = false;
       }
       opts = planOptions();
       from = *hold_;
@@ -4698,10 +4746,10 @@ private:
         err = "PS4 teleoperation engaged -- disengage it first";
       } else if (state_ == "EXECUTING" || state_ == "CALCULATING") {
         err = "planner is " + state_ + " -- wait for HOLD";
-      } else if (leg >= kGoToLandStart && !pp_route_wps_.empty() && routeCarrying()) {
+      } else if (leg >= kGoToLandStart && pp_route_on_ && routeCarrying()) {
         err = "letter " + std::to_string(pp_route_letter_ + 1) + " is in the claw -- post it (or Abort) before "
           "landing";
-      } else if (leg > pp_completed_ + 1 && !(leg == kGoToLandStart && !pp_route_wps_.empty())) {
+      } else if (leg > pp_completed_ + 1 && !(leg == kGoToLandStart && pp_route_on_)) {
         err = std::string("out of order -- the next leg is ") + pickPlaceLegName(pp_completed_ + 1);
       } else if (!odom_p_.has_value() || secondsSince(odom_p_time_) > kOdomFreshS) {
         err = "no fresh odometry -- a leg must not start blind";
@@ -4731,7 +4779,7 @@ private:
         aim = pp_aim_text_;
       }
       wp = *pp_wp_;
-      rc = ppRouteCheck(leg == kExecutePick);
+      rc = ppRouteCheck(leg);
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -4752,6 +4800,19 @@ private:
       pp_aborted_ = false;
       pp_guard_tripped_ = false;
       restoreAnchor();
+      // (2026-11-03, the operator fuzzer) a leg flown OFF THE PICK with the claw on the letter --
+      // Go To Mailbox Start pressed without Exit To Pick: its retreat lifts the letter just as
+      // the exit would. The route records it picked now; it marked a letter picked only on the
+      // exit, so once that retreat had cleared pp_at_table_ the letter was no longer "in the
+      // claw" and landing, Reset and another letter were all accepted with it still gripped.
+      if (pp_route_on_ && pp_at_table_ && pp_completed_ == kExecutePick && leg != kExecutePick &&
+        pp_route_letter_ < static_cast<int>(pp_route_state_.size()) &&
+        pp_route_state_[pp_route_letter_] == 0)
+      {
+        pp_route_state_[pp_route_letter_] = 1;
+        RCLCPP_INFO(get_logger(), "mail route: letter %d leaves its hat with %s (no Exit To Pick) -- "
+          "recorded in the claw", pp_route_letter_ + 1, pickPlaceLegName(leg));
+      }
     }
     const bool from_table = pp_at_table_;
     publishStatus();
@@ -4912,6 +4973,8 @@ private:
       pp_timed_out_ = false;
       pp_aborted_ = true;
       pp_aborting_ = true;
+      // the route: Exit To Insert flies only after the letter was let go in the mailbox
+      pp_route_abort_posted_ = pp_route_on_ && pp_exiting_.has_value() && *pp_exiting_ == kExecutePlace;
       pp_exit_plan_.reset();
       pp_exiting_.reset();
       restoreAnchor();                  // the climb is a flight motion: CoM anchor
@@ -5007,7 +5070,7 @@ private:
         return;
       }
       if (pp_wp_.has_value()) {wp = *pp_wp_;}
-      rc = ppRouteCheck(leg == kExecutePick);
+      rc = ppRouteCheck(leg);
       pp_exit_to_land_ = pickPlaceExitEndsAtLandStart(cfg, leg);
       from = *hold_;
       // THE DROP'S EXIT STARTS WHERE THE VEHICLE IS (2026-10-15, user: the claw
@@ -5388,13 +5451,15 @@ private:
     HatClearance hc;
   };
 
-  RouteCheck ppRouteCheck(bool own_pick) const
+  // `leg` the motion is (or follows): its own hat is exempt for the claw on the pick, its
+  // descent and exit, and the go_to_place_start that lifts the letter off it
+  RouteCheck ppRouteCheck(int leg) const
   {
     RouteCheck rc;
-    if (pp_route_wps_.empty()) {return rc;}
+    if (!pp_route_on_) {return rc;}
     rc.on = true;
     rc.letter = pp_route_letter_;
-    rc.own = own_pick ? pp_route_letter_ : -1;
+    rc.own = (leg == kExecutePick || leg == kGoToPlaceStart) ? pp_route_letter_ : -1;
     rc.floor = pp_route_floor_;
     rc.hats = pp_route_hats_;
     rc.hc.margin = get_parameter("pick_place_route_hat_margin").as_double();
@@ -5422,8 +5487,9 @@ private:
     PlanOptions opts;
     RestSpec from;
     HatClearance hc;
-    std::vector<double> loc;
+    std::vector<double> loc, centroid;
     bool hat_check = true;
+    bool mid = false;     // the route already under way: the dry run starts at letter 1's Pick Start
     unsigned gen = 0;
     {
       std::lock_guard<std::recursive_mutex> lk(lock_);
@@ -5473,6 +5539,14 @@ private:
       hat_check = get_parameter("pick_place_route_hat_check").as_bool();
       hc.margin = get_parameter("pick_place_route_hat_margin").as_double();
       loc = get_parameter("pick_place_pick_locator").as_double_array();
+      centroid = get_parameter("pick_place_route_frame_centroid").as_double_array();
+      // THE MID-ROUTE PLAN (2026-11-03 audit): after a parameter edit, Get or Adjust the
+      // route is re-planned where it stands -- from a pick hold the old dry run (letter 1's
+      // go_to_start from the hold) met the claw on its own hat at t = 0 and refused. The
+      // dry run then checks the LAYOUT from letter 1's Pick Start; every leg is checked
+      // again from the real hold when it is flown (onPpFly's routeHatCheck).
+      mid = pp_route_on_ && (pp_completed_ >= 0 ||
+        std::any_of(pp_route_state_.begin(), pp_route_state_.end(), [](int x) {return x != 0;}));
       opts = planOptions();
       from = *hold_;
       ppInvalidate();
@@ -5484,15 +5558,16 @@ private:
     publishPpStatus();
     publishPpPaths(nullptr);
     if (pp_worker_.joinable()) {pp_worker_.join();}
-    pp_worker_ = std::thread([this, tg, cfg, opts, from, gen, hc, loc, hat_check]() {
+    pp_worker_ = std::thread([this, tg, cfg, opts, from, gen, hc, loc, centroid, hat_check, mid]() {
         std::vector<PickPlaceWaypoints> wps;
         std::vector<Vec3> hats;
         MailRoutePlan plan;
         std::string err;
         try {
           wps = mailRouteWaypoints(*vehicle_, cfg, tg);
-          if (hat_check) {hats = mailRouteHats(tg, loc);}
-          plan = planMailRoute(*vehicle_, *planner_, opts, cfg, wps, from, hat_check ? &hats : nullptr, hc);
+          if (hat_check) {hats = mailRouteHats(tg, loc, centroid);}
+          const RestSpec start = mid ? wps.front().goal[kGoToStart] : from;
+          plan = planMailRoute(*vehicle_, *planner_, opts, cfg, wps, start, hat_check ? &hats : nullptr, hc);
         } catch (const std::exception & e) {
           err = e.what();
         }
@@ -5505,6 +5580,7 @@ private:
             RCLCPP_WARN(get_logger(), "mail route plan refused: %s", err.c_str());
           } else {
             const size_t n = wps.size();
+            pp_route_on_ = true;
             pp_route_wps_ = wps;
             pp_route_hats_ = hats;
             pp_route_floor_ = hat_check ? mailRouteCruiseFloor(hats, hc)
@@ -5551,8 +5627,9 @@ private:
       });
     resp->success = true;
     resp->message = "planning the mail route (" + std::to_string(tg.letters.size()) + " letters into " +
-      std::to_string(tg.boxes.size()) + " mailboxes, alternately) from the current hold -- the status "
-      "reads READY when done";
+      std::to_string(tg.boxes.size()) + " mailboxes, alternately) " +
+      (mid ? std::string("-- under way: checked from letter 1's Pick Start, each leg again from the hold when "
+                         "flown") : std::string("from the current hold")) + " -- the status reads READY when done";
   }
 
   // GET for the route: the localization frame (the pick body) averaged as every
@@ -5657,8 +5734,7 @@ private:
   // selects the next letter (onRouteSelect) or lands.
   void routeExitDone(int leg)
   {
-    const int n = static_cast<int>(pp_route_wps_.size());
-    if (static_cast<int>(pp_route_state_.size()) != n) {pp_route_state_.assign(n, 0);}
+    if (pp_route_letter_ < 0 || pp_route_letter_ >= static_cast<int>(pp_route_state_.size())) {return;}
     pp_route_state_[pp_route_letter_] = leg == kExecutePick ? 1 : 2;
   }
 
@@ -5690,7 +5766,10 @@ private:
         pp_abort_plan_ || state_ == "EXECUTING" || state_ == "CALCULATING")
       {
         err = "a motion is in flight -- wait for the hold, or Abort first";
-      } else if (k != pp_route_letter_ && routeCarrying()) {
+      } else if (routeCarrying() && !(k == pp_route_letter_ && pp_completed_ < kExecutePlace)) {
+        // (2026-11-03 audit) the letter in progress too, once it is at the mailbox: re-selecting
+        // it there cleared the mission's progress with the letter in the mouth, and the
+        // abort's back-out with it
         err = "letter " + std::to_string(pp_route_letter_ + 1) + " is in the claw -- post it (or Abort) first";
       } else if (k < static_cast<int>(pp_route_state_.size()) && pp_route_state_[k] == 2) {
         err = "letter " + std::to_string(k + 1) + " is already posted -- its hat is empty";
@@ -5731,7 +5810,7 @@ private:
   // The status line's route suffix (under the lock).
   std::string routeSuffix() const
   {
-    const int n = static_cast<int>(pp_route_wps_.size());
+    const int n = static_cast<int>(pp_route_state_.size());
     std::ostringstream m;
     const int nb = ppRouteCount(true);
     if (pp_completed_ >= kNumPickPlaceLegs - 1) {
@@ -5759,6 +5838,13 @@ private:
         resp->message = "a pick-and-place leg is in flight or waiting above its target -- Abort it first";
         return;
       }
+      if (pp_route_on_ && routeCarrying()) {
+        // (2026-11-03 audit) Reset cleared the carrying interlock with the letter still gripped
+        resp->success = false;
+        resp->message = "letter " + std::to_string(pp_route_letter_ + 1) +
+          " is in the claw -- post it (or Abort) before Reset";
+        return;
+      }
       pp_completed_ = -1;
       pp_aborted_ = false;
       pp_guard_tripped_ = false;
@@ -5766,6 +5852,8 @@ private:
       pp_exited_.fill(false);
       pp_route_letter_ = 0;
       pp_route_state_.clear();
+      pp_route_on_ = false;
+      pp_route_abort_posted_ = false;
       pp_drop_hold_t0_.reset();
       resetDropAuto();
       ppInvalidate();
@@ -5891,7 +5979,7 @@ private:
       bool route = false;
       {
         std::lock_guard<std::recursive_mutex> lk(lock_);
-        route = !pp_route_wps_.empty();
+        route = pp_route_on_;
       }
       (route ? pp_route_drop_now_pub_ : pp_drop_now_pub_)->publish(d);
     }
@@ -6339,7 +6427,7 @@ private:
       // arrival error stays measured against the TRUE target (pp_wp_)
       pp_descent_trim_ = descentTrim();
       wp.goal[leg].x_b += pp_descent_trim_;
-      rc = ppRouteCheck(leg == kExecutePick);
+      rc = ppRouteCheck(leg);
       opts = planOptions();
       gen = ++plan_gen_;
       state_ = "CALCULATING";
@@ -6445,7 +6533,7 @@ private:
           m << "touch down with SAFETY -> land";
         } else {
           m << "re-fly " << pickPlaceLegName(pp_completed_ + 1)
-            << (pp_route_wps_.empty() ? " or Reset" : ", select another letter, or Reset");
+            << (pp_route_on_ ? ", select another letter, or Reset" : " or Reset");
         }
       } else if (!pp_wp_.has_value()) {
         std::string err;
@@ -6481,7 +6569,7 @@ private:
           if (!pp_drop_text_.empty()) {m << " -- " << pp_drop_text_;}
         }
       }
-      if (mode_direct_ && !pp_route_wps_.empty()) {m << routeSuffix();}
+      if (mode_direct_ && pp_route_on_ && !pp_route_state_.empty()) {m << routeSuffix();}
       s = m.str();
     }
     String msg;
@@ -6542,12 +6630,13 @@ private:
       m.data.push_back(pp_at_table_ ? 1.0 : 0.0);
       m.data.push_back(pp_exiting_.has_value() ? static_cast<double>(*pp_exiting_) : -1.0);
       m.data.push_back(static_cast<double>(pp_phase_));
-      // [88] the route is on, [89] its letter in progress (0-based), [90] N
+      // [88] the route session is on, [89] its letter in progress (0-based), [90] N
       // letters, [91] that letter's box (0-based), [92 .. 92+N) each letter's
       // state (0 to do, 1 picked, 2 posted, 3 dropped by an abort), [92+N .. 92+2N) each
       // letter's box, [92+2N] the planned route's flight time [s] (NaN unplanned)
       const int n = ppRouteCount(false), nb = ppRouteCount(true);
-      const bool route = get_parameter("pick_place_route").as_bool();
+      // [88] is the route SESSION (pp_route_on_, 2026-11-03 audit), not the parameter
+      const bool route = pp_route_on_;
       m.data.push_back(route ? 1.0 : 0.0);
       m.data.push_back(route ? static_cast<double>(pp_route_letter_) : -1.0);
       m.data.push_back(static_cast<double>(n));
@@ -9625,6 +9714,14 @@ private:
   double pp_route_T_{0.0};
   int pp_route_letter_{0};
   std::vector<int> pp_route_state_;
+  // THE ROUTE SESSION (2026-11-03 audit): on from a route Plan until Reset or a
+  // single-mission Plan. A stale plan (any parameter edit, Get or Adjust clears
+  // pp_route_wps_) does NOT end it, so the letters' states, the hat checks and
+  // the carrying interlocks keep holding across a mid-route re-Plan.
+  bool pp_route_on_{false};
+  // the abort started during Exit To Insert: the letter was already let go in
+  // the mailbox, so it counts as posted, not dropped
+  bool pp_route_abort_posted_{false};
   OnSetParametersCallbackHandle::SharedPtr pp_param_cb_;
   // push-and-pull mode (push_pull.hpp)
   std::string pl_box_topic_;                    // the box's mocap body

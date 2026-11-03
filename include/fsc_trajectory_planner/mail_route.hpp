@@ -120,12 +120,20 @@ struct HatClearance
 // localization frame on the hat + Rz(yaw) [dx, dy, dz], so the frame, i.e. the
 // hat, is the letter - Rz(yaw) [dx, dy, 0]; the hat top is the letter's
 // height). An empty locator puts each hat at its letter.
-std::vector<Vec3> mailRouteHats(const MailRouteTargets & t, const std::vector<double> & pick_locator);
+// `frame_centroid` [x, y] (2026-11-03 audit): obj_0 is the frame's MARKER
+// CENTROID, not the hat's centre O -- (-3.58, 6.38) mm from O in the frame's
+// axes (pick_place_route_frame_centroid; Pegasus mail_delivery_20261023 README)
+// -- so the hat is that much further back: letter - Rz(yaw) ([dx, dy] + c).
+// [] = obj_0 on O.
+std::vector<Vec3> mailRouteHats(
+  const MailRouteTargets & t, const std::vector<double> & pick_locator,
+  const std::vector<double> & frame_centroid = {});
 
 // "" when no sample of `traj` brings the gear, the rotors or the claw within
 // the margin of a hat; else the first conflict, in words, starting with
 // `what`. `own` = the hat the claw is MEANT to reach on this motion (the
-// letter's own pick and its exit), exempt for the claw only; -1 = none.
+// letter's own pick, its exit, and the go_to_place_start that lifts the letter
+// off it), exempt for the claw only; -1 = none.
 std::string hatConflict(
   const VehicleModel & v, const Trajectory & traj, const std::vector<Vec3> & hats, int own,
   const HatClearance & h, const std::string & what);

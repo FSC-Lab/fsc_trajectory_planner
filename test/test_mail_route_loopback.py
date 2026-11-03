@@ -18,10 +18,17 @@ insert mission. What is checked:
                  Start; its place exit POSTS it and the route waits (no automatic
                  switch); re-selecting it is refused (its hat is empty)
   letter 2       selected by the operator; an abort while waiting above it
-  letter 3       selected instead; with it in the claw, selecting another letter
-                 and landing are refused; posted into RED; the land legs;
-                 COMPLETE with the route tally
-  Reset          back to letter 1; route off = the single mission again
+  letter 3       selected instead. The 2026-11-03 audit's cases: a parameter
+                 edit at its pick hold makes the plan stale but not the route --
+                 the route's own Plan (route/plan) re-plans it right there, and an
+                 Exit To Pick flown with the plan stale still records the letter
+                 in the claw; with it in the claw Reset, another letter, landing
+                 and a single-mission Plan are refused, also after a mid-route
+                 re-plan, and with pick_place_route false (the route flies from
+                 route/plan alone); at the mailbox re-selecting letter 3 is
+                 refused; an ABORT during Exit To Insert counts it POSTED; the
+                 land legs; COMPLETE with the route tally
+  Reset          back to letter 1, the route session off; the single mission
 
 The rig is test_pick_place_loopback.py's perfect plant (it teleports onto each
 planned rest), its mocap body the localization frame, here with a yaw.
@@ -111,6 +118,7 @@ class RouteRig(L.Rig):
         for name in ["capture_letter_1", "capture_letter_2", "capture_letter_3",
                      "get_box_1", "get_box_2", "select_letter_1", "select_letter_2", "select_letter_3"]:
             self.cli[name] = self.create_client(Trigger, f"whole_body_planner/pick_place/route/{name}")
+        self.cli["route_plan"] = self.create_client(Trigger, "whole_body_planner/pick_place/route/plan")
 
     def mocap_msg(self, topic, p):
         m = Mocap()
@@ -193,8 +201,9 @@ def main():
     try:
         L.wait(lambda: rig.pp_status is not None and rig.info is not None, 20, "planner up")
         assert rig.pp_status == "NOT IN DIRECT", rig.pp_status
-        assert route(rig)["on"] == 1.0 and route(rig)["n"] == 3 and route(rig)["boxes"] == [0, 1, 0], route(rig)
-        print(f"[1] route on: 3 letters, boxes {route(rig)['boxes']} (RED, BLUE, RED)")
+        # [88] is the route SESSION: off until a route Plan
+        assert route(rig)["on"] == 0.0 and route(rig)["n"] == 3 and route(rig)["boxes"] == [0, 1, 0], route(rig)
+        print(f"[1] 3 letters, boxes {route(rig)['boxes']} (RED, BLUE, RED); the session off until Plan")
 
         # [2] the Gets, on the ground: the frame on each hat, then on each box
         for k in range(3):
@@ -238,7 +247,7 @@ def main():
         assert L.call(rig, "plan").success
         L.wait(lambda: rig.pp_status.startswith("READY"), 60, "route READY")
         R = route(rig)
-        assert R["letter"] == 0 and R["state"] == [0, 0, 0] and R["T"] > 100.0, R
+        assert R["on"] == 1.0 and R["letter"] == 0 and R["state"] == [0, 0, 0] and R["T"] > 100.0, R
         assert rig.pp_status.endswith("[letter 1/3 -> mailbox RED]"), rig.pp_status
         assert rig.path is not None and len(rig.path) > 0
         print(f"[3] READY in {time.monotonic() - t0:.1f} s: {R['T']:.1f} s of flight -- {rig.pp_status}")
@@ -281,22 +290,65 @@ def main():
         assert route(rig)["state"] == [2, 0, 0], route(rig)     # never lifted: still to do
         print(f"[5] letter 2 selected, aborted above it -> {rig.pp_status}")
 
-        # [6] letter 3 instead: in the claw, no switching and no landing; then posted
+        # [6] letter 3 instead
         r = L.call(rig, "select_letter_3")
         assert r.success, r.message
         assert route(rig)["letter"] == 2 and route(rig)["box"] == 0, route(rig)
         L.fly(rig, 0)
         fly_claw(rig, 1)
+        # (audit) a parameter edit at the pick hold, the letter gripped: the PLAN goes
+        # stale, the route session and its states do not
+        assert L.set_param(rig, "pick_place_route_hat_margin", 0.031).successful
+        L.wait(lambda: math.isnan(route(rig)["T"]), 5, "the plan stale")
+        assert route(rig)["on"] == 1.0 and route(rig)["letter"] == 2, route(rig)
+        # (audit) the route's Plan re-plans it AT the pick hold (the old dry run started
+        # letter 1's go_to_start with the claw on hat 3 and refused)
+        r = L.call(rig, "route_plan")
+        assert r.success and "under way" in r.message, r.message
+        L.wait(lambda: not math.isnan(route(rig)["T"]), 60, "re-planned at the pick hold")
+        assert not rig.pp_status.startswith("INFEASIBLE"), rig.pp_status
+        print(f"[6] re-planned at letter 3's pick hold -> {rig.pp_status}")
+        # (audit) stale again, and Exit To Pick flown with NO plan still records the letter
+        assert L.set_param(rig, "pick_place_route_hat_margin", 0.03).successful
+        L.wait(lambda: math.isnan(route(rig)["T"]), 5, "the plan stale again")
         exit_leg(rig, 1)
-        r = L.call(rig, "select_letter_2")
+        L.wait(lambda: route(rig)["state"] == [2, 0, 1], 5, "letter 3 recorded in the claw")
+        r = L.call(rig, "select_letter_2")      # (the plan stale: "press Plan" comes first)
+        assert not r.success, r.message
+        r = L.call(rig, "reset")
         assert not r.success and "in the claw" in r.message, r.message
-        r = L.call(rig, "go_to_land_start")
+        # (audit) a single-mission Plan would end the route with the letter gripped: refused
+        assert L.set_param(rig, "pick_place_route", False).successful
+        r = L.call(rig, "plan")
         assert not r.success and "in the claw" in r.message, r.message
-        print(f"[6] letter 3 in the claw: {r.message}")
+        print(f"[6] letter 3 in the claw: Reset, letter 2 and the single-mission Plan refused ({r.message})")
+        # the route flies on from route/plan alone (pick_place_route false: the hardware yaml)
+        r = L.call(rig, "route_plan")
+        assert r.success, r.message
+        L.wait(lambda: not math.isnan(route(rig)["T"]), 60, "re-planned with the letter in the claw")
+        for name in ("go_to_land_start", "select_letter_2"):
+            r = L.call(rig, name)
+            assert not r.success and "in the claw" in r.message, (name, r.message)
+        print(f"[6] re-planned, still no landing or another letter: {r.message}")
         L.fly(rig, 2)
         fly_claw(rig, 3)
-        exit_leg(rig, 3)
-        L.wait(lambda: route(rig)["state"] == [2, 0, 2], 5, "letter 3 posted")
+        # (audit) at the mailbox, re-selecting the letter in progress is refused (it cleared
+        # the mission's progress with the letter in the mouth, and the abort's back-out)
+        r = L.call(rig, "select_letter_3")
+        assert not r.success and "in the claw" in r.message, r.message
+        print(f"[6] at the mailbox, Letter 3 again: {r.message}")
+        # (audit) an ABORT during Exit To Insert: the letter was let go first -> POSTED
+        r = L.call(rig, "exit_place")
+        assert r.success, r.message
+        L.wait(lambda: rig.status.startswith("EXECUTING") and "FLYING exit_place" in rig.pp_status, 10,
+               "exit_place flying")
+        time.sleep(1.0)
+        assert L.call(rig, "abort").success
+        L.wait(lambda: rig.pp_status.startswith("ABORTED") and rig.status == "HOLD", 40, "aborted in the exit")
+        L.wait(lambda: route(rig)["state"] == [2, 0, 2], 5, "letter 3 posted by the exit's abort")
+        print(f"[6] aborted during Exit To Insert -> letter 3 POSTED: {route(rig)['state']}")
+        # the land legs from the abort's hold (the rig does not model where it ended)
+        assert L.set_param(rig, "pick_place_leg_start_tol", 5.0).successful
         L.fly(rig, 4)
         L.fly(rig, 5)
         L.wait(lambda: rig.pp_status.startswith("COMPLETE"), 5, "COMPLETE")
@@ -304,13 +356,13 @@ def main():
         print(f"[6] {rig.pp_status}")
 
         # [7] Reset: letter 1 again; the route off = the single mission's Plan
-        assert L.call(rig, "reset").success
+        r = L.call(rig, "reset")
+        assert r.success, r.message
         R = route(rig)
-        assert R["letter"] == 0 and R["state"] == [0, 0, 0], R
-        assert L.set_param(rig, "pick_place_route", False).successful
+        assert R["on"] == 0.0 and R["letter"] == -1 and R["state"] == [0, 0, 0], R
         L.wait(lambda: rig.pp_status.startswith("NOT PLANNED: capture pick"), 5,
                "the single mission's status (its own pick capture missing)")
-        print(f"[7] reset to letter 1; route off -> {rig.pp_status}")
+        print(f"[7] reset: the route session off -> {rig.pp_status}")
         print("PASS")
     finally:
         os.killpg(gov.pid, signal.SIGINT)

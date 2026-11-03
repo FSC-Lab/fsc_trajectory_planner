@@ -889,7 +889,7 @@ over `pickPlaceWaypoints`), and a one-letter route is today's mission to 1e-12
   Mail Envelope tab (which also flies the insert and opens on `pick_place/drop_now`)
   does not release a second time.
 
-Tests: `test_mail_route.cpp` (6 gtests), `test/test_mail_route_loopback.py`
+Tests: `test_mail_route.cpp` (7 gtests then), `test/test_mail_route_loopback.py`
 (Gets, the hat-check refusal, letter 1 posted and the route waiting, a select of a
 posted letter refused, an abort, letter 3 selected instead, no select / land with
 it in the claw, COMPLETE "2 of 3 letters posted", route off = the single mission).
@@ -902,3 +902,70 @@ the driver pressed Insert after 20 s each time, as the operator does; route3,
 order 1, 3, 2: letters 1 and 3 posted into RED, letter 2's pick descent refused by
 the square frame model -- fixed with the outline, gtest
 `APicksOwnHatIsClearOfTheFrameWithRoomForATrim`).
+
+### The route session (2026-11-03 audit)
+
+An audit of the route found its bookkeeping keyed on the PLAN (`pp_route_wps_`
+non-empty), which every parameter edit, Get and Adjust clears -- so an Insert
+Margin tweak at a pick hold silently ended the route: the exit was not recorded,
+flew without a hat check, and after the next Plan landing and another letter
+were allowed with the letter still gripped. Fixed, each with a regression case:
+- **`pp_route_on_` is the route SESSION**: on from a route Plan until Reset or a
+  single-mission Plan; a stale plan does not end it. info [88] publishes it (was
+  the parameter). Every interlock, the hat checks, the exit bookkeeping,
+  `route/drop_now` and the status suffix key on it.
+- **`pick_place/route/plan`** plans the route whatever `pick_place_route` says;
+  the Mail Route tab uses it and no longer sets the parameter, which stayed true
+  after one route session and turned the Mail Envelope / Pick & Drop tabs' Plan
+  into the route. `/plan` still plans the route when the yaml sets the parameter.
+- A single-mission Plan ends the session, and is refused with a letter in the claw.
+  Reset is refused with a letter in the claw. Selecting ANY letter is refused with a
+  letter in the claw except re-pressing the current one before its place (a no-op):
+  re-selecting it at the mailbox cleared the mission's progress with the letter in
+  the mouth, and with it the abort's insert back-out.
+- A route Plan under way (progress, or any letter's state) dry-runs the layout from
+  letter 1's Pick Start, not from the hold: from a pick hold, letter 1's go_to_start
+  met the claw on the hat being picked from and the whole Plan was refused. Every
+  leg is still checked from the real hold when flown.
+- An ABORT during Exit To Insert counts the letter POSTED (it was let go first),
+  not dropped.
+- The claw is exempt from its own hat on the go_to_place_start that lifts the
+  letter off it too (the leg climbs to the cruise floor first): with a Vertical
+  Margin under ~0.13 m that leg was refused at t = 0 with the letter in the claw.
+- `pick_place_route_frame_centroid` (default `[-0.00358, 0.00638]` m): obj_0 is the
+  frame's MARKER CENTROID, not the hat centre, so the hats were placed 7 mm off.
+
+Tests: `test_mail_route.cpp` 9 gtests (+ `ALowVerticalMarginStillLiftsTheLetterOffItsOwnHat`,
+verified failing without the fix, and `AMidRoutePlanIsCheckedFromLetterOnesPickStart`);
+the loopback's step [6] now edits a parameter at the pick hold, re-plans there,
+exits with the plan stale, checks every carrying refusal (also with
+`pick_place_route` false, flown from `route/plan` alone), re-selects letter 3 at
+the mailbox (refused) and aborts during Exit To Insert (posted).
+
+### The operator fuzzer and what it found (2026-11-03)
+
+`test/fuzz_mail_route_loopback.py`: a random operator and safety pilot against the
+built node in the mail loopback rig (perfect plant), with its OWN record of where each
+letter physically is, checking after every step: CARRY (a letter in the claw: landing,
+another letter, Reset and the single mission's Plan refused), POSTED (never re-selected),
+PHANTOM (no FLYING/ABORTING status while the planner holds), INFO and ALIVE.
+`--chaos` weights mid-motion aborts and SAFETY several times higher; `--scenario
+safety_exit|skip_exit` replays the two cases below. Run each seed on its own
+`ROS_DOMAIN_ID`, and NEVER beside an Isaac run: the sim runner's
+`kill_stale_sim_processes.sh` kills every planner by name on every domain (it ended
+the first fuzz round and read as a planner hang).
+- **SAFETY during an exit stranded the mission** (also the single mission): `onMode`'s
+  SAFETY branch reset the leg, the abort and the plan but not `pp_exiting_` /
+  `pp_exit_plan_`, so after DIRECT came back the status read FLYING exit_* for ever and
+  every button but ABORT (which opens the gripper) refused. Now cleared there; the exit
+  is pressed again from the new hold (`pp_at_table_` keeps the carrying interlock).
+- **Go To Mailbox Start pressed straight after the pick (no Exit To Pick) lost the
+  letter**: its retreat lifts the letter, but a letter was recorded picked only by the
+  exit, so landing, Reset and another letter were accepted with it gripped. A route leg
+  flown off the pick hold now records the letter picked when it is accepted.
+Also found, NOT fixed (outside the planner): the arm GS's Mail Route tab treats a FULL
+gripper close as the hook grasp, so a missed grasp is flown and counted posted (Isaac:
+18 good grasps all stalled at -20..-42 deg, the one miss closed to -48.8) -- check how
+the real claw closes on an envelope before keying a missed-grasp check on it; and the
+mailboxes are not obstacles in `HatClearance` (the props pass 9-13 cm over the other
+box's top in every Isaac insert).
