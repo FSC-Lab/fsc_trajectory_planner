@@ -500,7 +500,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--steps", type=int, default=60)
     ap.add_argument("--stop-on-first", action="store_true")
-    ap.add_argument("--scenario", default="", help="safety_exit: SAFETY during an exit; skip_exit: Go To Mailbox Start without Exit To Pick")
+    ap.add_argument("--scenario", default="", help="safety_exit: SAFETY during an exit; skip_exit: Go To Mailbox Start without Exit To Pick; auto_insert: the automatic insert waits for the drone to settle")
     ap.add_argument("--chaos", action="store_true", help="the risky events several times as likely")
     a = ap.parse_args()
     rclpy.init()
@@ -571,6 +571,64 @@ def main():
                 if r is not None and r.success:
                     fz.violate("CARRY", f"{name} accepted with the letter in the claw")
                     break
+            a.steps = 0
+        if a.scenario == "auto_insert":
+            # the route's insert: automatic only, and only once the DRONE has settled
+            for name, val in (("pick_place_descent_on_request", True), ("pick_place_insert_auto", True),
+                              ("pick_place_insert_auto_settle_s", 3.0), ("pick_place_insert_auto_settle_tol", 0.015),
+                              ("pick_place_insert_auto_tol", 0.030)):
+                assert L.set_param(rig, name, val).successful, name
+            fz.a_plan()
+            fz.a_leg(force=0)
+            r = fz.call("execute_pick")
+            assert r and r.success, r
+            L.wait(lambda: (rig.pp_status or "").startswith("WAITING execute_pick") and rig.status == "HOLD", 40, "pick wait")
+            base, yaw, _ = rig.goal(1)
+            rig.at(np.array(base) - M.PICK_BACK * M.nose(yaw), yaw)
+            time.sleep(1.5)
+            assert fz.call("descend_pick").success
+            L.wait(lambda: "(descent)" in (rig.pp_status or ""), 10, "pick descent")
+            L.wait(lambda: rig.status == "HOLD" and not (rig.pp_status or "").startswith("FLYING"), 30, "picked")
+            rig.at(np.array(base), yaw)
+            fz.a_exit_named("exit_pick")
+            fz.a_leg(force=2)
+            r = fz.call("execute_place")
+            assert r and r.success, r
+            L.wait(lambda: (rig.pp_status or "").startswith("WAITING execute_place") and rig.status == "HOLD", 40, "place wait")
+            base, yaw, _ = rig.goal(3)
+            ap = np.array(base) - M.PLACE_BACK * math.cos(M.PITCH) * M.nose(yaw) + \
+                np.array([0.0, 0.0, M.PLACE_BACK * math.sin(M.PITCH)])
+            rig.at(ap, yaw)
+            r = fz.call("descend_place")
+            fz.note(f"manual Insert in the route: {'ok' if r and r.success else 'refused'} {r.message[:90] if r else ''}")
+            if r is not None and r.success:
+                fz.violate("INSERT", "a manual Insert was accepted in the route")
+            # an UNSETTLED drone: +-25 mm at a 6 s period -- inside the claw's own gates (30 mm, peak
+            # 0.026 m/s under 0.03), but ~25 mm from its mean over any 3 s. (A +-25 mm swing at 10 s
+            # is what CALM Isaac holds look like and does pass the 15 mm / 3 s settle gate near its
+            # peaks -- by design: the drifts that ended in contact moved 75-85 mm in 3 s.)
+            t0 = time.monotonic()
+            texts = set()
+            while time.monotonic() - t0 < 10.0:
+                k = time.monotonic() - t0
+                rig.odom_xyz = ap + np.array([0.025 * math.sin(2 * math.pi * k / 6.0), 0.0, 0.0])
+                p = rig.pp_status or ""
+                if "(descent)" in p:
+                    fz.violate("INSERT", f"the insert started while the drone drifted ({k:.1f} s): {p[:100]}")
+                    break
+                if "auto insert:" in p:
+                    texts.add(p[p.index("auto insert:"):][:70])
+                time.sleep(0.1)
+            fz.note("while drifting: " + " | ".join(sorted(texts))[:300])
+            if not any("settle" in t for t in texts):
+                fz.violate("INSERT", "the status never said it waits for the drone to settle")
+            rig.at(ap, yaw)
+            t1 = time.monotonic()
+            try:
+                L.wait(lambda: "(descent)" in (rig.pp_status or ""), 9, "the automatic insert once still")
+                fz.note(f"held still: the automatic insert started after {time.monotonic() - t1:.1f} s")
+            except AssertionError as e:
+                fz.violate("INSERT", f"no automatic insert within 9 s of holding still: {rig.pp_status[:100]}")
             a.steps = 0
         for _ in range(a.steps):
             fz.step()

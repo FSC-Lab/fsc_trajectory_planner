@@ -502,6 +502,13 @@ public:
     declare_parameter<bool>("pick_place_insert_auto", false);
     declare_parameter<double>("pick_place_insert_auto_tol", 0.015);
     declare_parameter<double>("pick_place_insert_auto_dwell_s", 1.0);
+    // ... and only once the DRONE has settled (2026-11-03, the mail route: the FSM sits at the
+    // point in front of the mouth until then): the body within pick_place_insert_auto_settle_tol
+    // [m] of its own mean over the last pick_place_insert_auto_settle_s [s]. Isaac holds: calm
+    // 83-92 % of the time inside 15 mm over 3 s, the drifts that ended in contact 0-3 %.
+    // 0 s = off (the claw gates alone, as before).
+    declare_parameter<double>("pick_place_insert_auto_settle_s", 0.0);
+    declare_parameter<double>("pick_place_insert_auto_settle_tol", 0.015);
     // ... and the insert's own wrist-roll gate [deg] (2026-10-30, the user's windowed
     // rehearsal hovered at the release point and never opened): the drop's 3 deg
     // (pick_place_drop_auto_q4_tol_deg) sits INSIDE the wrist's standing band at
@@ -4029,6 +4036,14 @@ private:
           r.reason = n + " needs [] or " + std::to_string(len) + " numbers ([x, y, z, yaw_deg] each, NaN = "
             "not measured)";
         }
+      } else if (n == "pick_place_insert_auto_settle_s" || n == "pick_place_insert_auto_settle_tol") {
+        const bool settle_s = n == "pick_place_insert_auto_settle_s";
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || !std::isfinite(p.as_double()) ||
+          (settle_s ? (p.as_double() < 0.0 || p.as_double() > 30.0) : !(p.as_double() > 0.0 && p.as_double() <= 0.2)))
+        {
+          r.successful = false;
+          r.reason = n + (settle_s ? " needs 0 (off) .. 30 s" : " needs (0, 0.2] m");
+        }
       } else if (n == "pick_place_route_frame_centroid") {
         if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY ||
           (!p.as_double_array().empty() && p.as_double_array().size() != 2) ||
@@ -5235,6 +5250,14 @@ private:
       } else if (leg == kExecutePlace && get_parameter("pick_place_place_drop").as_bool()) {
         err = "drop place (pick_place_place_drop): no descent -- Ready To Place ends on the drop "
           "point, Place opens the gripper there";
+      } else if (leg == kExecutePlace && pp_route_on_ && get_parameter("pick_place_place_insert").as_bool() &&
+        get_parameter("pick_place_insert_auto").as_bool())
+      {
+        // THE ROUTE INSERTS BY ITSELF (2026-11-03, user decision after the hold tests): the slide
+        // starts once the claw is still in front of the mouth, never by hand -- a letter waiting
+        // at the approach point is the one that gets pushed into the box
+        err = "the mail route inserts by itself (pick_place_insert_auto) once the claw is still in front "
+          "of the mouth -- wait for it, or ABORT";
       } else if (!get_parameter("pick_place_descent_on_request").as_bool()) {
         err = "the descent starts by itself (pick_place_descent_on_request is false)";
       } else if (!pp_flying_.has_value() || *pp_flying_ != leg || pp_phase_ != kPpWait ||
@@ -5932,10 +5955,11 @@ private:
       const bool ins_auto = claw && leg == kExecutePlace && pp_phase_ == kPpWait && state_ == "HOLD" &&
         get_parameter("pick_place_place_insert").as_bool() && get_parameter("pick_place_insert_auto").as_bool();
       if (ins_auto) {
-        if (evalInsertAuto(meas, e)) {descend = true;}
+        if (evalInsertAuto(meas, e, x_b)) {descend = true;}
       } else {
         pp_ins_ok_since_.reset();
         pp_ins_prev_.clear();
+        pp_ins_base_.clear();
         pp_ins_text_.clear();
       }
       if (!ins_auto && pp_phase_ == kPpWait && state_ == "HOLD" &&
@@ -5992,17 +6016,40 @@ private:
   // mouth, true once the claw has held within pick_place_insert_auto_tol of that
   // point, slower than pick_place_drop_auto_claw_speed, for _dwell_s. Called under
   // the lock at 10 Hz; a gap in the evaluation restarts the dwell.
-  bool evalInsertAuto(const Vec3 & claw, const Vec3 & e)
+  bool evalInsertAuto(const Vec3 & claw, const Vec3 & e, const Vec3 & base)
   {
     const auto now = Clock::now();
     const double tol = get_parameter("pick_place_insert_auto_tol").as_double();
     const double dwell = get_parameter("pick_place_insert_auto_dwell_s").as_double();
     const double vmax = get_parameter("pick_place_drop_auto_claw_speed").as_double();
+    const double settle_s = get_parameter("pick_place_insert_auto_settle_s").as_double();
+    const double settle_tol = get_parameter("pick_place_insert_auto_settle_tol").as_double();
     if (!pp_ins_prev_.empty() &&
       std::chrono::duration<double>(now - pp_ins_prev_.back().first).count() > 0.25)
     {
       pp_ins_ok_since_.reset();           // a gap restarts the dwell
     }
+    // THE DRONE SETTLED (pick_place_insert_auto_settle_*): the body's largest deviation from its
+    // own mean over the last settle_s; a gap starts the window afresh
+    if (!pp_ins_base_.empty() &&
+      std::chrono::duration<double>(now - pp_ins_base_.back().first).count() > 0.25)
+    {
+      pp_ins_base_.clear();
+    }
+    pp_ins_base_.emplace_back(now, base);
+    while (!pp_ins_base_.empty() &&
+      std::chrono::duration<double>(now - pp_ins_base_.front().first).count() > settle_s + 1e-6)
+    {
+      pp_ins_base_.pop_front();
+    }
+    double base_dev = 0.0;
+    {
+      Vec3 mean = Vec3::Zero();
+      for (const auto & b : pp_ins_base_) {mean += b.second;}
+      mean /= static_cast<double>(pp_ins_base_.size());
+      for (const auto & b : pp_ins_base_) {base_dev = std::max(base_dev, (b.second - mean).norm());}
+    }
+    const double base_span = std::chrono::duration<double>(now - pp_ins_base_.front().first).count();
     const double v = clawSpeed(&pp_ins_prev_, claw, now);
     std::ostringstream m;
     m.setf(std::ios::fixed);
@@ -6016,6 +6063,13 @@ private:
         << tol * 1e3 << ")";
     } else if (!(v <= vmax)) {
       m << std::setprecision(2) << "claw moving " << v << " m/s (gate " << vmax << ")";
+    } else if (settle_s > 0.0 && base_span < settle_s - 0.15) {
+      m << std::setprecision(1) << "waiting for the drone to settle (" << base_span << " of " << settle_s
+        << " s watched)";
+    } else if (settle_s > 0.0 && base_dev > settle_tol) {
+      m << std::setprecision(0) << "waiting for the drone to settle: it moved " << base_dev * 1e3
+        << " mm from its mean in the last " << std::setprecision(1) << settle_s << " s (gate "
+        << std::setprecision(0) << settle_tol * 1e3 << " mm)";
     } else {
       ok = true;
     }
@@ -9670,6 +9724,7 @@ private:
   bool pp_place_measured_{false};
   std::optional<Clock::time_point> pp_ins_ok_since_;
   std::deque<std::pair<Clock::time_point, Vec3>> pp_ins_prev_;
+  std::deque<std::pair<Clock::time_point, Vec3>> pp_ins_base_;   // the body, for the settle gate
   std::string pp_ins_text_;
   double pp_abort_back_{0.0};
   // aiming the drop at the basket (pick_place_drop_aim_payload): the basket -

@@ -969,3 +969,26 @@ gripper close as the hook grasp, so a missed grasp is flown and counted posted (
 the real claw closes on an envelope before keying a missed-grasp check on it; and the
 mailboxes are not obstacles in `HatClearance` (the props pass 9-13 cm over the other
 box's top in every Isaac insert).
+
+### The route's insert: automatic only, once the drone has settled (2026-11-03)
+
+The Isaac hold tests traced the insert aborts to CONTACT, not to an unstable hold: at
+`pick_place_place_approach_back` 0.15 the 15 cm envelope (hanging ~25 deg nose-down)
+waited ~5 cm from the box face, 1-2 cm above the mouth's bottom lip; a few cm of base
+swing or the letter slipping in the hook grasp put it on the box, and the contact moment
+(the attitude loop asked for 1.1 N.m and did not rotate the vehicle) dragged the vehicle
+in until the tilt guard fired. A 45 s hold with nothing touching stayed within +-9 mm.
+- Insert Margin 0.25 m in both mail yamls (gtest `TheDeeperInsertMarginStillPlansEveryLeg`).
+- In a route session with `pick_place_insert_auto` the planner REFUSES a manual
+  `descend_place` ("the mail route inserts by itself"); the arm GS disables its Insert.
+- `pick_place_insert_auto_settle_s` / `_settle_tol` (default 0 = off; the mail yamls 3 s /
+  15 mm): the automatic slide also waits until the BODY has stayed within `_settle_tol` of
+  its own mean over the last `_settle_s` (the FSM sits at the point in front of the mouth
+  until then; status "waiting for the drone to settle"). Chosen from the Isaac holds: calm
+  83-92 % inside 15 mm over 3 s, the drifts that ended in contact 0-3 %. A slow +-25 mm
+  swing at a 10 s period passes near its peaks -- by design, that is what calm holds look
+  like. Fuzzer scenario `--scenario auto_insert` (an unsettled +-25 mm / 6 s drift blocks
+  it, a still plant inserts after settle_s + the dwell).
+- `pick_place_insert_auto_tol` 0.015 -> 0.030: the hold parks 20-30 mm off (the steady
+  offset), so 15 mm fired within 20 s on only about half the inserts; every insert pressed
+  from that offset went in (6/6). Its stillness gate and dwell are unchanged.

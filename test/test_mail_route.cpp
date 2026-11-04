@@ -239,6 +239,31 @@ TEST(MailRoute, ALowVerticalMarginStillLiftsTheLetterOffItsOwnHat)
   EXPECT_TRUE(why.empty()) << why;
 }
 
+TEST(MailRoute, TheDeeperInsertMarginStillPlansEveryLeg)
+{
+  // 2026-11-03: pick_place_place_approach_back 0.15 -> 0.25 m (the envelope waited ~5 cm from
+  // the box face and touched it): the approach point moves 0.1 m further back and up the 25 deg
+  // insertion line; the whole route, every leg and exit, still plans clear of the hats.
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  const auto planner = makePlanner("bspline");
+  PickPlaceConfig c = mailConfig(*v);
+  c.place_approach_back = 0.25;
+  const MailRouteTargets t = scene();
+  const auto hats = mailRouteHats(t, kLocator);
+  std::string why;
+  try {
+    const auto wps = mailRouteWaypoints(*v, c, t);
+    planMailRoute(*v, *planner, PlanOptions{}, c, wps, hold(*v), &hats);
+    // the approach point is 0.25 m back along the line from the release point
+    for (const auto & wp : wps) {
+      EXPECT_NEAR((wp.approach[kExecutePlace].x_b - wp.goal[kExecutePlace].x_b).norm(), 0.25, 1e-6);
+    }
+  } catch (const std::runtime_error & e) {
+    why = e.what();
+  }
+  EXPECT_TRUE(why.empty()) << why;
+}
+
 TEST(MailRoute, AMidRoutePlanIsCheckedFromLetterOnesPickStart)
 {
   // 2026-11-03 audit: a route re-planned at a pick hold (after a margin edit there) was
