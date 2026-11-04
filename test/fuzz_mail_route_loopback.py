@@ -572,6 +572,16 @@ def main():
                     fz.violate("CARRY", f"{name} accepted with the letter in the claw")
                     break
             a.steps = 0
+        if a.scenario == "forced_insert":
+            # the wait limit: a drone that never settles is inserted anyway once the limit passes
+            for name, val in (("pick_place_descent_on_request", True), ("pick_place_insert_auto", True),
+                              ("pick_place_insert_auto_settle_s", 3.0), ("pick_place_insert_auto_settle_tol", 0.015),
+                              ("pick_place_insert_auto_tol", 0.030), ("pick_place_insert_auto_max_wait_s", 6.0)):
+                assert L.set_param(rig, name, val).successful, name
+            a.scenario = "auto_insert"
+            forced_limit = 6.0
+        else:
+            forced_limit = None
         if a.scenario == "auto_insert":
             # the route's insert: automatic only, and only once the DRONE has settled
             for name, val in (("pick_place_descent_on_request", True), ("pick_place_insert_auto", True),
@@ -603,13 +613,28 @@ def main():
             fz.note(f"manual Insert in the route: {'ok' if r and r.success else 'refused'} {r.message[:90] if r else ''}")
             if r is not None and r.success:
                 fz.violate("INSERT", "a manual Insert was accepted in the route")
+            if forced_limit is not None:
+                t_wait = time.monotonic()
+                started = None
+                while time.monotonic() - t_wait < forced_limit + 6.0:
+                    k = time.monotonic() - t_wait
+                    rig.odom_xyz = ap + np.array([0.025 * math.sin(2 * math.pi * k / 6.0), 0.0, 0.0])
+                    if "(descent)" in (rig.pp_status or ""):
+                        started = k
+                        break
+                    time.sleep(0.1)
+                fz.note(f"never settled: the insert started after {started if started is None else round(started, 1)} s "
+                        f"(the limit {forced_limit} s)")
+                if started is None or started < forced_limit - 1.0:
+                    fz.violate("INSERT", f"the forced insert did not start at the {forced_limit} s limit: {started}")
+                a.steps = 0
             # an UNSETTLED drone: +-25 mm at a 6 s period -- inside the claw's own gates (30 mm, peak
             # 0.026 m/s under 0.03), but ~25 mm from its mean over any 3 s. (A +-25 mm swing at 10 s
             # is what CALM Isaac holds look like and does pass the 15 mm / 3 s settle gate near its
             # peaks -- by design: the drifts that ended in contact moved 75-85 mm in 3 s.)
             t0 = time.monotonic()
             texts = set()
-            while time.monotonic() - t0 < 10.0:
+            while forced_limit is None and time.monotonic() - t0 < 10.0:
                 k = time.monotonic() - t0
                 rig.odom_xyz = ap + np.array([0.025 * math.sin(2 * math.pi * k / 6.0), 0.0, 0.0])
                 p = rig.pp_status or ""
@@ -619,16 +644,18 @@ def main():
                 if "auto insert:" in p:
                     texts.add(p[p.index("auto insert:"):][:70])
                 time.sleep(0.1)
-            fz.note("while drifting: " + " | ".join(sorted(texts))[:300])
-            if not any("settle" in t for t in texts):
+            if forced_limit is None:
+                fz.note("while drifting: " + " | ".join(sorted(texts))[:300])
+            if forced_limit is None and not any("settle" in t for t in texts):
                 fz.violate("INSERT", "the status never said it waits for the drone to settle")
             rig.at(ap, yaw)
             t1 = time.monotonic()
-            try:
-                L.wait(lambda: "(descent)" in (rig.pp_status or ""), 9, "the automatic insert once still")
-                fz.note(f"held still: the automatic insert started after {time.monotonic() - t1:.1f} s")
-            except AssertionError as e:
-                fz.violate("INSERT", f"no automatic insert within 9 s of holding still: {rig.pp_status[:100]}")
+            if forced_limit is None:
+                try:
+                    L.wait(lambda: "(descent)" in (rig.pp_status or ""), 9, "the automatic insert once still")
+                    fz.note(f"held still: the automatic insert started after {time.monotonic() - t1:.1f} s")
+                except AssertionError:
+                    fz.violate("INSERT", f"no automatic insert within 9 s of holding still: {rig.pp_status[:100]}")
             a.steps = 0
         for _ in range(a.steps):
             fz.step()

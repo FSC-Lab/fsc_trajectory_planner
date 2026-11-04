@@ -992,3 +992,10 @@ in until the tilt guard fired. A 45 s hold with nothing touching stayed within +
 - `pick_place_insert_auto_tol` 0.015 -> 0.030: the hold parks 20-30 mm off (the steady
   offset), so 15 mm fired within 20 s on only about half the inserts; every insert pressed
   from that offset went in (6/6). Its stillness gate and dwell are unchanged.
+- `pick_place_insert_auto_max_wait_s` (default 0 = wait for the settle; the mail yamls 10 s,
+  user decision 2026-11-03): once the insert's wait has lasted this long it inserts ANYWAY --
+  the settle and stillness gates dropped, only the claw within `pick_place_arrival_tol` (what
+  a manual Insert checked); logged "AUTO INSERT FORCED after X s -- the drone had (NOT)
+  settled". Isaac route21 (order 1,2,3): 3/3, one insert forced at 10.0 s on a calm drone; a
+  forced insert during a LARGE drift is untested (route19 waited 49 s through a 171 mm swing).
+  Fuzzer `--scenario forced_insert`.

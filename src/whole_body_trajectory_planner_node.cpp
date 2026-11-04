@@ -509,6 +509,10 @@ public:
     // 0 s = off (the claw gates alone, as before).
     declare_parameter<double>("pick_place_insert_auto_settle_s", 0.0);
     declare_parameter<double>("pick_place_insert_auto_settle_tol", 0.015);
+    // ... and once the wait has lasted pick_place_insert_auto_max_wait_s [s], inserts ANYWAY:
+    // the settle and stillness gates dropped, only the claw within pick_place_arrival_tol (a
+    // manual Insert's check). 0 = never (wait for the settle) -- an experiment (2026-11-03).
+    declare_parameter<double>("pick_place_insert_auto_max_wait_s", 0.0);
     // ... and the insert's own wrist-roll gate [deg] (2026-10-30, the user's windowed
     // rehearsal hovered at the release point and never opened): the drop's 3 deg
     // (pick_place_drop_auto_q4_tol_deg) sits INSIDE the wrist's standing band at
@@ -4036,6 +4040,13 @@ private:
           r.reason = n + " needs [] or " + std::to_string(len) + " numbers ([x, y, z, yaw_deg] each, NaN = "
             "not measured)";
         }
+      } else if (n == "pick_place_insert_auto_max_wait_s") {
+        if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || !std::isfinite(p.as_double()) ||
+          p.as_double() < 0.0)
+        {
+          r.successful = false;
+          r.reason = n + " needs 0 (never) or a wait [s]";
+        }
       } else if (n == "pick_place_insert_auto_settle_s" || n == "pick_place_insert_auto_settle_tol") {
         const bool settle_s = n == "pick_place_insert_auto_settle_s";
         if (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || !std::isfinite(p.as_double()) ||
@@ -5960,6 +5971,7 @@ private:
         pp_ins_ok_since_.reset();
         pp_ins_prev_.clear();
         pp_ins_base_.clear();
+        pp_ins_wait_t0_.reset();
         pp_ins_text_.clear();
       }
       if (!ins_auto && pp_phase_ == kPpWait && state_ == "HOLD" &&
@@ -6016,6 +6028,8 @@ private:
   // mouth, true once the claw has held within pick_place_insert_auto_tol of that
   // point, slower than pick_place_drop_auto_claw_speed, for _dwell_s. Called under
   // the lock at 10 Hz; a gap in the evaluation restarts the dwell.
+  bool q_age_ok_for_insert() const {return secondsSince(q_meas_time_) <= 0.25;}
+
   bool evalInsertAuto(const Vec3 & claw, const Vec3 & e, const Vec3 & base)
   {
     const auto now = Clock::now();
@@ -6050,6 +6064,20 @@ private:
       for (const auto & b : pp_ins_base_) {base_dev = std::max(base_dev, (b.second - mean).norm());}
     }
     const double base_span = std::chrono::duration<double>(now - pp_ins_base_.front().first).count();
+    // THE WAIT LIMIT (pick_place_insert_auto_max_wait_s): past it, insert anyway
+    if (!pp_ins_wait_t0_.has_value()) {pp_ins_wait_t0_ = now;}
+    const double waited = std::chrono::duration<double>(now - *pp_ins_wait_t0_).count();
+    const double max_wait = get_parameter("pick_place_insert_auto_max_wait_s").as_double();
+    if (max_wait > 0.0 && waited >= max_wait && q_age_ok_for_insert() &&
+      e.norm() <= get_parameter("pick_place_arrival_tol").as_double())
+    {
+      RCLCPP_WARN(get_logger(), "pick-and-place: AUTO INSERT FORCED after %.1f s of waiting -- the drone had "
+        "%s (body %.0f mm from its mean over the last %.1f s), claw %.0f mm from the point in front of the mouth",
+        waited, base_dev <= settle_tol ? "settled" : "NOT settled", base_dev * 1e3, base_span, e.norm() * 1e3);
+      pp_ins_text_ = "auto insert: FORCED after the wait limit";
+      pp_ins_ok_since_.reset();
+      return true;
+    }
     const double v = clawSpeed(&pp_ins_prev_, claw, now);
     std::ostringstream m;
     m.setf(std::ios::fixed);
@@ -9725,6 +9753,7 @@ private:
   std::optional<Clock::time_point> pp_ins_ok_since_;
   std::deque<std::pair<Clock::time_point, Vec3>> pp_ins_prev_;
   std::deque<std::pair<Clock::time_point, Vec3>> pp_ins_base_;   // the body, for the settle gate
+  std::optional<Clock::time_point> pp_ins_wait_t0_;               // the insert's wait began
   std::string pp_ins_text_;
   double pp_abort_back_{0.0};
   // aiming the drop at the basket (pick_place_drop_aim_payload): the basket -
