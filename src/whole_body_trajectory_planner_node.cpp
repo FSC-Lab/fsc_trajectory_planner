@@ -1169,6 +1169,14 @@ public:
     // (archive/valve_upush_20261102/tools/fin_monitor_replay.py). 0 = that check off; all off =
     // unchanged.
     declare_parameter<double>("push_pull_guard_fin_depth_min", 0.0);
+    // ... and the claw MORE than fin_depth_max under the top (2026-11-04, the PUSH PLATE, Pegasus
+    // archive/valve_push_plate_20261104): the plate's BOTTOM edge -- the closed claw's tip would
+    // slip under the plate onto the fin's narrow edge, directly below the plate's overhang, where
+    // the abort's straight climb would drive it into the plate's underside. With
+    // push_pull_valve_fin = the plate's box, the four checks bound all four of its edges
+    // (depth_min the top, depth_max the bottom, across_max the two sides). 0 = off (the U push:
+    // a deeper claw is still inside the U).
+    declare_parameter<double>("push_pull_guard_fin_depth_max", 0.0);
     declare_parameter<double>("push_pull_guard_fin_across_max", 0.0);
     declare_parameter<double>("push_pull_guard_fin_behind_max", 0.0);
     declare_parameter<double>("push_pull_guard_fin_ahead_max", 0.0);
@@ -6333,7 +6341,8 @@ private:
       "push_pull_guard_q3_lookahead_s", "push_pull_guard_q3_rate_min_deg_s",
       "push_pull_guard_q3_rate_persist_s", "push_pull_guard_q3_rate_filter_s",
       "push_pull_guard_q2_max_deg",
-      "push_pull_guard_fin_depth_min", "push_pull_guard_fin_across_max", "push_pull_guard_fin_behind_max",
+      "push_pull_guard_fin_depth_min", "push_pull_guard_fin_depth_max", "push_pull_guard_fin_across_max",
+      "push_pull_guard_fin_behind_max",
       "push_pull_guard_fin_ahead_max", "push_pull_guard_fin_bracket_back", "push_pull_guard_fin_persist_s",
       "push_pull_guard_fin_q3_max_deg",
       "push_pull_valve_fin", "push_pull_guard_clearance", "push_pull_guard_clearance_marker",
@@ -6813,11 +6822,12 @@ private:
     const bool on_fin = !exiting &&
       (pl_at_handle_ || (pl_flying_.has_value() && *pl_flying_ == kPlPush));
     const double dmin = get_parameter("push_pull_guard_fin_depth_min").as_double();
+    const double dmaxg = get_parameter("push_pull_guard_fin_depth_max").as_double();
     const double amax = get_parameter("push_pull_guard_fin_across_max").as_double();
     const double bmax = get_parameter("push_pull_guard_fin_behind_max").as_double();
     const double fmax = get_parameter("push_pull_guard_fin_ahead_max").as_double();
     const double q3max = get_parameter("push_pull_guard_fin_q3_max_deg").as_double();
-    if (on_fin && (dmin > 0.0 || amax > 0.0 || bmax > 0.0 || fmax > 0.0 || q3max > 0.0)) {
+    if (on_fin && (dmin > 0.0 || dmaxg > 0.0 || amax > 0.0 || bmax > 0.0 || fmax > 0.0 || q3max > 0.0)) {
       Vec3 r0e;
       armKinematics(*q_meas_, vehicle_->params, nullptr, &r0e, nullptr);
       const Vec3 claw = x_b + r0 * (vehicle_->r_model * r0e);
@@ -6827,6 +6837,9 @@ private:
       if (dmin > 0.0 && pl_fin_.depth < dmin) {
         m << "the claw only " << pl_fin_.depth * 1e3 << " mm under the fin top (< " << dmin * 1e3
           << " mm): riding over it";
+      } else if (dmaxg > 0.0 && pl_fin_.depth > dmaxg) {
+        m << "the claw " << pl_fin_.depth * 1e3 << " mm under the fin top (> " << dmaxg * 1e3
+          << " mm): sliding off its bottom edge";
       } else if (amax > 0.0 && std::abs(pl_fin_.across) > amax) {
         m << "the fin " << std::abs(pl_fin_.across) * 1e3 << " mm across the claw (> " << amax * 1e3
           << " mm): out between the claws";
