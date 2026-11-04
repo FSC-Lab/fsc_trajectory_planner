@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -714,6 +715,45 @@ TEST(PushPull, TurnRotatesTheRestAboutTheAxisWithTheArmHeld)
   }
   EXPECT_NEAR(wpc.drone_yaw, 0.5 * M_PI, 1e-9);
   EXPECT_NEAR(unw - headingOf(land->eval(0.0)), -450.0 * kDeg, 1e-3);
+}
+
+// THE PUSH PLATE (2026-11-04): the closed claw's nose pushes a plate on the fin's pushing edge, so the
+// claw point sits ~61 mm behind the fin's radial line -- 21 deg off it as seen from the axis. The
+// tangent check at the grasp point refuses that; made at the push point (turn_tangent_lead ahead along
+// the nose) it accepts it, and the turn still rotates the whole rest rigidly about the axis.
+TEST(PushPull, ThePushPlatesNoseIsCheckedAtThePushPoint)
+{
+  const auto v = makeVehicleModel("t650_aerial_manipulator");
+  PushPullConfig c = config(*v);
+  c.ee_offset << 0.160, -0.0613, 0.1704;            // the claw point: 61.3 mm behind the fin's radial line
+  c.push_pose << 0.0, 0.0, 30.0 * kDeg, 0.0;
+  c.yaw_from_box = 0.5 * M_PI;
+  c.turn_angle = 97.0 * kDeg;
+  c.gear_depth = 0.2425;
+  PushPullTargets t = scene();
+  t.box << 1.20, 0.0, 0.80;
+  t.box_yaw = M_PI;
+  try {
+    pushPullWaypoints(*v, c, t);
+    FAIL() << "the claw point 21 deg off the radial line was accepted with no lead";
+  } catch (const std::runtime_error & e) {
+    EXPECT_NE(std::string(e.what()).find("tangent"), std::string::npos) << e.what();
+  }
+  c.turn_tangent_lead = std::numeric_limits<double>::quiet_NaN();   // never passes the check
+  EXPECT_THROW(pushPullWaypoints(*v, c, t), std::runtime_error);
+  c.turn_tangent_lead = 0.0369;                     // the nose: 16.9 mm ahead of the claw point + 20 mm slack
+  PushPullWaypoints wp;
+  ASSERT_NO_THROW(wp = pushPullWaypoints(*v, c, t));
+  // the push point, 8.7 deg off the radial line (the plate face 24.4 mm behind the fin's centre)
+  const Vec3 nose = wp.grasp_ee + c.turn_tangent_lead * wp.push_dir;
+  const double bearing_off = std::atan2(std::abs((nose - wp.axis).cross(wp.push_dir)(2)),
+                                        std::abs((nose - wp.axis).dot(wp.push_dir)));
+  EXPECT_NEAR(90.0 - bearing_off * 180.0 / M_PI, std::atan2(0.0244, 0.160) * 180.0 / M_PI, 0.5);
+  // the turn: the grasp rest rotated rigidly about the axis by 97 deg, height kept
+  EXPECT_NEAR(wp.pushed.phi, wp.grasp.phi + c.turn_angle, 1e-12);
+  const Vec3 g = wp.grasp.x_b - wp.axis, p = wp.pushed.x_b - wp.axis;
+  EXPECT_NEAR(std::hypot(g(0), g(1)), std::hypot(p(0), p(1)), 1e-9);
+  EXPECT_NEAR(wp.pushed.x_b(2), wp.grasp.x_b(2), 1e-12);
 }
 
 TEST(PushPull, TheObstacleIsCheckedLikeTheTable)

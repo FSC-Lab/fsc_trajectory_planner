@@ -822,6 +822,10 @@ public:
     // turn's tangent at the handle (yaw_from_box +90 for a + turn, -90 for -).
     // 0 = the straight push (unchanged).
     declare_parameter<double>("push_pull_turn_deg", 0.0);
+    // (2026-11-04, the push plate) the push point's lead ahead of the grasp point along the nose
+    // [m]: the tangent check above is made there (PushPullConfig::turn_tangent_lead). 0 = at the
+    // grasp point (the clamp, the U push)
+    declare_parameter<double>("push_pull_turn_tangent_lead", 0.0);
     // the land hover [x, y, z, yaw_deg] (world, ACTUAL yaw, flown as typed:
     // from the push heading -90, -360 is 270 deg CLOCKWISE) and the start mark
     // Adjust measures against; Adjust writes its x, y shift into both
@@ -6173,6 +6177,7 @@ private:
     c->unload_time = get_parameter("push_pull_unload_time_s").as_double();
     c->unload_wait = get_parameter("push_pull_unload_wait_s").as_double();
     c->turn_angle = get_parameter("push_pull_turn_deg").as_double() * M_PI / 180.0;
+    c->turn_tangent_lead = get_parameter("push_pull_turn_tangent_lead").as_double();
     c->fence.min_z = get_parameter("push_pull_fence_min_z").as_double();
     c->fence.max_z = get_parameter("push_pull_fence_max_z").as_double();
     const auto xy = get_parameter("push_pull_fence_xy").as_double_array();
@@ -6448,6 +6453,14 @@ private:
           r.reason = n + " needs [min, max] m with 0 <= min < max";
           return r;
         }
+      }
+      // (2026-11-04) the push point's lead: a NaN would pass the plan's tangent check
+      if (n == "push_pull_turn_tangent_lead" &&
+        (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || !std::isfinite(p.as_double())))
+      {
+        r.successful = false;
+        r.reason = n + " needs a finite number [m] (a double)";
+        return r;
       }
       if (n == "push_pull_valve_beam_tol_deg" &&
         (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE || !(p.as_double() >= 0.0)))

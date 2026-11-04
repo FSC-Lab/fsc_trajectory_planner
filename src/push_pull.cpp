@@ -1008,16 +1008,23 @@ PushPullWaypoints pushPullWaypoints(
     // THE TURN: the grasp rest rotated about the captured body's vertical
     // axis; the nose must be along the turn's tangent at the handle, or the
     // jaws would drag the handle sideways instead of pushing it round
-    const Vec3 radial = wp.grasp_ee - axis;
+    // (2026-11-04) at the PUSH point: the grasp point + turn_tangent_lead along the nose (0 = the
+    // grasp point itself; the push plate's nose leads the claw point)
+    if (!std::isfinite(c.turn_tangent_lead)) {
+      // a NaN would pass the check below (every comparison with it is false)
+      throw std::runtime_error("push: push_pull_turn_tangent_lead must be a finite number [m]");
+    }
+    const Vec3 radial = wp.grasp_ee + c.turn_tangent_lead * wp.push_dir - axis;
     const double r = std::hypot(radial(0), radial(1));
     if (r < 0.02) {
       throw std::runtime_error(
-        "push: the grasp point is on the turn's axis (push_pull_ee_offset must put it at the "
-        "handle's radius from the captured body)");
+        "push: the push point is on the turn's axis (push_pull_ee_offset, plus "
+        "push_pull_turn_tangent_lead along the nose, must put it at the handle's radius from the "
+        "captured body)");
     }
     const Vec3 tangent = (c.turn_angle > 0.0 ? 1.0 : -1.0) * Vec3(-radial(1), radial(0), 0.0) / r;
     const double along = wp.push_dir.dot(tangent);
-    if (along < std::cos(15.0 / kDeg)) {
+    if (!(along >= std::cos(15.0 / kDeg))) {   // (written so a NaN refuses)
       std::ostringstream m;
       m.setf(std::ios::fixed);
       m.precision(0);

@@ -162,6 +162,12 @@ struct PushPullConfig
   // handle's bearing for a + turn, -90 for a - turn). push_distance is then
   // ignored. 0 = the straight push, unchanged.
   double turn_angle{0.0};
+  // THE PUSH POINT'S LEAD (2026-11-04, the push plate, Pegasus archive/valve_push_plate_20261104):
+  // the claw's NOSE pushes a plate on the fin's pushing edge, so the force acts this far [m] AHEAD of
+  // the grasp point (the model claw point) along the nose. The tangent check above is made at that
+  // push point: the claw point itself sits ~61 mm behind the fin's radial line, 21 deg off it. 0 = at
+  // the grasp point, unchanged (the clamp, the U push).
+  double turn_tangent_lead{0.0};
   Geofence fence;
   TableKeepOut table;
   // A SECOND keep-out with the same rule (2026-10-15): the valve's swept
