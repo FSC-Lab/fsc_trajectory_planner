@@ -48,8 +48,10 @@ TEST(QuadrotorPlanner, RegistryKnowsT650AndRejectsUnknown)
 TEST(QuadrotorPlanner, RegistryKnowsX650)
 {
   const auto m = makeQuadrotorModel("x650");
-  EXPECT_NEAR(m.mass, 3.25, 1e-12);
-  EXPECT_NEAR(m.inertia(0, 0), 0.05777498, 1e-12);
+  EXPECT_NEAR(m.mass, 3.387, 1e-12);
+  EXPECT_NEAR(m.inertia(0, 0), 0.08666247, 1e-12);
+  EXPECT_NEAR(m.inertia(1, 1), 0.09612258, 1e-12);
+  EXPECT_NEAR(m.inertia(2, 2), 0.09750685, 1e-12);
   EXPECT_NEAR(m.inertia(0, 1), 0.0, 1e-12);
   EXPECT_NEAR(m.rotor_time_constant, 0.115, 1e-12);
 }

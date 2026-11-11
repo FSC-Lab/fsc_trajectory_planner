@@ -31,16 +31,18 @@ QuadrotorModel makeT650()
   return m;
 }
 
-// FSC X650 (MN4014 + 15x5), flown from 2026-10 on: total mass 3.25 kg with battery;
-// inertia = the X650 sim's (fsc_PegasusSimulator x650_params.py INERTIA_DIAG),
-// a placeholder until identified from flight data. MUST match the model the
-// RCCM was trained for (CCM_quad configs/config_quad_torque.py VEHICLE 'x650').
+// FSC X650 (MN4014 + 15x5), flown from 2026-10 on. Since 2026-11-10: total mass 3.387 kg
+// (weighed with battery, camera and printed parts; was 3.25 kg) and inertia 1.5x the X650
+// sim's CAD value (fsc_PegasusSimulator x650_params.py INERTIA_DIAG), identified from the
+// 2026-11-10 flights (the geometric law's 0.65-0.78 Hz divergence; Isaac with the plant
+// inertia x1.5 reproduces it). MUST match the model the (R)CCM was trained for
+// (CCM_quad configs/config_quad_torque.py VEHICLE 'x650') and the flight node's ccm_dob_*.
 QuadrotorModel makeX650()
 {
   QuadrotorModel m;
   m.name = "x650";
-  m.mass = 3.25;
-  m.inertia = Eigen::Vector3d(0.05777498, 0.06408172, 0.065004565).asDiagonal();
+  m.mass = 3.387;
+  m.inertia = Eigen::Vector3d(0.08666247, 0.09612258, 0.09750685).asDiagonal();
   m.gravity = 9.81;
   // Rotor lag identified from the first CCM flights (2026-10-14); the MN4014 bench report gave 0.0951 s.
   m.rotor_time_constant = 0.115;
