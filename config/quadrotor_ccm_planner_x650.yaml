@@ -59,7 +59,11 @@
     # drag in Isaac it beat "ude" by 7-28 % RMS (runbook section 5). Not yet flown on hardware.
     disturbance_source: "ccm"
     use_angular_disturbance: true  # with "ccm": also fold J*d_w into the reference torque
-    max_disturbance_angular_accel: 3.0
+    # Norm clamp on the folded d_w [rad/s^2] (direction kept). 2.0 since 2026-11-10 (was 3.0): with the planner's J
+    # = the networks' training J (1.5x CAD), J*d_w then stays inside the training box's reference torque
+    # (+-2 rad/s^2 x J per axis); the excess is left to feedback. The node clips its estimate first (ccm_dob_max_ang,
+    # 5.0 per component); the geometric law reads that estimate directly, so this clamp does not apply to it.
+    max_disturbance_angular_accel: 2.0
     disturbance_topic: "fsc_autopilot_ros2/ccm_rotor_actuation/disturbance"
     ccm_mode_topic: "fsc_autopilot_ros2/ccm_rotor_actuation/mode"
     hold_on_ccm_exit: true
